@@ -1,0 +1,53 @@
+Build a LucidLink Workspace Manager app with these features:
+
+Token Authentication: A settings or login screen where users paste their LucidLink service account token. The token format is sa_live followed by two colon-separated base64 strings. Store the token in localStorage. Show authenticated state in the header.
+
+Filespace Manager: Dashboard showing all filespaces as cards. Each card shows name, status which is ready or notReady, storage size, provider, and created date. Actions include create new filespace, delete filespace, and click to browse files.
+
+Create Filespace Dialog: Form with filespace name which is required and must be lowercase letters numbers and hyphens only. Also optional fields for MinIO endpoint, bucket name, access key, and secret key. All optional fields are pre-filled with UGREEN defaults. On create, show a progress indicator through these phases: "creating" shows a spinner with Creating filespace text while the Management API POST runs. "initializing" shows a spinner with Initializing storage text while polling GET /api/v1/filespaces/ID every 2 seconds until status becomes ready, then bootstraps the SDK. "ready" shows a green checkmark with Filespace ready text and auto-closes the dialog after 1.5 seconds. "error" shows the error message with a retry button. The useFilespaces hook exposes createPhase and setCreatePhase for this. Reset createPhase to idle when the dialog closes.
+
+File Browser: Full file and folder browser for a selected filespace. Includes breadcrumb navigation showing current path. Table or list of files and folders with name, size, type, and modified date. Click folder to navigate into it. Up button to go to parent directory. Upload file button with drag and drop or file picker. Create new folder button. Download file button. Delete file or folder button with confirmation dialog. Read and preview text files inline. Move and rename files.
+
+Two backend APIs are already running. No setup needed.
+
+First backend is the Management API at this URL: https://spark-47d8.tail333a1d.ts.net
+
+Authentication uses the Authorization header with Bearer followed by the service account token.
+
+Management API endpoints:
+- GET /api/v1/filespaces returns list of filespaces
+- POST /api/v1/filespaces creates a filespace
+- DELETE /api/v1/filespaces/FILESPACE_ID deletes a filespace
+- GET /api/v1/filespaces/FILESPACE_ID/entries/resolve?path=/ resolves a path to an entry
+- GET /api/v1/filespaces/FILESPACE_ID/entries/ENTRY_ID/children lists children of an entry
+
+Second backend is the File Service using the Python SDK at this URL: https://ai-factory-mini.tail333a1d.ts.net
+
+Authentication uses both the Authorization header with Bearer token AND the X-LucidLink-Filespace header set to the filespace name.
+
+File Service endpoints:
+- GET /filespaces returns list of filespaces
+- GET /files?path=/ lists a directory
+- GET /files/read?path=/file.txt reads file content
+- POST /files/write writes a file, send JSON body with path and content
+- POST /files/mkdir?path=/dir creates a directory
+- DELETE /files?path=/file.txt deletes a file
+- DELETE /files/dir?path=/dir&recursive=true deletes a directory
+- POST /files/move moves or renames, send JSON body with src and dst
+- GET /files/download?path=/file downloads a file
+- POST /files/upload uploads a file as multipart form with path and file fields
+- GET /files/stat?path=/file gets file metadata
+- GET /files/exists?path=/file checks if path exists
+
+UGREEN MinIO defaults to pre-fill in the create filespace form:
+- Endpoint: https://ugreen-nas.tail333a1d.ts.net
+- Bucket: lucidlink
+- Access Key: 59985424344315eb7d715b9e
+- Secret Key: 4zulHWOCAg2o4JqKC3T5WUaIrOeygAaSReVc8nv2
+- Region: us-east-1
+
+The create filespace POST body should be JSON with these fields: name set to the filespace name, region set to us-east-1, storageProvider set to Other, storageOwner set to customer, and a nested customerStorageParams object containing accessKeyId and secretAccessKey and endpoint and bucketName using the UGREEN defaults listed above.
+
+Filespace creation lifecycle: First POST to /api/v1/filespaces creates the filespace and returns immediately with status notReady. Then poll GET /api/v1/filespaces/ID every 2 seconds until status becomes ready, which typically takes 3 to 10 seconds with a 30 second timeout. Then call GET /files?path=/ with the X-LucidLink-Filespace header set to the new filespace name to trigger the Python SDK to bootstrap encryption keys. The filespace is then fully operational. The waitForReady function in src/lib/lucidlink.ts and the createPhase state in the useFilespaces hook handle this entire flow. The UI just needs to read createPhase to show the right indicator.
+
+Use shadcn/ui components. Support dark mode. Make the layout responsive. Show toast notifications for success and error states. Show loading states on all async operations. Show confirmation dialogs before destructive actions like delete. Format file sizes from bytes to KB MB GB. Show empty state messages when no filespaces or files exist.
