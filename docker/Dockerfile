@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir \
     python-multipart==0.0.20 \
     lucidlink==0.12.0
 
-COPY lucidlink_api.py .
+COPY ll_core.py connect_api.py insights_api.py lucidlink_api.py ./
 
 EXPOSE 8000
 

@@ -1,18 +1,32 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel
-import lucidlink, os, time, logging, mimetypes
-from datetime import datetime, timezone
-from threading import Lock
-from typing import Optional
+"""LucidLink file service — FastAPI app.
 
-logger = logging.getLogger("lucidlink_api")
+Core file CRUD + filespace listing + a Range-aware download, plus the Connect
+(external S3/HTTP files) and insights (stats / data preview / agent) routers.
+Shared daemon plumbing lives in ll_core; SDK is lucidlink >=0.12.
+"""
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, JSONResponse
+from pydantic import BaseModel
+import os
+import time
+import mimetypes
+import httpx
+from datetime import datetime, timezone
+
+from ll_core import (
+    require_token,
+    require_token_and_filespace,
+    _with_fs,
+    _list_filespaces_cached,
+)
+from connect_api import router as connect_router
+from insights_api import router as insights_router
 
 BOOT_TIME = datetime.now(timezone.utc)
 BOOT_MONO = time.monotonic()
 
-app = FastAPI()
+app = FastAPI(title="LucidLink File Service", version="0.12")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,147 +36,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Daemon is process-wide and does NOT need a token to start.
-# Each request authenticates with a token (from header or env-var fallback).
-daemon = lucidlink.create_daemon()
-daemon.start()
-
-# The native LucidLink daemon has a single-active-workspace state model.
-# `daemon.authenticate()` mutates global daemon state (stops the previously
-# active workspace, links a new one). Caching Workspace or Filesystem objects
-# across requests with different tokens would yield stale handles that point at
-# a workspace the daemon has since unlinked. So we don't cache them — every
-# request re-authenticates under the daemon lock.
-#
-# Filespace list results are immutable data (not daemon handles), so we keep
-# a short TTL cache keyed by token to avoid an authenticate round-trip per call.
-_daemon_lock = Lock()
-_FS_LIST_TTL = 45.0
-_fs_list_cache: dict[str, tuple[float, list]] = {}
-_cache_lock = Lock()
-_current_link: dict = {"token": None, "filespace": None, "fs": None, "fsobj": None}
-
-
-def _extract_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> Optional[str]:
-    """Accept either `Authorization: Bearer <token>` or `X-LucidLink-Token: <token>`.
-    Bearer prefix is stripped if present; a raw Authorization value (no scheme)
-    is also accepted. No env-var fallback — every request must carry a token."""
-    if x_lucid_token:
-        return x_lucid_token
-    if authorization:
-        parts = authorization.split(None, 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            return parts[1]
-        return authorization
-    return None
-
-
-def _auth_error(e: Exception) -> HTTPException:
-    msg = str(e)
-    if "401" in msg or "Unauthorized" in msg or "Invalid token" in msg:
-        return HTTPException(status_code=401, detail=f"LucidLink auth failed: {msg}")
-    if "403" in msg or "Forbidden" in msg:
-        return HTTPException(status_code=403, detail=f"LucidLink forbidden: {msg}")
-    return HTTPException(status_code=502, detail=f"LucidLink upstream error: {msg}")
-
-
-def _authenticate(token: str):
-    """Fresh authenticate. Caller MUST hold _daemon_lock."""
-    credentials = lucidlink.ServiceAccountCredentials(token=token)
-    return daemon.authenticate(credentials)
-
-
-def _require_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> str:
-    token = _extract_token(authorization, x_lucid_token)
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing Authorization: Bearer or X-LucidLink-Token header",
-        )
-    return token
-
-
-# Headers-only dependencies: extract values from the request without touching
-# the daemon. Handlers then acquire `_daemon_lock` and authenticate themselves,
-# so the daemon's single-active-workspace state is always set by whoever holds
-# the lock right now (no stale cached workspaces).
-
-def require_token(
-    authorization: Optional[str] = Header(default=None),
-    x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
-) -> str:
-    return _require_token(authorization, x_lucid_token)
-
-
-def require_token_and_filespace(
-    authorization: Optional[str] = Header(default=None),
-    x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
-    x_lucid_filespace: Optional[str] = Header(default=None, alias="X-LucidLink-Filespace"),
-) -> tuple[str, str]:
-    token = _require_token(authorization, x_lucid_token)
-    if not x_lucid_filespace:
-        raise HTTPException(
-            status_code=400,
-            detail="Missing X-LucidLink-Filespace header",
-        )
-    return token, x_lucid_filespace
-
-
-def _with_fs(token: str, filespace_name: str, fn):
-    """Run `fn(fs)` with a linked filespace. Reuses the existing link if the
-    token and filespace haven't changed, avoiding expensive unlink/relink cycles.
-    On a cache miss the previously linked filespace is torn down with
-    Filespace.unlink() (SDK >=0.12: the old no-arg daemon.unlink_filespace() now
-    requires the LinkedFilespace handle and is deprecated in favour of
-    Filespace.unlink())."""
-    with _daemon_lock:
-        try:
-            if _current_link["token"] == token and _current_link["filespace"] == filespace_name and _current_link["fs"] is not None:
-                return fn(_current_link["fs"])
-            # Cache miss: unlink the previously linked filespace (if any) before relinking.
-            if _current_link["fsobj"] is not None:
-                try:
-                    _current_link["fsobj"].unlink()
-                except Exception:
-                    pass
-            workspace = _authenticate(token)
-            filespace = workspace.link_filespace(name=filespace_name)
-            _current_link["token"] = token
-            _current_link["filespace"] = filespace_name
-            _current_link["fs"] = filespace.fs
-            _current_link["fsobj"] = filespace
-        except Exception as e:
-            _current_link["token"] = None
-            _current_link["filespace"] = None
-            _current_link["fs"] = None
-            _current_link["fsobj"] = None
-            raise _auth_error(e)
-        return fn(_current_link["fs"])
-
-
-def _with_workspace(token: str, fn):
-    """Run `fn(workspace)` with a freshly authenticated workspace."""
-    with _daemon_lock:
-        try:
-            workspace = _authenticate(token)
-        except Exception as e:
-            raise _auth_error(e)
-        return fn(workspace)
-
-
-def _list_filespaces_cached(token: str) -> list[dict]:
-    now = time.monotonic()
-    with _cache_lock:
-        cached = _fs_list_cache.get(token)
-        if cached and cached[0] > now:
-            return cached[1]
-    items = _with_workspace(token, lambda ws: [
-        {"id": fi.id, "name": fi.name, "created": fi.created}
-        for fi in ws.list_filespaces()
-    ])
-    with _cache_lock:
-        _fs_list_cache[token] = (now + _FS_LIST_TTL, items)
-    return items
+app.include_router(connect_router)
+app.include_router(insights_router)
 
 
 class WriteRequest(BaseModel):
@@ -194,13 +69,11 @@ def health():
 
 @app.get("/filespaces")
 def list_filespaces(token: str = Depends(require_token)):
-    """List filespaces visible to the Service Account."""
     return {"filespaces": _list_filespaces_cached(token)}
 
 
 @app.get("/filespaces/{name}")
 def get_filespace(name: str, token: str = Depends(require_token)):
-    """Resolve a single filespace by name. 404 if not visible to this SA."""
     for fs in _list_filespaces_cached(token):
         if fs["name"] == name:
             return fs
@@ -291,19 +164,76 @@ def file_exists(path: str, creds=Depends(require_token_and_filespace)):
     return _files_op(creds, lambda fs: {"exists": fs.file_exists(path) or fs.dir_exists(path)})
 
 
+def _parse_range(range_header: str, total: int):
+    """Parse a single 'bytes=start-end'. Returns (start, end) inclusive, or None
+    if unsatisfiable."""
+    try:
+        spec = range_header.split("=", 1)[1].split(",")[0].strip()
+    except IndexError:
+        return None
+    start_s, _, end_s = spec.partition("-")
+    if start_s == "" and end_s == "":
+        return None
+    if start_s == "":  # suffix range: last N bytes
+        n = int(end_s)
+        if n <= 0:
+            return None
+        start = max(0, total - n)
+        end = total - 1
+    else:
+        start = int(start_s)
+        end = int(end_s) if end_s else total - 1
+    end = min(end, total - 1)
+    if start > end or start >= total:
+        return None
+    return start, end
+
+
 @app.get("/files/download")
-def download_file(path: str, creds=Depends(require_token_and_filespace)):
-    data = _files_op(creds, lambda fs: fs.read_file(path), not_found_on_error=True)
+def download_file(path: str, request: Request, creds=Depends(require_token_and_filespace)):
     content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
     filename = os.path.basename(path)
+    range_header = request.headers.get("range")
+
+    if range_header and range_header.lower().startswith("bytes="):
+        def op(fs):
+            total = fs.get_entry(path).size
+            rng = _parse_range(range_header, total)
+            if rng is None:
+                return {"satisfiable": False, "total": total}
+            start, end = rng
+            f = fs.open(path, "rb")
+            try:
+                f.seek(start)
+                data = f.read(end - start + 1)
+            finally:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            return {"satisfiable": True, "start": start, "end": end,
+                    "total": total, "data": data}
+
+        r = _files_op(creds, op, not_found_on_error=True)
+        if not r["satisfiable"]:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{r['total']}"})
+        return Response(
+            content=r["data"], status_code=206, media_type=content_type,
+            headers={
+                "Content-Range": f"bytes {r['start']}-{r['end']}/{r['total']}",
+                "Accept-Ranges": "bytes",
+                "Content-Length": str(len(r["data"])),
+                "Content-Disposition": f'inline; filename="{filename}"',
+            },
+        )
+
+    data = _files_op(creds, lambda fs: fs.read_file(path), not_found_on_error=True)
     return Response(
-        content=data,
-        media_type=content_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        content=data, media_type=content_type,
+        headers={"Accept-Ranges": "bytes",
+                 "Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-
-from fastapi import UploadFile, File, Form
 
 @app.post("/files/upload")
 async def upload_file(
@@ -317,13 +247,8 @@ async def upload_file(
         return {"status": "ok", "path": path, "size": len(data)}
     return _files_op(creds, op)
 
-# --- Management API Proxy (append to lucidlink_api.py) ---
-# Proxies /api/v1/* to the LucidLink Management API container (Docker internal network)
 
-import httpx, os
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
+# --- Management API Proxy: /api/v1/* -> LucidLink Management API container ---
 MGMT_API_UPSTREAM = os.environ.get("MGMT_API_UPSTREAM", "http://lucidlink-api:3003")
 _http_client = httpx.AsyncClient(base_url=MGMT_API_UPSTREAM, timeout=120.0)
 
@@ -333,22 +258,14 @@ async def proxy_management_api(request: Request, path: str):
     url = f"/api/v1/{path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
-
     headers = {}
     if "authorization" in request.headers:
         headers["Authorization"] = request.headers["authorization"]
     if "content-type" in request.headers:
         headers["Content-Type"] = request.headers["content-type"]
-
     body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
-
     try:
-        resp = await _http_client.request(
-            method=request.method,
-            url=url,
-            headers=headers,
-            content=body,
-        )
+        resp = await _http_client.request(method=request.method, url=url, headers=headers, content=body)
         try:
             data = resp.json()
         except Exception:
