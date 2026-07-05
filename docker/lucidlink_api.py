@@ -40,7 +40,7 @@ _daemon_lock = Lock()
 _FS_LIST_TTL = 45.0
 _fs_list_cache: dict[str, tuple[float, list]] = {}
 _cache_lock = Lock()
-_current_link: dict = {"token": None, "filespace": None, "fs": None}
+_current_link: dict = {"token": None, "filespace": None, "fs": None, "fsobj": None}
 
 
 def _extract_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> Optional[str]:
@@ -110,24 +110,32 @@ def require_token_and_filespace(
 
 def _with_fs(token: str, filespace_name: str, fn):
     """Run `fn(fs)` with a linked filespace. Reuses the existing link if the
-    token and filespace haven't changed, avoiding expensive unlink/relink cycles."""
+    token and filespace haven't changed, avoiding expensive unlink/relink cycles.
+    On a cache miss the previously linked filespace is torn down with
+    Filespace.unlink() (SDK >=0.12: the old no-arg daemon.unlink_filespace() now
+    requires the LinkedFilespace handle and is deprecated in favour of
+    Filespace.unlink())."""
     with _daemon_lock:
         try:
             if _current_link["token"] == token and _current_link["filespace"] == filespace_name and _current_link["fs"] is not None:
                 return fn(_current_link["fs"])
-            try:
-                daemon.unlink_filespace()
-            except Exception:
-                pass
+            # Cache miss: unlink the previously linked filespace (if any) before relinking.
+            if _current_link["fsobj"] is not None:
+                try:
+                    _current_link["fsobj"].unlink()
+                except Exception:
+                    pass
             workspace = _authenticate(token)
             filespace = workspace.link_filespace(name=filespace_name)
             _current_link["token"] = token
             _current_link["filespace"] = filespace_name
             _current_link["fs"] = filespace.fs
+            _current_link["fsobj"] = filespace
         except Exception as e:
             _current_link["token"] = None
             _current_link["filespace"] = None
             _current_link["fs"] = None
+            _current_link["fsobj"] = None
             raise _auth_error(e)
         return fn(_current_link["fs"])
 
