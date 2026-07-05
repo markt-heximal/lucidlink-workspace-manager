@@ -22,6 +22,11 @@ services:
       - "8000:8000"
     environment:
       - MGMT_API_UPSTREAM=http://lucidlink-api:3003
+      # /agent/query LLM (OpenAI-compatible chat/completions). Optional: if unset,
+      # /agent/query returns 503. Point at any reachable OpenAI-compatible endpoint.
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-180}
     depends_on:
       lucidlink-api:
         condition: service_healthy
