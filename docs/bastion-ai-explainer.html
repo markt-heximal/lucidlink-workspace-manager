@@ -345,6 +345,65 @@
   footer .foot-in { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; justify-content: space-between; font-family: var(--mono); font-size: 12.5px; }
   footer .note { font-family: var(--sans); font-size: 13.5px; max-width: 60ch; margin-top: 18px; color: var(--faint); }
 
+  /* ---------- naive vs governed contrast ---------- */
+  .contrast { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 40px; }
+  @media (max-width: 800px) { .contrast { grid-template-columns: 1fr; } }
+  .crail { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; box-shadow: var(--shadow); }
+  .crail.leak { border-color: color-mix(in srgb, var(--block) 40%, var(--line)); }
+  .crail.safe { border-color: color-mix(in srgb, var(--sov) 40%, var(--line)); }
+  .crail-head { padding: 15px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .crail-head .h { font-weight: 700; font-size: 15.5px; }
+  .crail-head .h small { display: block; font-family: var(--mono); font-size: 11px; color: var(--muted); font-weight: 400; margin-top: 3px; letter-spacing: .02em; }
+  .crail-head .badge { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; padding: 4px 9px; border-radius: 6px; white-space: nowrap; }
+  .crail.leak .badge { color: var(--block); background: color-mix(in srgb, var(--block) 14%, transparent); }
+  .crail.safe .badge { color: var(--sov); background: color-mix(in srgb, var(--sov) 14%, transparent); }
+  .cstep { display: flex; gap: 12px; padding: 14px 18px; border-top: 1px dashed var(--line); align-items: flex-start; }
+  .cstep .ic { font-family: var(--mono); font-weight: 700; margin-top: 1px; font-size: 14px; }
+  .crail.leak .cstep .ic { color: var(--block); }
+  .crail.safe .cstep .ic { color: var(--sov); }
+  .cstep .nm { font-weight: 650; font-size: 14px; }
+  .cstep .dt { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .cverdict { padding: 14px 18px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12.5px; letter-spacing: .06em; text-transform: uppercase; background: var(--raised); }
+  .crail.leak .cverdict { color: var(--block); }
+  .crail.safe .cverdict { color: var(--sov); }
+
+  /* ---------- live console mock ---------- */
+  .console { margin-top: 34px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; background: var(--panel); box-shadow: var(--shadow); }
+  .console-chrome { display: flex; align-items: center; gap: 8px; padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--raised); }
+  .console-chrome .dots { display: flex; gap: 6px; }
+  .console-chrome .dots i { width: 11px; height: 11px; border-radius: 50%; background: var(--line); }
+  .console-chrome .addr { font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-left: 8px; }
+  .console-chrome .lock { color: var(--sov); }
+  .console-tabs { display: flex; gap: 2px; padding: 0 12px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+  .console-tabs button { font-family: var(--mono); font-size: 12.5px; letter-spacing: .05em; background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 12px 14px; cursor: pointer; white-space: nowrap; }
+  .console-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--brass); }
+  .console-tabs button:hover { color: var(--text); }
+  .console-body { padding: 20px; min-height: 250px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .kpi { background: var(--panel); padding: 15px 16px; }
+  .kpi .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+  .kpi .v { font-size: 26px; font-weight: 750; margin-top: 5px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+  .kpi .v small { font-size: 13px; color: var(--muted); font-weight: 500; }
+  .kpi .v.sov { color: var(--sov); } .kpi .v.brass { color: var(--brass); }
+  .tablewrap { overflow-x: auto; }
+  .ctable { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; min-width: 460px; }
+  .ctable th { text-align: left; color: var(--faint); font-weight: 500; letter-spacing: .06em; text-transform: uppercase; font-size: 10px; padding: 9px 10px; border-bottom: 1px solid var(--line); }
+  .ctable td { padding: 10px 10px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+  .ctable tr:last-child td { border-bottom: none; }
+  .ctable td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .pill { font-family: var(--mono); font-size: 10.5px; padding: 2px 7px; border-radius: 5px; letter-spacing: .04em; }
+  .pill.sov { color: var(--sov); background: color-mix(in srgb, var(--sov) 14%, transparent); }
+  .pill.cloud { color: var(--cloud); background: color-mix(in srgb, var(--cloud) 14%, transparent); }
+  .pill.block { color: var(--block); background: color-mix(in srgb, var(--block) 14%, transparent); }
+  .pill.brass { color: var(--brass); background: color-mix(in srgb, var(--brass) 15%, transparent); }
+  .console-note { font-family: var(--mono); font-size: 11px; color: var(--faint); margin: 12px 2px 0; }
+  .policy-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 12px 4px; border-top: 1px solid var(--line-soft); }
+  .policy-row:first-child { border-top: none; }
+  .policy-row .tier { font-family: var(--mono); font-size: 12.5px; font-weight: 700; width: 116px; }
+  .policy-row .allow { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .strategy { font-family: var(--mono); font-size: 12.5px; color: var(--muted); margin-bottom: 8px; }
+  .strategy b { color: var(--brass); }
+
   .reveal { opacity: 0; transform: translateY(14px); }
   @media (prefers-reduced-motion: no-preference) {
     .reveal { transition: opacity .7s ease, transform .7s ease; }
@@ -361,6 +420,7 @@
       <a href="#thesis">Thesis</a>
       <a href="#arch">Architecture</a>
       <a href="#pipeline">Pipeline</a>
+      <a href="#console">Console</a>
       <a href="#oia">OIA</a>
       <a href="#gaps">Gaps</a>
     </nav>
@@ -460,6 +520,27 @@
           <p>Retrieved chunk text rides <b style="color:var(--text)">inside the prompt</b>. So whatever governs the prompt governs the confidential content. Bastion forces regulated queries in-boundary and blocks the cloud path — even when a cloud key is present.</p>
         </div>
       </div>
+
+      <h3 style="margin-top:48px;font-size:15px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--muted)">The same confidential query, two stacks</h3>
+      <p style="color:var(--muted);margin-top:6px">“From our private board deck, what were the Q3 churn drivers?” — a naive cloud RAG leaks it three ways; Bastion contains it.</p>
+      <div class="contrast">
+        <div class="crail leak">
+          <div class="crail-head"><span class="h">Naive cloud RAG<small>the common default</small></span><span class="badge">✕ leaked</span></div>
+          <div class="cstep"><span class="ic">✕</span><span><span class="nm">Embed via a cloud API</span><span class="dt">Raw deck text is POSTed to a hosted embedding endpoint — the first silent egress.</span></span></div>
+          <div class="cstep"><span class="ic">✕</span><span><span class="nm">Store in a cloud vector DB</span><span class="dt">Vectors sit off-prem — and embeddings can be inverted back to source text.</span></span></div>
+          <div class="cstep"><span class="ic">·</span><span><span class="nm">Retrieve → augment</span><span class="dt">Top chunks are pasted into the prompt.</span></span></div>
+          <div class="cstep"><span class="ic">✕</span><span><span class="nm">Send to a cloud model</span><span class="dt">Confidential content now rides inside a third-party prompt. No governor sees it.</span></span></div>
+          <div class="cverdict">verdict · confidential content egressed × 3</div>
+        </div>
+        <div class="crail safe">
+          <div class="crail-head"><span class="h">Bastion governed<small>this stack</small></span><span class="badge">✓ contained</span></div>
+          <div class="cstep"><span class="ic">✓</span><span><span class="nm">Embed locally · in-process</span><span class="dt">ONNX MiniLM (384-dim, WASM) — no embedding API is ever called. Gate 01.</span></span></div>
+          <div class="cstep"><span class="ic">✓</span><span><span class="nm">Store in RVF · on-prem</span><span class="dt">Witness-chained vectors stay in-boundary, tagged with the sensitivity label.</span></span></div>
+          <div class="cstep"><span class="ic">·</span><span><span class="nm">Retrieve → augment</span><span class="dt">Top chunks are placed into the prompt — where the governor can see them.</span></span></div>
+          <div class="cstep"><span class="ic">✓</span><span><span class="nm">Governor routes the prompt</span><span class="dt">Classified confidential → gpt-oss-120b · customer · $0. Cloud path blocked. Gate 02.</span></span></div>
+          <div class="cverdict">verdict · confidential · gpt-oss-120b · customer · $0</div>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -497,10 +578,28 @@
     </div>
   </section>
 
+  <!-- LIVE CONSOLE -->
+  <section id="console">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">04</span> Proof, in one surface</div>
+      <h2>The live console — everything on real data.</h2>
+      <p class="lede">One page, bound to loopback and reachable only over the tailnet. It reads Bastion's own signed audit chain, model registry, and router policy — so operation and proof share a screen.</p>
+      <div class="console">
+        <div class="console-chrome">
+          <span class="dots"><i></i><i></i><i></i></span>
+          <span class="addr"><span class="lock">⚿</span> https://bastion-01.&lt;tailnet&gt;.ts.net</span>
+        </div>
+        <div class="console-tabs" id="consoleTabs" role="tablist" aria-label="Console sections"></div>
+        <div class="console-body" id="consoleBody" role="tabpanel"></div>
+      </div>
+      <p class="console-note">Illustrative snapshot — the real console renders live values from <span style="color:var(--brass)">audit.jsonl</span>, <span style="color:var(--brass)">/v1/models</span>, and <span style="color:var(--brass)">router.config.json</span>.</p>
+    </div>
+  </section>
+
   <!-- OIA MAPPING -->
   <section id="oia">
     <div class="wrap reveal">
-      <div class="eyebrow"><span class="num">04</span> Mapped to a standard</div>
+      <div class="eyebrow"><span class="num">05</span> Mapped to a standard</div>
       <h2>A near reference-implementation of the OIA lower-and-mid stack.</h2>
       <p class="lede">Read through the ten-layer OIA Reference Model, the claim is deliberately testable: strong where it ships, honestly blank where it doesn't.</p>
       <div class="oia" id="oia">
@@ -518,7 +617,7 @@
   <!-- GAPS -->
   <section id="gaps">
     <div class="wrap reveal">
-      <div class="eyebrow"><span class="num">05</span> Stated plainly</div>
+      <div class="eyebrow"><span class="num">06</span> Stated plainly</div>
       <h2>What's honestly missing.</h2>
       <p class="lede">The guarantee is governance-enforced and audit-recorded — not yet hardware-attested. The repo names its gaps rather than blurring them.</p>
       <div class="gaps" style="margin-top:28px">
@@ -534,7 +633,7 @@
   <!-- REPO MAP -->
   <section id="repo">
     <div class="wrap reveal">
-      <div class="eyebrow"><span class="num">06</span> Repository map</div>
+      <div class="eyebrow"><span class="num">07</span> Repository map</div>
       <h2>Where to read next.</h2>
       <div class="filetable" style="margin-top:24px">
         <div class="frow"><span class="path">rag-service/</span><span class="desc">The zero-egress RAG service: server, ingest pipeline, hybrid retrieval, local embedder, and the Bastion query bridge.</span></div>
@@ -731,6 +830,88 @@
       '<span class="strength"><span class="bars"><i></i><i></i><i></i></span><span class="txt">' + labels[l.s] + '</span></span>';
     oiaEl.appendChild(d);
   });
+
+  /* ---------- live console mock ---------- */
+  var FLEET = [
+    { m: "gpt-oss-120b", host: "ba71", b: "customer", cap: 88, st: "resident" },
+    { m: "qwen2.5-32b", host: "spark-47d8", b: "customer", cap: 70, st: "available" },
+    { m: "llama-3.1-70b", host: "spark-47d8", b: "customer", cap: 75, st: "available" },
+    { m: "qwen2.5-7b", host: "nutanix-ada", b: "customer", cap: 55, st: "available" },
+    { m: "claude-opus-4-8", host: "cloud/anthropic", b: "third_party", cap: 96, st: "cloud" }
+  ];
+  var TIERS = [
+    { t: "public", allow: "local + cloud · escalation ✓" },
+    { t: "internal", allow: "local + cloud · de-identified" },
+    { t: "confidential", allow: "in-boundary · cloud de-id only" },
+    { t: "regulated", allow: "in-boundary only · cloud denied" }
+  ];
+  var AUDIT = [
+    { sens: "regulated", model: "gpt-oss-120b", b: "customer", cost: "$0.00", out: "served" },
+    { sens: "public", model: "claude-opus-4-8", b: "third_party", cost: "$0.012", out: "served" },
+    { sens: "regulated", model: "—", b: "—", cost: "$0.00", out: "blocked" },
+    { sens: "confidential", model: "gpt-oss-120b", b: "customer", cost: "$0.00", out: "served" },
+    { sens: "internal", model: "qwen2.5-32b", b: "customer", cost: "$0.00", out: "served" },
+    { sens: "public", model: "claude-opus-4-8", b: "third_party", cost: "$0.011", out: "served" }
+  ];
+  function bpill(b) {
+    if (b === "customer") return '<span class="pill sov">customer</span>';
+    if (b === "third_party") return '<span class="pill cloud">third_party</span>';
+    return '<span class="mono-muted" style="color:var(--faint)">—</span>';
+  }
+  var CTABS = {
+    Overview: function () {
+      return '<div class="kpis">' +
+        '<div class="kpi"><div class="k">Requests</div><div class="v">1,284</div></div>' +
+        '<div class="kpi"><div class="k">In-boundary</div><div class="v sov">91.4<small>%</small></div></div>' +
+        '<div class="kpi"><div class="k">Cloud spend</div><div class="v">$0.61</div></div>' +
+        '<div class="kpi"><div class="k">Est. saved</div><div class="v brass">$11.73</div></div>' +
+        '<div class="kpi"><div class="k">Leaks</div><div class="v sov">0</div></div>' +
+        '<div class="kpi"><div class="k">Blocked</div><div class="v">47</div></div>' +
+        '</div><p class="console-note">A leak = content served to a boundary its sensitivity forbids. A <em>blocked</em> outcome is the policy working, not a leak.</p>';
+    },
+    Fleet: function () {
+      var rows = FLEET.map(function (f) {
+        return '<tr><td style="color:var(--text)">' + f.m + '</td><td class="mono-muted" style="color:var(--muted)">' + f.host + '</td><td>' + bpill(f.b) +
+          '</td><td class="num">' + f.cap + '</td><td>' + (f.st === "resident" ? '<span class="pill brass">resident</span>' : f.st === "cloud" ? '<span class="pill cloud">cloud</span>' : '<span class="mono-muted" style="color:var(--muted)">' + f.st + '</span>') + '</td></tr>';
+      }).join("");
+      return '<div class="tablewrap"><table class="ctable"><thead><tr><th>Model</th><th>Host</th><th>Boundary</th><th style="text-align:right">Cap</th><th>State</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+    },
+    Policy: function () {
+      var rows = TIERS.map(function (t) {
+        var cls = t.t === "regulated" || t.t === "confidential" ? "sov" : "cloud";
+        return '<div class="policy-row"><span class="tier"><span class="pill ' + cls + '">' + t.t + '</span></span><span class="allow">→ ' + t.allow + '</span></div>';
+      }).join("");
+      return '<div class="strategy">routingStrategy = <b>sovereignty</b> · minCompetency 40 · deidentifyByDefault true</div>' + rows;
+    },
+    Audit: function () {
+      var rows = AUDIT.map(function (e, i) {
+        var h = sig(e.sens + e.model + e.b + i);
+        var outCls = e.out === "blocked" ? "block" : "sov";
+        return '<tr><td>' + bpill2(e.sens) + '</td><td style="color:var(--text)">' + e.model + '</td><td>' + bpill(e.b) +
+          '</td><td class="num">' + e.cost + '</td><td><span class="pill ' + outCls + '">' + e.out + '</span></td><td class="mono-muted" style="color:var(--faint)">' + h.slice(0, 12) + '…</td></tr>';
+      }).join("");
+      return '<div class="tablewrap"><table class="ctable"><thead><tr><th>Sensitivity</th><th>Model</th><th>Boundary</th><th style="text-align:right">Cost</th><th>Outcome</th><th>HMAC ⛓</th></tr></thead><tbody>' + rows + '</tbody></table></div><p class="console-note">Each entry is hash-linked to the previous — the chain is verified, not merely trusted.</p>';
+    }
+  };
+  function bpill2(s) {
+    var cls = (s === "regulated" || s === "confidential") ? "sov" : "cloud";
+    return '<span class="pill ' + cls + '">' + s + '</span>';
+  }
+  var ctabsEl = document.getElementById("consoleTabs");
+  var cbodyEl = document.getElementById("consoleBody");
+  var CORDER = ["Overview", "Fleet", "Policy", "Audit"];
+  function renderCtab(name) {
+    Array.prototype.forEach.call(ctabsEl.children, function (c) { c.setAttribute("aria-selected", c.textContent === name ? "true" : "false"); });
+    cbodyEl.innerHTML = CTABS[name]();
+  }
+  CORDER.forEach(function (name) {
+    var b = document.createElement("button");
+    b.setAttribute("role", "tab");
+    b.textContent = name;
+    b.addEventListener("click", function () { renderCtab(name); });
+    ctabsEl.appendChild(b);
+  });
+  renderCtab("Overview");
 
   /* ---------- scroll reveal ---------- */
   if ("IntersectionObserver" in window && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
