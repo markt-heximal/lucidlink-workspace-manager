@@ -1,0 +1,745 @@
+<title>Bastion AI — The Boundary</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    color-scheme: light dark;
+    /* dark is the primary world */
+    --ink: #0A0E14;
+    --panel: #121A24;
+    --raised: #18222E;
+    --line: #24303D;
+    --line-soft: #1B2530;
+    --text: #E6EDF3;
+    --muted: #8A9AA9;
+    --faint: #5F707E;
+    --brass: #C79A4B;
+    --brass-dim: #8E7333;
+    --sov: #43C4A8;   /* in-boundary / sovereign */
+    --cloud: #5B9BD5; /* third-party cloud */
+    --block: #E56A54; /* blocked / leak */
+    --grid: rgba(120,150,180,0.045);
+    --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 18px 40px -24px rgba(0,0,0,0.7);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ink: #EAEEF3;
+      --panel: #FFFFFF;
+      --raised: #F5F8FB;
+      --line: #D3DCE4;
+      --line-soft: #E1E8EF;
+      --text: #142129;
+      --muted: #55676F;
+      --faint: #7C8B94;
+      --brass: #8C6A1C;
+      --brass-dim: #A98A3E;
+      --sov: #1E8E7A;
+      --cloud: #2F6FB0;
+      --block: #C24A38;
+      --grid: rgba(30,60,90,0.05);
+      --shadow: 0 1px 0 rgba(255,255,255,0.6), 0 20px 40px -28px rgba(20,40,60,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --ink: #0A0E14; --panel: #121A24; --raised: #18222E; --line: #24303D; --line-soft:#1B2530;
+    --text: #E6EDF3; --muted: #8A9AA9; --faint:#5F707E;
+    --brass:#C79A4B; --brass-dim:#8E7333; --sov:#43C4A8; --cloud:#5B9BD5; --block:#E56A54;
+    --grid: rgba(120,150,180,0.045);
+    --shadow: 0 1px 0 rgba(255,255,255,0.03), 0 18px 40px -24px rgba(0,0,0,0.7);
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --ink:#EAEEF3; --panel:#FFFFFF; --raised:#F5F8FB; --line:#D3DCE4; --line-soft:#E1E8EF;
+    --text:#142129; --muted:#55676F; --faint:#7C8B94;
+    --brass:#8C6A1C; --brass-dim:#A98A3E; --sov:#1E8E7A; --cloud:#2F6FB0; --block:#C24A38;
+    --grid: rgba(30,60,90,0.05);
+    --shadow: 0 1px 0 rgba(255,255,255,0.6), 0 20px 40px -28px rgba(20,40,60,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px) 0 0 / 34px 34px,
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px) 0 0 / 34px 34px,
+      var(--ink);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: var(--brass); color: #0A0E14; }
+  a { color: var(--brass); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible {
+    outline: 2px solid var(--brass); outline-offset: 3px; border-radius: 3px;
+  }
+
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- top bar ---------- */
+  header.bar {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: blur(10px);
+    background: color-mix(in srgb, var(--ink) 82%, transparent);
+    border-bottom: 1px solid var(--line);
+  }
+  .bar-in { display: flex; align-items: center; gap: 14px; height: 58px; }
+  .brand { display: flex; align-items: baseline; gap: 10px; font-family: var(--mono); }
+  .brand b { font-weight: 700; letter-spacing: .02em; font-size: 15px; }
+  .brand .slash { color: var(--brass); }
+  .brand .tag {
+    font-size: 11px; color: var(--muted); letter-spacing: .12em; text-transform: uppercase;
+  }
+  .bar-spacer { flex: 1; }
+  .nav { display: flex; gap: 20px; font-family: var(--mono); font-size: 12.5px; letter-spacing: .04em; }
+  .nav a { color: var(--muted); text-transform: uppercase; }
+  .nav a:hover { color: var(--text); text-decoration: none; }
+  .themebtn {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+    background: transparent; color: var(--muted); border: 1px solid var(--line);
+    padding: 7px 11px; border-radius: 7px; cursor: pointer;
+  }
+  .themebtn:hover { color: var(--text); border-color: var(--faint); }
+  @media (max-width: 720px) { .nav { display: none; } }
+
+  /* ---------- eyebrow / section scaffolding ---------- */
+  .eyebrow {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .18em; text-transform: uppercase;
+    color: var(--brass); display: flex; align-items: center; gap: 12px; margin: 0 0 20px;
+  }
+  .eyebrow .num { color: var(--faint); }
+  .eyebrow::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+
+  section { padding: 84px 0; border-top: 1px solid var(--line-soft); }
+  section:first-of-type { border-top: none; }
+  h1, h2, h3 { text-wrap: balance; line-height: 1.1; }
+  h2 { font-size: clamp(28px, 4.4vw, 42px); font-weight: 800; letter-spacing: -0.02em; margin: 0 0 18px; }
+  h3 { font-size: 19px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .lede { font-size: clamp(18px, 2.2vw, 21px); color: var(--muted); max-width: 62ch; }
+  p { max-width: 68ch; }
+  .prose p + p { margin-top: 1em; }
+
+  /* ---------- hero ---------- */
+  .hero { padding-top: 68px; padding-bottom: 40px; }
+  .hero h1 {
+    font-size: clamp(38px, 7vw, 74px); font-weight: 850; letter-spacing: -0.035em; margin: 18px 0 0;
+  }
+  .hero h1 .b { color: var(--brass); }
+  .hero-sub { margin: 22px 0 0; font-size: clamp(18px, 2.4vw, 22px); color: var(--muted); max-width: 60ch; }
+  .hero-meta {
+    display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px;
+    font-family: var(--mono); font-size: 12px; letter-spacing: .04em;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 7px;
+    border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; color: var(--muted);
+    background: var(--panel);
+  }
+  .chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brass); }
+  .chip.sov .dot { background: var(--sov); }
+  .chip.cloud .dot { background: var(--cloud); }
+
+  /* ---------- interactive router ---------- */
+  .router {
+    margin-top: 44px; border: 1px solid var(--line); border-radius: 16px;
+    background:
+      radial-gradient(120% 100% at 50% -20%, color-mix(in srgb, var(--brass) 7%, transparent), transparent 60%),
+      var(--panel);
+    box-shadow: var(--shadow); overflow: hidden;
+  }
+  .router-head {
+    display: flex; align-items: center; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line);
+    font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted);
+  }
+  .router-head .live { width: 8px; height: 8px; border-radius: 50%; background: var(--sov); box-shadow: 0 0 0 0 var(--sov); }
+  @media (prefers-reduced-motion: no-preference) {
+    .router-head .live { animation: pulse 2.4s infinite; }
+    @keyframes pulse { 0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--sov) 70%,transparent);} 70%{box-shadow:0 0 0 7px transparent;} 100%{box-shadow:0 0 0 0 transparent;} }
+  }
+  .router-body { padding: 22px 18px 24px; }
+  .samples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+  .samples button {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .03em;
+    background: var(--raised); color: var(--text); border: 1px solid var(--line);
+    padding: 9px 13px; border-radius: 9px; cursor: pointer; transition: border-color .18s, transform .18s;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .samples button:hover { border-color: var(--faint); transform: translateY(-1px); }
+  .samples button[aria-pressed="true"] { border-color: var(--brass); color: var(--text); }
+  .samples button .lvl { font-size: 10px; letter-spacing: .12em; padding: 2px 6px; border-radius: 5px; text-transform: uppercase; }
+  .lvl.regulated, .lvl.confidential { background: color-mix(in srgb,var(--sov) 18%, transparent); color: var(--sov); }
+  .lvl.public { background: color-mix(in srgb,var(--cloud) 18%, transparent); color: var(--cloud); }
+
+  .query-line {
+    font-family: var(--mono); font-size: 13.5px; color: var(--text); background: var(--ink);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 24px;
+    min-height: 44px; display: flex; align-items: center; gap: 10px;
+  }
+  .query-line .caret { color: var(--brass); }
+
+  /* diagram */
+  .diagram {
+    display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: stretch; gap: 0;
+  }
+  .node {
+    border: 1px solid var(--line); border-radius: 12px; padding: 14px; background: var(--raised);
+    display: flex; flex-direction: column; gap: 4px; transition: border-color .3s, box-shadow .3s, opacity .3s, background .3s;
+  }
+  .node .role { font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
+  .node .name { font-weight: 700; font-size: 15px; }
+  .node .meta { font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+  .node.governor { border-color: var(--brass); background: color-mix(in srgb, var(--brass) 10%, var(--raised)); }
+  .node.governor .role { color: var(--brass); }
+  .node.dim { opacity: .38; }
+  .node.on-sov { border-color: var(--sov); box-shadow: 0 0 0 1px var(--sov), 0 0 26px -8px var(--sov); }
+  .node.on-sov .role { color: var(--sov); }
+  .node.on-cloud { border-color: var(--cloud); box-shadow: 0 0 0 1px var(--cloud), 0 0 26px -8px var(--cloud); }
+  .node.on-cloud .role { color: var(--cloud); }
+
+  .wire { align-self: center; min-width: 26px; height: 2px; background: var(--line); position: relative; transition: background .3s; }
+  .wire::after {
+    content: ""; position: absolute; right: -1px; top: -3px; border: 4px solid transparent;
+    border-left-color: var(--line); transition: border-left-color .3s;
+  }
+  .wire.on-sov { background: var(--sov); } .wire.on-sov::after { border-left-color: var(--sov); }
+  .wire.on-cloud { background: var(--cloud); } .wire.on-cloud::after { border-left-color: var(--cloud); }
+  .wire.blocked { background: var(--block); }
+  .wire.blocked::after { border-left-color: var(--block); }
+  .wire .barrier {
+    position: absolute; inset: -18px 0 auto 0; left: 50%; transform: translate(-50%,-8px);
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em; color: var(--block);
+    background: var(--panel); border: 1px solid var(--block); border-radius: 5px; padding: 1px 6px; white-space: nowrap;
+    opacity: 0; transition: opacity .3s;
+  }
+  .wire.blocked .barrier { opacity: 1; }
+
+  .destcol { display: grid; gap: 10px; }
+
+  /* verdict receipt */
+  .verdict {
+    margin-top: 24px; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--ink);
+  }
+  .verdict-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;
+    padding: 12px 16px; border-bottom: 1px dashed var(--line); font-family: var(--mono); font-size: 11px;
+    letter-spacing: .12em; text-transform: uppercase; color: var(--faint); }
+  .verdict-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px,1fr)); gap: 1px; background: var(--line); }
+  .vcell { background: var(--ink); padding: 13px 16px; }
+  .vcell .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint); }
+  .vcell .v { font-family: var(--mono); font-size: 14px; margin-top: 4px; font-weight: 600; }
+  .v.sov { color: var(--sov); } .v.cloud { color: var(--cloud); } .v.block { color: var(--block); } .v.brass { color: var(--brass); }
+  .verdict-note { padding: 13px 16px; color: var(--muted); font-size: 14.5px; border-top: 1px solid var(--line); }
+  .verdict-note b { color: var(--text); font-weight: 600; }
+  .sighash { font-family: var(--mono); font-size: 11px; color: var(--faint); word-break: break-all; }
+
+  @media (max-width: 780px) {
+    .diagram { grid-template-columns: 1fr; gap: 10px; }
+    .wire { width: 2px; min-width: 0; height: 22px; justify-self: center; }
+    .wire::after { right: -3px; top: auto; bottom: -1px; border: 4px solid transparent; border-top-color: var(--line); }
+    .wire.on-sov::after { border-top-color: var(--sov); border-left-color: transparent; }
+    .wire.on-cloud::after { border-top-color: var(--cloud); border-left-color: transparent; }
+    .wire.blocked::after { border-top-color: var(--block); border-left-color: transparent; }
+    .wire .barrier { position: static; transform: none; display: inline-block; margin: 0 auto; }
+  }
+
+  /* ---------- generic cards ---------- */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  @media (max-width: 800px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
+  .card {
+    border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 22px; box-shadow: var(--shadow);
+  }
+  .card .kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--brass); margin-bottom: 10px; }
+  .card p { color: var(--muted); font-size: 15.5px; margin: 0; }
+
+  .gates { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 8px; }
+  @media (max-width: 800px) { .gates { grid-template-columns: 1fr; } }
+  .gate { border: 1px solid var(--line); border-left: 3px solid var(--sov); border-radius: 12px; background: var(--panel); padding: 22px; }
+  .gate .n { font-family: var(--mono); font-size: 12px; color: var(--sov); letter-spacing: .1em; }
+  .gate h3 { margin-top: 8px; }
+  .gate p { color: var(--muted); font-size: 15px; margin: 6px 0 0; }
+
+  .mythcard { border: 1px solid var(--line); border-left: 3px solid var(--block); border-radius: 12px; background: var(--panel); padding: 18px 20px; }
+  .mythcard .x { color: var(--block); font-family: var(--mono); font-weight: 700; }
+  .mythcard h3 { font-size: 16px; }
+  .mythcard p { color: var(--muted); font-size: 14.5px; margin: 4px 0 0; }
+  .myth-wrap { display: grid; gap: 12px; }
+
+  /* ---------- pipeline stepper ---------- */
+  .stepper { margin-top: 8px; }
+  .steps { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+  .steps button {
+    font-family: var(--mono); font-size: 12px; letter-spacing: .03em; cursor: pointer;
+    background: var(--panel); color: var(--muted); border: 1px solid var(--line); padding: 9px 12px; border-radius: 9px;
+    display: inline-flex; align-items: center; gap: 8px; transition: border-color .18s, color .18s;
+  }
+  .steps button .idx { color: var(--faint); }
+  .steps button:hover { color: var(--text); border-color: var(--faint); }
+  .steps button[aria-selected="true"] { border-color: var(--brass); color: var(--text); background: color-mix(in srgb, var(--brass) 8%, var(--panel)); }
+  .steps button[aria-selected="true"] .idx { color: var(--brass); }
+  .steppanel { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); box-shadow: var(--shadow); padding: 26px; min-height: 190px; }
+  .steppanel .stage-tag { font-family: var(--mono); font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--brass); }
+  .steppanel h3 { margin-top: 8px; font-size: 22px; }
+  .steppanel p { color: var(--muted); margin-top: 8px; font-size: 15.5px; }
+  .steppanel .gatebadge {
+    display: inline-flex; align-items: center; gap: 7px; margin-top: 16px;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: .05em; color: var(--sov);
+    border: 1px solid color-mix(in srgb, var(--sov) 45%, var(--line)); border-radius: 999px; padding: 5px 11px;
+    background: color-mix(in srgb, var(--sov) 10%, transparent);
+  }
+  .steppanel .file { font-family: var(--mono); font-size: 12px; color: var(--faint); margin-top: 14px; }
+
+  /* ---------- OIA stack ---------- */
+  .oia { display: grid; gap: 6px; margin-top: 8px; }
+  .layer {
+    display: grid; grid-template-columns: 46px 1fr 128px; align-items: center; gap: 14px;
+    border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 12px 16px;
+    transition: border-color .18s, background .18s; cursor: default;
+  }
+  .layer:hover { border-color: var(--faint); background: var(--raised); }
+  .layer .lnum { font-family: var(--mono); font-weight: 700; color: var(--brass); font-size: 15px; }
+  .layer .lname { font-weight: 650; font-size: 15px; }
+  .layer .lname small { display: block; color: var(--muted); font-weight: 400; font-size: 13px; font-family: var(--mono); margin-top: 2px; }
+  .strength { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+  .bars { display: flex; gap: 3px; }
+  .bars i { width: 8px; height: 16px; border-radius: 2px; background: var(--line); }
+  .strength .txt { font-family: var(--mono); font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); width: 58px; text-align: right; }
+  .layer.s-strong .bars i:nth-child(-n+3) { background: var(--sov); }
+  .layer.s-strong .txt { color: var(--sov); }
+  .layer.s-solid .bars i:nth-child(-n+2) { background: var(--cloud); }
+  .layer.s-solid .txt { color: var(--cloud); }
+  .layer.s-partial .bars i:nth-child(-n+1) { background: var(--brass); }
+  .layer.s-partial .txt { color: var(--brass); }
+  .layer.s-none { opacity: .6; }
+  .layer.s-none .txt { color: var(--faint); }
+  @media (max-width: 620px) {
+    .layer { grid-template-columns: 34px 1fr; }
+    .strength { grid-column: 1 / -1; justify-content: flex-start; }
+    .strength .txt { text-align: left; }
+  }
+
+  /* ---------- honest gaps ---------- */
+  .gaps { display: grid; gap: 10px; margin-top: 8px; }
+  .gap { display: flex; gap: 14px; align-items: flex-start; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 16px 18px; }
+  .gap .mark { font-family: var(--mono); color: var(--brass); font-size: 13px; margin-top: 2px; white-space: nowrap; }
+  .gap div p { margin: 0; color: var(--muted); font-size: 15px; }
+  .gap div b { color: var(--text); }
+
+  /* ---------- repo map ---------- */
+  .filetable { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; font-family: var(--mono); font-size: 13.5px; }
+  .frow { display: grid; grid-template-columns: 190px 1fr; gap: 16px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .frow:first-child { border-top: none; }
+  .frow .path { color: var(--brass); }
+  .frow .desc { color: var(--muted); font-family: var(--sans); font-size: 14.5px; }
+  @media (max-width: 640px) { .frow { grid-template-columns: 1fr; gap: 4px; } }
+
+  .callout { border: 1px solid var(--brass-dim); border-radius: 12px; background: color-mix(in srgb, var(--brass) 8%, var(--panel)); padding: 20px 22px; margin-top: 26px; }
+  .callout p { margin: 0; color: var(--text); }
+  .callout .lbl { font-family: var(--mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--brass); margin-bottom: 8px; }
+
+  footer { border-top: 1px solid var(--line); padding: 40px 0 64px; color: var(--muted); }
+  footer .foot-in { display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline; justify-content: space-between; font-family: var(--mono); font-size: 12.5px; }
+  footer .note { font-family: var(--sans); font-size: 13.5px; max-width: 60ch; margin-top: 18px; color: var(--faint); }
+
+  .reveal { opacity: 0; transform: translateY(14px); }
+  @media (prefers-reduced-motion: no-preference) {
+    .reveal { transition: opacity .7s ease, transform .7s ease; }
+  }
+  .reveal.in { opacity: 1; transform: none; }
+  @media (prefers-reduced-motion: reduce) { .reveal { opacity: 1; transform: none; } }
+</style>
+
+<header class="bar">
+  <div class="wrap bar-in">
+    <div class="brand"><b>bastion<span class="slash">_</span>ai</b><span class="tag">sovereign ai stack</span></div>
+    <div class="bar-spacer"></div>
+    <nav class="nav">
+      <a href="#thesis">Thesis</a>
+      <a href="#arch">Architecture</a>
+      <a href="#pipeline">Pipeline</a>
+      <a href="#oia">OIA</a>
+      <a href="#gaps">Gaps</a>
+    </nav>
+    <button class="themebtn" id="themebtn" aria-label="Toggle color theme">Theme</button>
+  </div>
+</header>
+
+<main>
+  <!-- HERO -->
+  <section class="hero">
+    <div class="wrap">
+      <div class="eyebrow"><span class="num">//</span> Sovereign AI · on-prem · zero-egress</div>
+      <h1>Use the best AI models<br>without regulated data<br>crossing <span class="b">the boundary.</span></h1>
+      <p class="hero-sub">Bastion AI is a working, self-hosted stack that answers your most sensitive data in-boundary — and proves, with a signed receipt, that it never left.</p>
+      <div class="hero-meta">
+        <span class="chip"><span class="dot"></span> Node ESM · ~8 modules</span>
+        <span class="chip sov"><span class="dot"></span> Local MiniLM embeddings</span>
+        <span class="chip cloud"><span class="dot"></span> Cloud only for public work</span>
+        <span class="chip"><span class="dot"></span> HMAC-signed audit chain</span>
+      </div>
+
+      <!-- INTERACTIVE ROUTER -->
+      <div class="router" id="router">
+        <div class="router-head"><span class="live"></span> Bastion trust router · :3000 · <span style="color:var(--brass)">routingStrategy = sovereignty</span></div>
+        <div class="router-body">
+          <div class="samples" id="samples" role="group" aria-label="Sample queries"></div>
+          <div class="query-line"><span class="caret">&gt;</span> <span id="queryText">Pick a query to route through the governor…</span></div>
+
+          <div class="diagram" id="diagram">
+            <div class="node" id="n-query">
+              <span class="role">Operator · tailnet</span>
+              <span class="name">Augmented prompt</span>
+              <span class="meta">retrieved chunks inline</span>
+            </div>
+            <div class="wire" id="w1"></div>
+            <div class="node governor" id="n-gov">
+              <span class="role">The governor</span>
+              <span class="name">Bastion</span>
+              <span class="meta">classify · policy · route · sign</span>
+            </div>
+            <div class="wire" id="w2"><span class="barrier">CLOUD PATH BLOCKED</span></div>
+            <div class="destcol">
+              <div class="node" id="n-fleet">
+                <span class="role">In-boundary · customer</span>
+                <span class="name">Self-hosted fleet</span>
+                <span class="meta">gpt-oss:120b · $0</span>
+              </div>
+              <div class="node" id="n-cloud">
+                <span class="role">Third-party · BYOK</span>
+                <span class="name">Cloud Claude</span>
+                <span class="meta">public / internal only</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="verdict" id="verdict" hidden>
+            <div class="verdict-top"><span>Governance verdict</span><span id="vReqId">req —</span></div>
+            <div class="verdict-grid">
+              <div class="vcell"><div class="k">Sensitivity</div><div class="v" id="vSens">—</div></div>
+              <div class="vcell"><div class="k">Model</div><div class="v" id="vModel">—</div></div>
+              <div class="vcell"><div class="k">Boundary</div><div class="v" id="vBound">—</div></div>
+              <div class="vcell"><div class="k">Cost</div><div class="v" id="vCost">—</div></div>
+              <div class="vcell"><div class="k">Cloud path</div><div class="v" id="vCloud">—</div></div>
+            </div>
+            <div class="verdict-note" id="vNote"></div>
+            <div class="verdict-note"><span class="sighash" id="vHash"></span></div>
+          </div>
+        </div>
+      </div>
+      <p style="font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:14px;">A local demonstration of the routing logic — the real verdicts come from Bastion's classifier and land in <span style="color:var(--brass)">audit.jsonl</span>.</p>
+    </div>
+  </section>
+
+  <!-- THESIS -->
+  <section id="thesis">
+    <div class="wrap reveal prose">
+      <div class="eyebrow"><span class="num">01</span> The thesis</div>
+      <h2>Sovereignty lives in exactly two places — not where you'd think.</h2>
+      <p class="lede">Most "sovereign RAG" claims don't survive a skeptic. This project is explicit about why, and pins the guarantee to two mechanical gates rather than good intentions.</p>
+
+      <div style="margin-top:34px" class="myth-wrap">
+        <div class="mythcard"><h3><span class="x">✕</span> Streaming a file is not egress control.</h3><p>Streaming reduces at-rest copies, but the bytes still land in a process that could send them anywhere. Transport ≠ containment.</p></div>
+        <div class="mythcard"><h3><span class="x">✕</span> Vectors are not anonymization.</h3><p>Embeddings can be inverted back to approximate source text. Vectors of confidential text are themselves confidential.</p></div>
+        <div class="mythcard"><h3><span class="x">✕</span> A cloud contract is not sovereignty.</h3><p>A contractual promise is trust <em>granted</em>, not trust <em>verified</em>. The architecture must not depend on it for regulated content.</p></div>
+      </div>
+
+      <h3 style="margin-top:44px;font-size:15px;font-family:var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--sov)">The two gates that actually hold</h3>
+      <div class="gates">
+        <div class="gate">
+          <span class="n">GATE 01</span>
+          <h3>Local embeddings</h3>
+          <p>Raw text is vectorized <b style="color:var(--text)">in-process</b> by an ONNX MiniLM model (all-MiniLM-L6-v2, 384-dim, WASM/SIMD). No embedding API is ever called — closing the most common silent egress in RAG systems.</p>
+        </div>
+        <div class="gate">
+          <span class="n">GATE 02</span>
+          <h3>A governor over the prompt</h3>
+          <p>Retrieved chunk text rides <b style="color:var(--text)">inside the prompt</b>. So whatever governs the prompt governs the confidential content. Bastion forces regulated queries in-boundary and blocks the cloud path — even when a cloud key is present.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section id="arch">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">02</span> Architecture</div>
+      <h2>One governor decides. Everything else feeds it or proves it.</h2>
+      <p class="lede">All of it runs in-boundary on an on-prem Nutanix lab, reachable only over a Tailscale tailnet. The only path out for regulated content is no path.</p>
+      <div class="grid3" style="margin-top:34px">
+        <div class="card"><div class="kicker">:3000 · the governor</div><h3>Bastion trust router</h3><p>OpenAI-compatible /v1 gateway: sensitivity classification, sovereignty routing, PII redaction (Presidio), governed search (SearXNG), MCP RBAC, and an HMAC-signed audit chain.</p></div>
+        <div class="card"><div class="kicker">capability</div><h3>Self-hosted fleet</h3><p>gpt-oss:120b held resident (no cold start), plus qwen2.5-32b, llama-3.1-70b, small local models on an RTX 2000 Ada VM — and cloud Claude via BYOK for public work only.</p></div>
+        <div class="card"><div class="kicker">source layer</div><h3>LucidLink file service</h3><p>Streams enterprise filespaces over FUSE. One daemon per workspace (the SDK is single-workspace); tokens supplied per request, never baked into an image.</p></div>
+        <div class="card"><div class="kicker">zero-egress path</div><h3>RAG pipeline</h3><p>stream → chunk (per-slide pptx) → local embed → RVF store → hybrid retrieve → augment → govern. The raw text never leaves the boundary to become an answer.</p></div>
+        <div class="card"><div class="kicker">sovereign memory</div><h3>RuVector RVF + agenticow</h3><p>Single-file HNSW store, witness-chained for provenance, with copy-on-write branching → lineage() trails and surgical GDPR erasure (drop a branch, no re-index).</p></div>
+        <div class="card"><div class="kicker">:8090 · tailnet only</div><h3>Live console</h3><p>One SPA — Overview, Fleet, Policy, signed Audit, and the Knowledge/RAG workflow — all on real data. Binds loopback, fronted by Tailscale Serve (not a public Funnel).</p></div>
+      </div>
+      <div class="callout">
+        <div class="lbl">One honest caveat</div>
+        <p><b>The keystone isn't in this repo.</b> Bastion itself — the classifier and router that makes the guarantee mechanical — is <em>referenced, not vendored</em>, as is the LucidLink service. This repo is the RAG pipeline, the console, and the docs: the half you can read to understand exactly how the sovereign path is argued and built.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- PIPELINE STEPPER -->
+  <section id="pipeline">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">03</span> The zero-egress pipeline</div>
+      <h2>From a private document to a cited, governed answer.</h2>
+      <p class="lede">Six stages in <code style="font-family:var(--mono);color:var(--brass)">rag-service/</code>. Two of them are the sovereignty gates; the rest exist to feed them.</p>
+      <div class="stepper" style="margin-top:30px">
+        <div class="steps" id="steps" role="tablist" aria-label="Pipeline stages"></div>
+        <div class="steppanel" id="steppanel" role="tabpanel"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- OIA MAPPING -->
+  <section id="oia">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">04</span> Mapped to a standard</div>
+      <h2>A near reference-implementation of the OIA lower-and-mid stack.</h2>
+      <p class="lede">Read through the ten-layer OIA Reference Model, the claim is deliberately testable: strong where it ships, honestly blank where it doesn't.</p>
+      <div class="oia" id="oia">
+        <!-- filled by JS -->
+      </div>
+      <p style="font-family:var(--mono);font-size:12px;color:var(--faint);margin-top:16px;display:flex;gap:18px;flex-wrap:wrap">
+        <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--sov);vertical-align:middle;margin-right:6px"></i>strong</span>
+        <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--cloud);vertical-align:middle;margin-right:6px"></i>solid</span>
+        <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--brass);vertical-align:middle;margin-right:6px"></i>partial</span>
+        <span><i style="display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--line);vertical-align:middle;margin-right:6px"></i>out of scope</span>
+      </p>
+    </div>
+  </section>
+
+  <!-- GAPS -->
+  <section id="gaps">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">05</span> Stated plainly</div>
+      <h2>What's honestly missing.</h2>
+      <p class="lede">The guarantee is governance-enforced and audit-recorded — not yet hardware-attested. The repo names its gaps rather than blurring them.</p>
+      <div class="gaps" style="margin-top:28px">
+        <div class="gap"><span class="mark">L1</span><div><p><b>No hardware-attested execution.</b> Trust is signed and recorded, not yet proven by a TEE / Confidential GPU. This is the largest gap versus a full Verifiability span.</p></div></div>
+        <div class="gap"><span class="mark">L4</span><div><p><b>No training / adaptation layer.</b> The stack consumes models; it does not train or attest fine-tuning.</p></div></div>
+        <div class="gap"><span class="mark">L9</span><div><p><b>Human identity is coarse.</b> Access is tailnet-membership today, not per-user SSO with scoped authority.</p></div></div>
+        <div class="gap"><span class="mark">L7/L9</span><div><p><b>No mimicry / agent-spoofing defenses.</b> Human-vs-agent liveness and per-agent identity governance are future work.</p></div></div>
+        <div class="gap"><span class="mark">env</span><div><p><b>Environment-coupled.</b> The service reads <code style="font-family:var(--mono)">~/bastion-app/out/audit.jsonl</code> and hits <code style="font-family:var(--mono)">localhost:3000</code> — it assumes the surrounding stack is already running on <code style="font-family:var(--mono)">bastion-01</code>.</p></div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- REPO MAP -->
+  <section id="repo">
+    <div class="wrap reveal">
+      <div class="eyebrow"><span class="num">06</span> Repository map</div>
+      <h2>Where to read next.</h2>
+      <div class="filetable" style="margin-top:24px">
+        <div class="frow"><span class="path">rag-service/</span><span class="desc">The zero-egress RAG service: server, ingest pipeline, hybrid retrieval, local embedder, and the Bastion query bridge.</span></div>
+        <div class="frow"><span class="path">rag-service/retrieval.mjs</span><span class="desc">Hybrid retrieve: dense cosine + multi-field BM25 + RRF + phrase boost + MMR dedup. No cross-encoder, and it says why.</span></div>
+        <div class="frow"><span class="path">console/console.html</span><span class="desc">The unified live console (SPA) — Overview, Fleet, Policy, Audit, Knowledge — served same-origin.</span></div>
+        <div class="frow"><span class="path">docs/sovereignty-model.md</span><span class="desc">Where the guarantee actually lives — the two-gates argument, defended to a skeptic.</span></div>
+        <div class="frow"><span class="path">docs/oia-mapping.md</span><span class="desc">The stack mapped layer-by-layer onto the OIA Reference Model, with gaps named.</span></div>
+        <div class="frow"><span class="path">lucidlink/ · deploy/</span><span class="desc">The in-boundary file service (daemon-per-workspace) and deployment: systemd units, Docker/FUSE, Tailscale Serve.</span></div>
+      </div>
+      <div class="callout">
+        <div class="lbl">Bottom line</div>
+        <p>Bastion AI is the documentation-and-RAG face of a real on-prem sovereign-AI deployment. Its value is the <b>argument</b> — where sovereignty genuinely lives — plus a clean, honest reference implementation of the zero-egress retrieval path and its operator console. Not a turnkey app you <code style="font-family:var(--mono)">npm start</code>.</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-in">
+      <span>markt-heximal / bastion_ai</span>
+      <span style="color:var(--faint)">Proprietary · © 2026 Mark Templeton</span>
+    </div>
+    <p class="note">Sanitized repository — no service-account tokens, API keys, or live host addresses are committed. This page is an independent explainer generated from the repo's own source and docs.</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ---------- theme toggle ---------- */
+  var root = document.documentElement;
+  var btn = document.getElementById("themebtn");
+  function current() {
+    var t = root.getAttribute("data-theme");
+    if (t) return t;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  btn.addEventListener("click", function () {
+    var next = current() === "dark" ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    btn.textContent = next === "dark" ? "☾ Dark" : "☀ Light";
+  });
+  btn.textContent = current() === "dark" ? "☾ Dark" : "☀ Light";
+
+  /* ---------- pseudo signature (deterministic, no crypto needed) ---------- */
+  function sig(str) {
+    var h = 0x811c9dc5;
+    for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = (h * 0x01000193) >>> 0; }
+    var out = "";
+    for (var j = 0; j < 16; j++) { h ^= (h << 13); h >>>= 0; h ^= (h >> 7); h ^= (h << 17); h >>>= 0; out += (h & 0xff).toString(16).padStart(2, "0"); }
+    return out.slice(0, 32);
+  }
+
+  /* ---------- interactive router ---------- */
+  var SAMPLES = [
+    { id: "phi", lvl: "regulated", label: "Regulated · PHI",
+      q: "Summarize this patient's PHI intake record and flag abnormal labs.",
+      sens: "regulated", model: "gpt-oss-120b", boundary: "customer", cost: "$0.00",
+      route: "in", cloudBlocked: true,
+      note: "<b>Regulated PHI is pinned in-boundary.</b> The cloud path is blocked even though a BYOK key is present and a cloud model would be more capable." },
+    { id: "deck", lvl: "confidential", label: "Confidential · deck",
+      q: "From our private board deck, what were the Q3 churn drivers?",
+      sens: "confidential", model: "gpt-oss-120b", boundary: "customer", cost: "$0.00",
+      route: "in", cloudBlocked: true,
+      note: "Retrieved chunk text rides inside the prompt, so the governor sees confidential content and keeps it in-boundary — answered with inline <code>【source†n】</code> citations." },
+    { id: "pub", lvl: "public", label: "Public · drafting",
+      q: "Draft a friendly intro paragraph about zero-trust networking.",
+      sens: "public", model: "claude-opus-4-8", boundary: "third_party", cost: "$0.012",
+      route: "out", cloudBlocked: false,
+      note: "Public work is <b>allowed</b> to reach frontier cloud Claude via BYOK. The difference from the case above is a governance decision — recorded in the signed audit chain." }
+  ];
+
+  var samplesEl = document.getElementById("samples");
+  var els = {
+    query: document.getElementById("queryText"),
+    diagram: document.getElementById("diagram"),
+    w1: document.getElementById("w1"), w2: document.getElementById("w2"),
+    fleet: document.getElementById("n-fleet"), cloud: document.getElementById("n-cloud"),
+    qnode: document.getElementById("n-query"),
+    verdict: document.getElementById("verdict"),
+    vSens: document.getElementById("vSens"), vModel: document.getElementById("vModel"),
+    vBound: document.getElementById("vBound"), vCost: document.getElementById("vCost"),
+    vCloud: document.getElementById("vCloud"), vNote: document.getElementById("vNote"),
+    vHash: document.getElementById("vHash"), vReqId: document.getElementById("vReqId")
+  };
+
+  SAMPLES.forEach(function (s) {
+    var b = document.createElement("button");
+    b.setAttribute("aria-pressed", "false");
+    b.innerHTML = '<span class="lvl ' + s.sens + '">' + s.lvl.split(" ")[0] + '</span>' + s.label.split("·")[1].trim();
+    b.addEventListener("click", function () { route(s, b); });
+    samplesEl.appendChild(b);
+  });
+
+  function clearWires() {
+    [els.w1, els.w2].forEach(function (w) { w.classList.remove("on-sov", "on-cloud", "blocked"); });
+    [els.fleet, els.cloud, els.qnode].forEach(function (n) { n.classList.remove("on-sov", "on-cloud", "dim"); });
+  }
+
+  function route(s, btnEl) {
+    Array.prototype.forEach.call(samplesEl.children, function (c) { c.setAttribute("aria-pressed", "false"); });
+    if (btnEl) btnEl.setAttribute("aria-pressed", "true");
+    els.query.textContent = s.q;
+    clearWires();
+    els.qnode.classList.add("on-sov");
+    els.w1.classList.add("on-sov");
+
+    var cls = s.route === "in" ? "on-sov" : "on-cloud";
+    if (s.route === "in") {
+      els.fleet.classList.add("on-sov");
+      els.cloud.classList.add("dim");
+      if (s.cloudBlocked) els.w2.classList.add("blocked");
+    } else {
+      els.cloud.classList.add("on-cloud");
+      els.fleet.classList.add("dim");
+      els.w2.classList.add("on-cloud");
+    }
+
+    els.vSens.textContent = s.sens;
+    els.vSens.className = "v " + (s.route === "in" ? "sov" : "cloud");
+    els.vModel.textContent = s.model; els.vModel.className = "v brass";
+    els.vBound.textContent = s.boundary;
+    els.vBound.className = "v " + (s.route === "in" ? "sov" : "cloud");
+    els.vCost.textContent = s.cost; els.vCost.className = "v " + (s.cost === "$0.00" ? "sov" : "");
+    els.vCloud.textContent = s.cloudBlocked ? "BLOCKED" : "permitted";
+    els.vCloud.className = "v " + (s.cloudBlocked ? "block" : "cloud");
+    els.vNote.innerHTML = s.note;
+    els.vReqId.textContent = "req_" + sig(s.id + s.q).slice(0, 10);
+    els.vHash.textContent = "hmac ⛓ " + sig(s.sens + s.model + s.boundary + s.q);
+    els.verdict.hidden = false;
+  }
+
+  route(SAMPLES[0], samplesEl.children[0]);
+
+  /* ---------- pipeline stepper ---------- */
+  var STAGES = [
+    { tag: "01 · stream", title: "Stream over FUSE", gate: false, file: "ingestlib.mjs",
+      body: "Walk a LucidLink filespace breadth-first through the in-boundary file service, so shallow, important documents are captured before any cap is hit deep in a large subtree. Connection drops mid-walk are ridden out with retry-and-backoff." },
+    { tag: "02 · chunk", title: "Extract & chunk", gate: false, file: "ingestlib.mjs",
+      body: "PowerPoint decks are parsed per-slide (not blindly windowed across concatenated slides); text docs are windowed with overlap. Media is skipped; legacy .ppt is catalogued by metadata. Every chunk is prefixed with its [filename] so topic and filename queries land on the right document." },
+    { tag: "03 · embed", title: "Embed locally", gate: true, file: "embed.mjs",
+      body: "RuVector's ONNX MiniLM (all-MiniLM-L6-v2, 384-dim, pure WASM/SIMD) runs in-process. This is the first sovereignty gate: raw text is vectorized locally and never sent out to an embedding API." },
+    { tag: "04 · store", title: "Store with provenance", gate: false, file: "agenticow / RVF",
+      body: "Vectors plus a citation sidecar are written to a per-source .rvf store, tagged with the sensitivity label. Copy-on-write branching gives a lineage() provenance trail and surgical GDPR erasure — drop a branch, no re-index." },
+    { tag: "05 · retrieve", title: "Hybrid retrieve", gate: false, file: "retrieval.mjs",
+      body: "Dense cosine + multi-field BM25 (filename up-weighted) fused with Reciprocal Rank Fusion, a bigram phrase boost, catalog-chunk demotion, a distance threshold, and MMR near-duplicate suppression. No cross-encoder on the hot path — the ~30MB / ~25× latency cost isn't worth it at this scale." },
+    { tag: "06 · govern", title: "Augment & govern", gate: true, file: "rag.mjs",
+      body: "The top chunks are placed into the prompt and sent to Bastion /v1. Because the retrieved text now rides in the prompt, the governor's classification covers the whole answer: a regulated corpus is forced onto gpt-oss-120b, customer boundary, $0 — with the cloud path blocked. This is the decisive gate." }
+  ];
+  var stepsEl = document.getElementById("steps");
+  var panelEl = document.getElementById("steppanel");
+  function renderStage(i) {
+    var s = STAGES[i];
+    Array.prototype.forEach.call(stepsEl.children, function (c, k) { c.setAttribute("aria-selected", k === i ? "true" : "false"); });
+    panelEl.innerHTML =
+      '<div class="stage-tag">' + s.tag + '</div>' +
+      '<h3>' + s.title + '</h3>' +
+      '<p>' + s.body + '</p>' +
+      (s.gate ? '<div class="gatebadge">◆ sovereignty gate</div>' : '') +
+      '<div class="file">' + s.file + '</div>';
+  }
+  STAGES.forEach(function (s, i) {
+    var b = document.createElement("button");
+    b.setAttribute("role", "tab");
+    b.innerHTML = '<span class="idx">' + s.tag.split(" ")[0] + '</span>' + s.title;
+    b.addEventListener("click", function () { renderStage(i); });
+    stepsEl.appendChild(b);
+  });
+  renderStage(0);
+
+  /* ---------- OIA stack ---------- */
+  var LAYERS = [
+    { n: 0, name: "Physical Compute", sub: "on-prem Nutanix · Spark · RTX Ada", s: "strong" },
+    { n: 1, name: "Silicon Abstraction", sub: "MiniLM ONNX/WASM · TEE roadmap", s: "partial" },
+    { n: 2, name: "Sovereign Infrastructure", sub: "the boundary itself — the establishing layer", s: "strong" },
+    { n: 3, name: "Agent Data Substrate", sub: "RVF/agenticow · LucidLink · sensitivity tags", s: "strong" },
+    { n: 4, name: "Model Training & Adaptation", sub: "out of scope — consumes, doesn't train", s: "none" },
+    { n: 5, name: "Inference & Retrieval", sub: "Bastion routing · model-as-actor", s: "strong" },
+    { n: 6, name: "Context & Knowledge", sub: "the RAG pipeline · local embeddings", s: "strong" },
+    { n: 7, name: "Orchestration & Workflow", sub: "trust router · MCP RBAC · policy", s: "solid" },
+    { n: 8, name: "Continuity Fabric", sub: "agenticow COW lineage · witness chains", s: "strong" },
+    { n: 9, name: "Human & Browser Interface", sub: "the live console · tailnet identity", s: "solid" }
+  ];
+  var labels = { strong: "strong", solid: "solid", partial: "partial", none: "n/a" };
+  var oiaEl = document.getElementById("oia");
+  LAYERS.forEach(function (l) {
+    var d = document.createElement("div");
+    d.className = "layer s-" + l.s;
+    d.innerHTML =
+      '<span class="lnum">L' + l.n + '</span>' +
+      '<span class="lname">' + l.name + '<small>' + l.sub + '</small></span>' +
+      '<span class="strength"><span class="bars"><i></i><i></i><i></i></span><span class="txt">' + labels[l.s] + '</span></span>';
+    oiaEl.appendChild(d);
+  });
+
+  /* ---------- scroll reveal ---------- */
+  if ("IntersectionObserver" in window && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add("in"); io.unobserve(e.target); } });
+    }, { threshold: 0.12 });
+    document.querySelectorAll(".reveal").forEach(function (el) { io.observe(el); });
+  } else {
+    document.querySelectorAll(".reveal").forEach(function (el) { el.classList.add("in"); });
+  }
+})();
+</script>
