@@ -5,7 +5,10 @@ cd "$(dirname "$0")"
 echo "=== LucidLink Workspace Manager ==="
 echo ""
 
-echo "[1/3] Building file service container..."
+GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+export GIT_SHA
+
+echo "[1/3] Building file service container (git ${GIT_SHA})..."
 docker compose build --quiet lucidlink-fileservice
 
 echo "[2/3] Starting services..."
