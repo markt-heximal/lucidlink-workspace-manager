@@ -6,13 +6,21 @@ import lucidlink, os, time, logging, mimetypes
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Optional
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 
 logger = logging.getLogger("lucidlink_api")
 
 BOOT_TIME = datetime.now(timezone.utc)
 BOOT_MONO = time.monotonic()
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(_app):
+    yield
+    _shutdown()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,25 +30,76 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Daemon is process-wide and does NOT need a token to start.
-# Each request authenticates with a token (from header or env-var fallback).
-daemon = lucidlink.create_daemon()
-daemon.start()
-
-# The native LucidLink daemon has a single-active-workspace state model.
-# `daemon.authenticate()` mutates global daemon state (stops the previously
-# active workspace, links a new one). Caching Workspace or Filesystem objects
-# across requests with different tokens would yield stale handles that point at
-# a workspace the daemon has since unlinked. So we don't cache them — every
-# request re-authenticates under the daemon lock.
+# The SDK's `Client` (0.12.0+) replaces the deprecated `Daemon`. Unlike Daemon,
+# it has no single-instance-per-process guard — the C++ global-state constraint
+# that forced this service's old "one active workspace, re-authenticate every
+# request" design is gone. A Client is bound to one token for its lifetime
+# (`login()` with a different token raises), so we keep one Client per token and
+# link filespaces beneath it.
 #
-# Filespace list results are immutable data (not daemon handles), so we keep
-# a short TTL cache keyed by token to avoid an authenticate round-trip per call.
-_daemon_lock = Lock()
+# Both registries are bounded LRUs because each level costs real resources: a
+# Client owns a sandbox cache directory, and each linked filespace runs a full
+# client stack with its own disk cache (~1 GB default) plus worker threads.
+# Eviction must therefore actually release — `Filespace.unlink()` (which flushes
+# pending writes first, under the default SYNC_ALL) and `Client.close()`.
+# Floored at 1: a limit of 0 would evict the entry the caller is about to use.
+MAX_CLIENTS = max(1, int(os.environ.get("LUCIDLINK_MAX_CLIENTS", "1")))
+MAX_LINKS_PER_CLIENT = max(1, int(os.environ.get("LUCIDLINK_MAX_LINKED_FILESPACES", "2")))
+
+# One lock guards the registries *and* the filesystem call, which keeps the same
+# request serialization this service has always had. Narrowing it to registry
+# operations alone needs per-link refcounting so an eviction cannot pull a
+# filespace out from under an in-flight request; that is a separate change.
+_registry_lock = Lock()
+_clients: "OrderedDict[str, _Session]" = OrderedDict()
+
 _FS_LIST_TTL = 45.0
 _fs_list_cache: dict[str, tuple[float, list]] = {}
 _cache_lock = Lock()
-_current_link: dict = {"token": None, "filespace": None, "fs": None}
+
+
+class _Session:
+    """One logged-in Client plus the filespaces linked beneath it."""
+
+    def __init__(self, token: str):
+        self.client = lucidlink.Client()  # SANDBOXED storage; distinct temp root per client
+        self.client.login(lucidlink.ServiceAccountCredentials(token=token))
+        # Service-account tokens are workspace-scoped, so there is exactly one.
+        self.workspace = self.client.get_workspace(self.client.list_workspaces()[0].id)
+        self.links: "OrderedDict[str, object]" = OrderedDict()
+
+    def link(self, filespace_id: str):
+        """Link by id and return the Filespace. Idempotent; LRU-bounded."""
+        existing = self.links.get(filespace_id)
+        if existing is not None:
+            self.links.move_to_end(filespace_id)
+            return existing
+
+        filespace = self.workspace.link_filespace(id=filespace_id)
+        self.links[filespace_id] = filespace
+        while len(self.links) > MAX_LINKS_PER_CLIENT:
+            old_id, old = self.links.popitem(last=False)
+            _release(lambda: old.unlink(), f"unlink filespace {old_id}")
+        return filespace
+
+    def close(self):
+        for filespace_id, filespace in list(self.links.items()):
+            _release(lambda f=filespace: f.unlink(), f"unlink filespace {filespace_id}")
+        self.links.clear()
+        _release(self.client.close, "close client")
+
+
+def _release(fn, what: str):
+    """Run a teardown step, logging failures instead of discarding them.
+
+    The predecessor of this function was a bare `except Exception: pass`, which
+    is why a signature change in `unlink_filespace()` went unnoticed across four
+    SDK releases. Teardown must never abort the caller, but it must be visible.
+    """
+    try:
+        fn()
+    except Exception:
+        logger.warning("teardown failed: %s", what, exc_info=True)
 
 
 def _extract_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> Optional[str]:
@@ -66,12 +125,6 @@ def _auth_error(e: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=f"LucidLink upstream error: {msg}")
 
 
-def _authenticate(token: str):
-    """Fresh authenticate. Caller MUST hold _daemon_lock."""
-    credentials = lucidlink.ServiceAccountCredentials(token=token)
-    return daemon.authenticate(credentials)
-
-
 def _require_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> str:
     token = _extract_token(authorization, x_lucid_token)
     if not token:
@@ -83,9 +136,7 @@ def _require_token(authorization: Optional[str], x_lucid_token: Optional[str]) -
 
 
 # Headers-only dependencies: extract values from the request without touching
-# the daemon. Handlers then acquire `_daemon_lock` and authenticate themselves,
-# so the daemon's single-active-workspace state is always set by whoever holds
-# the lock right now (no stale cached workspaces).
+# the SDK. Handlers then acquire `_registry_lock` themselves.
 
 def require_token(
     authorization: Optional[str] = Header(default=None),
@@ -108,38 +159,43 @@ def require_token_and_filespace(
     return token, x_lucid_filespace
 
 
-def _with_fs(token: str, filespace_name: str, fn):
-    """Run `fn(fs)` with a linked filespace. Reuses the existing link if the
-    token and filespace haven't changed, avoiding expensive unlink/relink cycles."""
-    with _daemon_lock:
-        try:
-            if _current_link["token"] == token and _current_link["filespace"] == filespace_name and _current_link["fs"] is not None:
-                return fn(_current_link["fs"])
-            try:
-                daemon.unlink_filespace()
-            except Exception:
-                pass
-            workspace = _authenticate(token)
-            filespace = workspace.link_filespace(name=filespace_name)
-            _current_link["token"] = token
-            _current_link["filespace"] = filespace_name
-            _current_link["fs"] = filespace.fs
-        except Exception as e:
-            _current_link["token"] = None
-            _current_link["filespace"] = None
-            _current_link["fs"] = None
-            raise _auth_error(e)
-        return fn(_current_link["fs"])
+def _get_session(token: str) -> "_Session":
+    """Return this token's Session, creating it if needed.
+
+    Caller MUST hold `_registry_lock`.
+    """
+    session = _clients.get(token)
+    if session is not None:
+        _clients.move_to_end(token)
+        return session
+
+    try:
+        session = _Session(token)
+    except Exception as e:
+        raise _auth_error(e)
+
+    _clients[token] = session
+    while len(_clients) > MAX_CLIENTS:
+        _, evicted = _clients.popitem(last=False)
+        evicted.close()
+    return session
 
 
 def _with_workspace(token: str, fn):
-    """Run `fn(workspace)` with a freshly authenticated workspace."""
-    with _daemon_lock:
+    """Run `fn(workspace)` against this token's logged-in workspace."""
+    with _registry_lock:
+        return fn(_get_session(token).workspace)
+
+
+def _with_fs(token: str, filespace_id: str, fn):
+    """Run `fn(filesystem)` against a linked filespace, by id."""
+    with _registry_lock:
+        session = _get_session(token)
         try:
-            workspace = _authenticate(token)
+            filespace = session.link(filespace_id)
         except Exception as e:
             raise _auth_error(e)
-        return fn(workspace)
+        return fn(filespace.fs)
 
 
 def _list_filespaces_cached(token: str) -> list[dict]:
@@ -155,6 +211,30 @@ def _list_filespaces_cached(token: str) -> list[dict]:
     with _cache_lock:
         _fs_list_cache[token] = (now + _FS_LIST_TTL, items)
     return items
+
+
+def _resolve_filespace_id(token: str, ref: str) -> str:
+    """Map the X-LucidLink-Filespace header to a stable filespace id.
+
+    `link_filespace(name=...)` is deprecated upstream because names are mutable:
+    a rename silently links to nothing, or to the wrong filespace. The HTTP API
+    still accepts a name for compatibility; it is resolved here, through the
+    existing list cache, and everything below this line works in ids.
+
+    Must NOT be called while holding `_registry_lock` — the list lookup takes it.
+    """
+    for entry in _list_filespaces_cached(token):
+        if entry["id"] == ref or entry["name"] == ref:
+            return entry["id"]
+    raise HTTPException(status_code=404, detail=f"Filespace '{ref}' not found")
+
+
+def _shutdown():
+    """Release every link on the way out so pending writes are flushed."""
+    with _registry_lock:
+        for _, session in list(_clients.items()):
+            session.close()
+        _clients.clear()
 
 
 class WriteRequest(BaseModel):
@@ -184,6 +264,23 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/version")
+def version():
+    """Report what is actually deployed, so drift is visible without SSH."""
+    with _registry_lock:
+        linked = sum(len(s.links) for s in _clients.values())
+        clients = len(_clients)
+    return {
+        "sdk": getattr(lucidlink, "__version__", "unknown"),
+        "git_sha": os.environ.get("GIT_SHA", "unknown"),
+        "mgmt_api_upstream": os.environ.get("MGMT_API_UPSTREAM", "unset"),
+        "clients": clients,
+        "linked_filespaces": linked,
+        "limits": {"max_clients": MAX_CLIENTS,
+                   "max_links_per_client": MAX_LINKS_PER_CLIENT},
+    }
+
+
 @app.get("/filespaces")
 def list_filespaces(token: str = Depends(require_token)):
     """List filespaces visible to the Service Account."""
@@ -200,9 +297,12 @@ def get_filespace(name: str, token: str = Depends(require_token)):
 
 
 def _files_op(creds: tuple[str, str], fn, *, not_found_on_error: bool = False):
-    token, filespace_name = creds
+    token, filespace_ref = creds
+    # Resolved before _with_fs so the list lookup is not attempted while the
+    # (non-reentrant) registry lock is held.
+    filespace_id = _resolve_filespace_id(token, filespace_ref)
     try:
-        return _with_fs(token, filespace_name, fn)
+        return _with_fs(token, filespace_id, fn)
     except HTTPException:
         raise
     except Exception as e:

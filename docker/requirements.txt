@@ -1,0 +1,7 @@
+# Pinned exactly. Bumps arrive as reviewed PRs, never as a silent `pip install`.
+# The LucidLink SDK is published on public PyPI, so no vendored wheel is needed.
+fastapi==0.115.12
+uvicorn==0.34.3
+httpx==0.28.1
+python-multipart==0.0.20
+lucidlink==0.14.0

@@ -2,17 +2,16 @@ FROM --platform=linux/amd64 python:3.12-slim
 
 WORKDIR /app
 
-COPY lucidlink-0.10.0-py3-none-manylinux_2_35_x86_64.whl .
+COPY requirements.txt .
 
-RUN pip install --no-cache-dir \
-    fastapi==0.115.12 \
-    uvicorn==0.34.3 \
-    httpx==0.28.1 \
-    python-multipart==0.0.20 \
-    ./lucidlink-0.10.0-py3-none-manylinux_2_35_x86_64.whl \
-    && rm lucidlink-0.10.0-py3-none-manylinux_2_35_x86_64.whl
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY lucidlink_api.py .
+
+# Surface SDK deprecations in the logs instead of letting them pass silently.
+# A no-arg unlink_filespace() call went unnoticed for months exactly because
+# nothing was listening for these.
+ENV PYTHONWARNINGS=default::DeprecationWarning
 
 EXPOSE 8000
 
