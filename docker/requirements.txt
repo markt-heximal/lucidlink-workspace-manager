@@ -1,0 +1,8 @@
+# Pinned exactly. Bumps arrive as reviewed PRs, never as a silent `pip install`.
+# Only an x86_64 manylinux wheel is published for lucidlink (no linux/arm64),
+# hence the --platform=linux/amd64 pin in the Dockerfile.
+fastapi==0.115.12
+uvicorn==0.34.3
+httpx==0.28.1
+python-multipart==0.0.20
+lucidlink==0.14.0

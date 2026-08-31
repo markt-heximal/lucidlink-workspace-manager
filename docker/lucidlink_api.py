@@ -4,6 +4,8 @@ Core file CRUD + filespace listing + a Range-aware download, plus the Connect
 (external S3/HTTP files) and insights (stats / data preview / agent) routers.
 Shared daemon plumbing lives in ll_core; SDK is lucidlink >=0.12.
 """
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
@@ -12,6 +14,7 @@ import os
 import time
 import mimetypes
 import httpx
+import lucidlink
 from datetime import datetime, timezone
 
 from ll_core import (
@@ -19,6 +22,8 @@ from ll_core import (
     require_token_and_filespace,
     _with_fs,
     _list_filespaces_cached,
+    registry_stats,
+    shutdown as _ll_shutdown,
 )
 from connect_api import router as connect_router
 from insights_api import router as insights_router
@@ -26,7 +31,13 @@ from insights_api import router as insights_router
 BOOT_TIME = datetime.now(timezone.utc)
 BOOT_MONO = time.monotonic()
 
-app = FastAPI(title="LucidLink File Service", version="0.12")
+@asynccontextmanager
+async def _lifespan(_app):
+    yield
+    _ll_shutdown()
+
+
+app = FastAPI(title="LucidLink File Service", version="0.14", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -65,6 +76,17 @@ def uptime():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/version")
+def version():
+    """Report what is actually deployed, so drift is visible without SSH."""
+    return {
+        "sdk": getattr(lucidlink, "__version__", "unknown"),
+        "git_sha": os.environ.get("GIT_SHA", "unknown"),
+        "mgmt_api_upstream": os.environ.get("MGMT_API_UPSTREAM", "unset"),
+        **registry_stats(),
+    }
 
 
 @app.get("/filespaces")

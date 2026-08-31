@@ -1,6 +1,6 @@
 services:
   lucidlink-api:
-    image: lucidlink/lucidlink-api:latest
+    image: lucidlink/lucidlink-api:1.5.0@sha256:faed972d4191e89dde1e83f32ddb2196f7ce86bbe477172a99de623ca709b831
     container_name: lucidlink-api-test
     restart: unless-stopped
     ports:

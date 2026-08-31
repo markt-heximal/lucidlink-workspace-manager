@@ -1,0 +1,21 @@
+# Ruflo / AgentDB persistent memory (local, per-machine)
+.swarm/
+.claude-flow/
+ruvector.db
+ruvector.db-*
+
+# Vendored SDK wheels — the SDK installs from PyPI via requirements.txt
+docker/*.whl
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+*.log
+
+# Env
+.env
+.env.*
+!.env.example
