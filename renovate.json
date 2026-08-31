@@ -1,0 +1,85 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":dependencyDashboard",
+    ":semanticCommitsDisabled"
+  ],
+  "timezone": "America/New_York",
+  "schedule": ["before 6am on monday"],
+  "prConcurrentLimit": 3,
+  "labels": ["dependencies"],
+  "commitMessagePrefix": "deps:",
+
+  "pinDigests": true,
+
+  "packageRules": [
+    {
+      "description": "The LucidLink SDK is pre-1.0, so a minor bump can break the API. Never group it, split minor from patch, and let it soak for a few days before proposing it.",
+      "matchDatasources": ["pypi"],
+      "matchPackageNames": ["lucidlink"],
+      "groupName": null,
+      "separateMinorPatch": true,
+      "minimumReleaseAge": "3 days",
+      "labels": ["dependencies", "lucidlink-sdk", "review-api-diff"],
+      "prBodyNotes": [
+        "⚠️ **Pre-1.0 SDK — a minor bump may change the API.** Before merging, diff the public surface against the wheel and check `ll_core.py` in particular:",
+        "```",
+        "pip download lucidlink=={{{newVersion}}} --no-deps -d /tmp/ll && unzip -o -q /tmp/ll/*.whl -d /tmp/ll-new",
+        "grep -rn '@deprecated' /tmp/ll-new/lucidlink/*.py",
+        "```",
+        "Past example: `Daemon.unlink_filespace()` gained a required positional argument in 0.12.0, and `link_filespace(name=)` was deprecated in favour of `id=`.",
+        "The file service runs this SDK behind the public gateway catch-all — see `docs/GATEWAY.md`."
+      ]
+    },
+    {
+      "description": "The MCP server pins its own lucidlink version, so it moves on its own schedule.",
+      "matchDatasources": ["pypi"],
+      "matchPackageNames": ["lucidlink-mcp"],
+      "groupName": null,
+      "labels": ["dependencies", "mcp"]
+    },
+    {
+      "description": "Web-stack runtime deps move together; they are low-risk relative to the SDK.",
+      "matchDatasources": ["pypi"],
+      "matchPackageNames": ["fastapi", "uvicorn", "httpx", "python-multipart"],
+      "groupName": "python runtime",
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Management API image. Digest-pinned, so a retag of the same version still surfaces as a PR.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["lucidlink/lucidlink-api"],
+      "groupName": null,
+      "labels": ["dependencies", "mgmt-api"],
+      "prBodyNotes": [
+        "Both `docker-compose.yml` and `docker-compose.test.yml` must land on the same digest.",
+        "Validate on the test stack first — `docker compose -p lltest -f docker-compose.test.yml up -d` on ports 3004/8002, which bypasses the gateway catch-all."
+      ]
+    },
+    {
+      "description": "Base image: take patch updates automatically, hold the Python minor line for a deliberate decision.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["python"],
+      "matchUpdateTypes": ["minor", "major"],
+      "dependencyDashboardApproval": true
+    }
+  ],
+
+  "customManagers": [
+    {
+      "description": "Pick up the pinned lucidlink-mcp version in .mcp.json (uvx arg, not a normal manifest).",
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.mcp\\.json$/"],
+      "matchStrings": ["\"(?<depName>[a-z0-9][a-z0-9-]*)==(?<currentValue>[0-9][^\"]*)\""],
+      "datasourceTemplate": "pypi",
+      "versioningTemplate": "pep440"
+    }
+  ],
+
+  "vulnerabilityAlerts": {
+    "labels": ["security"],
+    "schedule": ["at any time"],
+    "minimumReleaseAge": null
+  }
+}
