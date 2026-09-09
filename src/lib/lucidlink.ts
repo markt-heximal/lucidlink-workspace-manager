@@ -60,8 +60,61 @@ const UGREEN_DEFAULTS = {
   region: import.meta.env.VITE_MINIO_REGION ?? "us-east-1",
 };
 
+/** An error from the LucidLink APIs, carrying the HTTP status and raw server
+ *  detail so callers can branch on them instead of re-parsing a string. */
+export class LucidLinkError extends Error {
+  constructor(message: string, readonly status?: number, readonly detail?: string) {
+    super(message);
+    this.name = "LucidLinkError";
+  }
+}
+
+/** Reject before the request when there is no token.
+ *
+ *  Without this an empty token is sent as the literal header "Bearer ", which
+ *  the service forwards to LucidLink and reports as a 502 "Invalid service
+ *  account token format" — an upstream-sounding error for what is simply a
+ *  signed-out client. Fail here, with the actual cause. */
+function requireToken(token: string): void {
+  if (!token || !token.trim()) {
+    throw new LucidLinkError(
+      "Not signed in: no LucidLink service-account token. Enter your token to continue.",
+      401,
+    );
+  }
+}
+
+/** fetch(), but a transport failure names the host instead of surfacing the
+ *  browser's bare "Failed to fetch" — which is indistinguishable from an
+ *  application error once it reaches the UI. */
+async function send(url: string, init: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (e: any) {
+    const origin = (() => { try { return new URL(url).origin; } catch { return url; } })();
+    throw new LucidLinkError(
+      `Cannot reach ${origin}: network error, or the service is not running (${e?.message ?? "fetch failed"}).`,
+    );
+  }
+}
+
+/** Turn a status + server detail into something the user can act on. The raw
+ *  detail is always preserved on the error for logging. */
+function explain(status: number, detail: string): string {
+  if (/invalid service account token/i.test(detail)) {
+    return "LucidLink rejected the token: it is malformed or expired. Re-enter your service-account token.";
+  }
+  if (status === 401) return `Not signed in: ${detail}`;
+  if (status === 403) return `Access denied: ${detail}`;
+  if (status === 404 && /filespace/i.test(detail)) {
+    return `${detail}. It may have been deleted or renamed — reload the filespace list.`;
+  }
+  return detail;
+}
+
 async function mgmtFetch(path: string, token: string, options: RequestInit = {}) {
-  const res = await fetch(`${MANAGEMENT_API}${path}`, {
+  requireToken(token);
+  const res = await send(`${MANAGEMENT_API}${path}`, {
     ...options,
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -71,13 +124,15 @@ async function mgmtFetch(path: string, token: string, options: RequestInit = {})
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));
-    throw new Error(body.error?.message || `Management API error: ${res.status}`);
+    const detail = body.error?.message || `Management API error: ${res.status}`;
+    throw new LucidLinkError(explain(res.status, detail), res.status, detail);
   }
   return res.json();
 }
 
 async function fileFetch(path: string, token: string, filespace: string, options: RequestInit = {}) {
-  const res = await fetch(`${FILE_SERVICE}${path}`, {
+  requireToken(token);
+  const res = await send(`${FILE_SERVICE}${path}`, {
     ...options,
     headers: {
       "Authorization": `Bearer ${token}`,
@@ -87,7 +142,8 @@ async function fileFetch(path: string, token: string, filespace: string, options
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(body.detail || `File service error: ${res.status}`);
+    const detail = body.detail || `File service error: ${res.status}`;
+    throw new LucidLinkError(explain(res.status, detail), res.status, detail);
   }
   return res;
 }
