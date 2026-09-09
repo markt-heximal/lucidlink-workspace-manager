@@ -55,8 +55,8 @@ Build a "LucidLink Workspace Manager" app with these features:
 ### UGREEN MinIO defaults (pre-fill in create filespace form):
 - Endpoint: `https://ugreen-nas.tail333a1d.ts.net`
 - Bucket: `lucidlink`
-- Access Key: `REDACTED-MINIO-ACCESS-KEY`
-- Secret Key: `REDACTED-MINIO-SECRET-KEY`
+- Access Key: from `VITE_MINIO_ACCESS_KEY`
+- Secret Key: from `VITE_MINIO_SECRET_KEY` (never hardcode; see .env.example)
 - Region: `us-east-1`
 
 ### Create filespace request body:
@@ -67,8 +67,8 @@ Build a "LucidLink Workspace Manager" app with these features:
   "storageProvider": "Other",
   "storageOwner": "customer",
   "customerStorageParams": {
-    "accessKeyId": "REDACTED-MINIO-ACCESS-KEY",
-    "secretAccessKey": "REDACTED-MINIO-SECRET-KEY",
+    "accessKeyId": "<VITE_MINIO_ACCESS_KEY>",
+    "secretAccessKey": "<VITE_MINIO_SECRET_KEY>",
     "endpoint": "https://ugreen-nas.tail333a1d.ts.net",
     "bucketName": "lucidlink"
   }

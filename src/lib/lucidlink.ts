@@ -44,12 +44,20 @@ export interface CreateFilespaceParams {
   secretAccessKey?: string;
 }
 
+// Storage defaults used to pre-fill the "create filespace" form. Supplied at
+// build time via Vite env vars (see .env.example) so live keys stay out of git.
+//
+// SECURITY: `import.meta.env.VITE_*` values are inlined into the client bundle,
+// so whatever is set here is readable by anyone who loads the app. This keeps
+// secrets out of the repo; it does NOT make them private. The durable fix is to
+// move filespace creation behind the file service, which already holds
+// credentials server-side, and drop the key fields from this module entirely.
 const UGREEN_DEFAULTS = {
-  endpoint: "https://ugreen-nas.tail333a1d.ts.net",
-  bucketName: "lucidlink",
-  accessKeyId: "REDACTED-MINIO-ACCESS-KEY",
-  secretAccessKey: "REDACTED-MINIO-SECRET-KEY",
-  region: "us-east-1",
+  endpoint: import.meta.env.VITE_MINIO_ENDPOINT ?? "",
+  bucketName: import.meta.env.VITE_MINIO_BUCKET ?? "lucidlink",
+  accessKeyId: import.meta.env.VITE_MINIO_ACCESS_KEY ?? "",
+  secretAccessKey: import.meta.env.VITE_MINIO_SECRET_KEY ?? "",
+  region: import.meta.env.VITE_MINIO_REGION ?? "us-east-1",
 };
 
 async function mgmtFetch(path: string, token: string, options: RequestInit = {}) {

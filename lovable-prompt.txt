@@ -42,8 +42,8 @@ File Service endpoints:
 UGREEN MinIO defaults to pre-fill in the create filespace form:
 - Endpoint: https://ugreen-nas.tail333a1d.ts.net
 - Bucket: lucidlink
-- Access Key: REDACTED-MINIO-ACCESS-KEY
-- Secret Key: REDACTED-MINIO-SECRET-KEY
+- Access Key: from env var VITE_MINIO_ACCESS_KEY
+- Secret Key: from env var VITE_MINIO_SECRET_KEY (never hardcode)
 - Region: us-east-1
 
 The create filespace POST body should be JSON with these fields: name set to the filespace name, region set to us-east-1, storageProvider set to Other, storageOwner set to customer, and a nested customerStorageParams object containing accessKeyId and secretAccessKey and endpoint and bucketName using the UGREEN defaults listed above.
