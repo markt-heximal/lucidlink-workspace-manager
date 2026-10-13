@@ -1,10 +1,12 @@
+name: lucidlink
+
 services:
   lucidlink-api:
     image: lucidlink/lucidlink-api:1.5.0@sha256:faed972d4191e89dde1e83f32ddb2196f7ce86bbe477172a99de623ca709b831
     container_name: lucidlink-api
     restart: unless-stopped
     ports:
-      - "3003:3003"
+      - "127.0.0.1:3003:3003"
     healthcheck:
       test: ["CMD", "/nodejs/bin/node", "-e", "fetch('http://localhost:3003/api/v1/health').then(r=>{process.exit(r.ok?0:1)}).catch(()=>process.exit(1))"]
       interval: 30s
@@ -21,7 +23,7 @@ services:
     container_name: lucidlink-fileservice
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - MGMT_API_UPSTREAM=http://lucidlink-api:3003
       # /agent/query LLM (OpenAI-compatible chat/completions). Optional: if unset,
