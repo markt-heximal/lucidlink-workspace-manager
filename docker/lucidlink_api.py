@@ -3,16 +3,24 @@
 Core file CRUD + filespace listing + a Range-aware download, plus the Connect
 (external S3/HTTP files) and insights (stats / data preview / agent) routers.
 Shared daemon plumbing lives in ll_core; SDK is lucidlink >=0.12.
+
+Also the owner-facing pieces of docs/INDEXER.md: the `/vault/*` router, the
+owner-only `/index/*` proxy to the indexer container, and best-effort index
+hints after successful file mutations.
 """
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form
+from fastapi import (FastAPI, HTTPException, Depends, Request, UploadFile, File, Form,
+                     BackgroundTasks, Header)
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 import os
 import time
 import mimetypes
+import logging
+from typing import Optional
 import httpx
 import lucidlink
 from datetime import datetime, timezone
@@ -24,9 +32,14 @@ from ll_core import (
     _list_filespaces_cached,
     registry_stats,
     shutdown as _ll_shutdown,
+    vault_token_for_owner,
 )
 from connect_api import router as connect_router
 from insights_api import router as insights_router
+from vault import router as vault_router
+import owner_auth
+
+logger = logging.getLogger("lucidlink_api")
 
 BOOT_TIME = datetime.now(timezone.utc)
 BOOT_MONO = time.monotonic()
@@ -49,6 +62,7 @@ app.add_middleware(
 
 app.include_router(connect_router)
 app.include_router(insights_router)
+app.include_router(vault_router)
 
 
 class WriteRequest(BaseModel):
@@ -102,6 +116,47 @@ def get_filespace(name: str, token: str = Depends(require_token)):
     raise HTTPException(status_code=404, detail=f"Filespace '{name}' not found")
 
 
+# --- Index hints ------------------------------------------------------------
+# After a successful mutation the indexer is told which path changed, so in-app
+# edits show up in search within seconds instead of at the next delta scan.
+# Strictly best effort: it runs after the response, has a short timeout, and a
+# failure is only logged. The periodic scan is the safety net.
+INDEXER_URL = os.environ.get("INDEXER_URL", "http://lucidlink-indexer:8100").rstrip("/")
+HINT_TIMEOUT = 2.0
+# Tests swap this for an httpx.MockTransport.
+_hint_transport: Optional[httpx.BaseTransport] = None
+
+
+def _internal_key() -> str:
+    return os.environ.get("INDEXER_INTERNAL_KEY", "")
+
+
+def _send_hint(body: dict, workspace_id: Optional[str]) -> None:
+    key = _internal_key()
+    if not key:
+        return
+    if workspace_id:
+        body = {"workspaceId": workspace_id, **body}
+    try:
+        with httpx.Client(timeout=HINT_TIMEOUT, transport=_hint_transport) as client:
+            resp = client.post(f"{INDEXER_URL}/index/hint", json=body,
+                               headers={"X-Internal-Key": key})
+        if resp.status_code >= 400:
+            logger.warning("index hint %s %s -> HTTP %s", body.get("op"), body.get("path"), resp.status_code)
+    except Exception as e:
+        logger.warning("index hint %s %s failed: %s", body.get("op"), body.get("path"), type(e).__name__)
+
+
+def _hint(background: BackgroundTasks, creds: tuple[str, str], workspace_id: Optional[str],
+          op: str, path: str, src: Optional[str] = None) -> None:
+    if not _internal_key():
+        return
+    body = {"filespace": creds[1], "op": op, "path": path}
+    if src is not None:
+        body["src"] = src
+    background.add_task(_send_hint, body, workspace_id)
+
+
 def _files_op(creds: tuple[str, str], fn, *, not_found_on_error: bool = False):
     token, filespace_name = creds
     try:
@@ -133,43 +188,63 @@ def read_file(path: str, creds=Depends(require_token_and_filespace)):
 
 
 @app.post("/files/write")
-def write_file(req: WriteRequest, creds=Depends(require_token_and_filespace)):
+def write_file(req: WriteRequest, background: BackgroundTasks,
+               creds=Depends(require_token_and_filespace),
+               x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
     def op(fs):
         fs.write_file(req.path, req.content.encode())
         return {"status": "ok"}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "write", req.path)
+    return result
 
 
 @app.post("/files/mkdir")
-def make_dir(path: str, creds=Depends(require_token_and_filespace)):
+def make_dir(path: str, background: BackgroundTasks,
+             creds=Depends(require_token_and_filespace),
+             x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
     def op(fs):
         fs.create_dir(path)
         return {"status": "ok"}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "mkdir", path)
+    return result
 
 
 @app.delete("/files")
-def delete_file(path: str, creds=Depends(require_token_and_filespace)):
+def delete_file(path: str, background: BackgroundTasks,
+                creds=Depends(require_token_and_filespace),
+                x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
     def op(fs):
         fs.delete(path)
         return {"status": "ok"}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "delete", path)
+    return result
 
 
 @app.delete("/files/dir")
-def delete_dir(path: str, recursive: bool = True, creds=Depends(require_token_and_filespace)):
+def delete_dir(path: str, background: BackgroundTasks, recursive: bool = True,
+               creds=Depends(require_token_and_filespace),
+               x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
     def op(fs):
         fs.delete_dir(path, recursive=recursive)
         return {"status": "ok"}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "delete", path)
+    return result
 
 
 @app.post("/files/move")
-def move_file(req: MoveRequest, creds=Depends(require_token_and_filespace)):
+def move_file(req: MoveRequest, background: BackgroundTasks,
+              creds=Depends(require_token_and_filespace),
+              x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
     def op(fs):
         fs.move(req.src, req.dst)
         return {"status": "ok"}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "move", req.dst, src=req.src)
+    return result
 
 
 @app.get("/files/stat")
@@ -259,15 +334,19 @@ def download_file(path: str, request: Request, creds=Depends(require_token_and_f
 
 @app.post("/files/upload")
 async def upload_file(
+    background: BackgroundTasks,
     path: str = Form(...),
     file: UploadFile = File(...),
     creds=Depends(require_token_and_filespace),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
 ):
     data = await file.read()
     def op(fs):
         fs.write_file(path, data)
         return {"status": "ok", "path": path, "size": len(data)}
-    return _files_op(creds, op)
+    result = _files_op(creds, op)
+    _hint(background, creds, x_workspace_id, "write", path)
+    return result
 
 
 # --- Management API Proxy: /api/v1/* -> LucidLink Management API container ---
@@ -282,7 +361,20 @@ async def proxy_management_api(request: Request, path: str):
         url = f"{url}?{request.url.query}"
     headers = {}
     if "authorization" in request.headers:
-        headers["Authorization"] = request.headers["authorization"]
+        auth = request.headers["authorization"]
+        bearer = owner_auth.bearer_from_header(auth)
+        if bearer and owner_auth.is_jwt(bearer):
+            # Owner session: act with the vault's token for the chosen workspace.
+            # Blocking (Supabase + SQLite), so off the event loop.
+            try:
+                await run_in_threadpool(owner_auth.verify_owner, bearer)
+                token = await run_in_threadpool(
+                    vault_token_for_owner, request.headers.get("x-workspace-id"))
+            except HTTPException as e:
+                return JSONResponse(status_code=e.status_code,
+                                    content={"error": {"message": e.detail}})
+            auth = f"Bearer {token}"
+        headers["Authorization"] = auth
     if "content-type" in request.headers:
         headers["Content-Type"] = request.headers["content-type"]
     body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
@@ -297,3 +389,42 @@ async def proxy_management_api(request: Request, path: str):
         return JSONResponse(status_code=504, content={"error": {"message": "Management API timeout"}})
     except httpx.ConnectError:
         return JSONResponse(status_code=502, content={"error": {"message": "Management API unreachable"}})
+
+
+# --- Indexer proxy: /index/* -> lucidlink-indexer (owner only) ---------------
+# The indexer is not published; the browser reaches it only through here. The
+# owner's session is checked on this side and the shared X-Internal-Key added,
+# so the indexer itself never sees a browser credential.
+_INDEX_TIMEOUT = httpx.Timeout(120.0, connect=5.0)  # ask/survey can run an LLM
+_index_transport: Optional[httpx.AsyncBaseTransport] = None
+
+
+@app.api_route("/index/{path:path}", methods=["GET", "POST", "PUT"])
+async def proxy_indexer(request: Request, path: str,
+                        _owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
+    key = _internal_key()
+    if not key:
+        return JSONResponse(status_code=503,
+                            content={"detail": "Indexer not configured (set INDEXER_INTERNAL_KEY)"})
+    if any(seg in ("..", ".") for seg in path.split("/")):
+        raise HTTPException(status_code=400, detail="Invalid index path")
+    url = f"{INDEXER_URL}/index/{path}"
+    if request.url.query:
+        url = f"{url}?{request.url.query}"
+    headers = {"X-Internal-Key": key}
+    if "content-type" in request.headers:
+        headers["Content-Type"] = request.headers["content-type"]
+    if "x-workspace-id" in request.headers:
+        headers["X-Workspace-Id"] = request.headers["x-workspace-id"]
+    body = await request.body() if request.method in ("POST", "PUT") else None
+    try:
+        async with httpx.AsyncClient(timeout=_INDEX_TIMEOUT, transport=_index_transport) as client:
+            resp = await client.request(request.method, url, headers=headers, content=body)
+    except httpx.TimeoutException:
+        return JSONResponse(status_code=504, content={"detail": "Indexer timeout"})
+    except httpx.HTTPError as e:
+        # ConnectError and friends: the container is down or restarting.
+        logger.warning("indexer proxy %s /index/%s failed: %s", request.method, path, type(e).__name__)
+        return JSONResponse(status_code=502, content={"detail": "Indexer unreachable"})
+    return Response(content=resp.content, status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type"))

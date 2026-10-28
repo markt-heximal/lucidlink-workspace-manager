@@ -2,7 +2,8 @@
 
 - /filespaces/{name}/stats  -> SDK Filesystem.get_statistics()
 - /data/preview             -> bounded CSV/TSV preview via Filesystem.open() (no OOM)
-- /agent/query              -> shallow retrieval over the filespace + an
+- /agent/query              -> the indexer's /index/ask (owner callers), else
+                               shallow retrieval over the filespace + an
                                OpenAI-compatible LLM (configured via env)
 """
 from fastapi import APIRouter, HTTPException, Depends
@@ -12,9 +13,12 @@ from collections import deque
 import os
 import csv
 import json
+import logging
 import httpx
 
-from ll_core import require_token, _with_fs
+from ll_core import require_token, require_caller, Caller, _with_fs
+
+logger = logging.getLogger("lucidlink_api")
 
 router = APIRouter(tags=["insights"])
 
@@ -190,8 +194,58 @@ def _call_llm(question: str, context: str) -> str:
     return answer
 
 
+# Indexer delegation (docs/INDEXER.md). Read at call time so tests and env
+# changes apply without a reload; the transport hook is for tests.
+_indexer_transport: Optional[httpx.BaseTransport] = None
+INDEXER_ASK_TIMEOUT = httpx.Timeout(120.0, connect=3.0)
+
+
+def _ask_indexer(req: AgentRequest, workspace_id: Optional[str]) -> Optional[dict]:
+    """{answer, sources} from the indexer, or None to fall back.
+
+    Falls back on anything other than a usable answer: indexer not configured
+    or unreachable, any non-2xx (503 = no LLM there, 404 = filespace not
+    indexed, ...), `"empty": true`, or a malformed reply. The shallow path
+    below is slower and shallower but always available.
+    """
+    key = os.environ.get("INDEXER_INTERNAL_KEY", "")
+    if not key:
+        return None
+    base = os.environ.get("INDEXER_URL", "http://lucidlink-indexer:8100").rstrip("/")
+    headers = {"X-Internal-Key": key}
+    body: dict = {"filespace": req.filespace, "question": req.question}
+    if workspace_id:
+        headers["X-Workspace-Id"] = workspace_id
+        body["workspaceId"] = workspace_id
+    try:
+        with httpx.Client(timeout=INDEXER_ASK_TIMEOUT, transport=_indexer_transport) as client:
+            resp = client.post(f"{base}/index/ask", json=body, headers=headers)
+    except httpx.HTTPError as e:
+        logger.info("indexer ask unavailable (%s); using shallow agent", type(e).__name__)
+        return None
+    if resp.status_code >= 300:
+        logger.info("indexer ask -> HTTP %s; using shallow agent", resp.status_code)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("empty") or not data.get("answer"):
+        return None
+    sources = data.get("sources") or []
+    return {"answer": data["answer"], "sources": [s for s in sources if isinstance(s, str)]}
+
+
 @router.post("/agent/query")
-def agent_query(req: AgentRequest, token: str = Depends(require_token)):
+def agent_query(req: AgentRequest, caller: Caller = Depends(require_caller)):
+    # Only the owner's index may answer, and only for a verified owner: a
+    # LucidLink-token caller is not checked against the owner's workspaces
+    # until the SDK logs in, so it always takes the per-request path.
+    if caller.owner is not None:
+        indexed = _ask_indexer(req, caller.workspace_id)
+        if indexed is not None:
+            return indexed
+    token = caller.token
     if not LLM_BASE_URL or not LLM_MODEL:
         raise HTTPException(
             status_code=503,

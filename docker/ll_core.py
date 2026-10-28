@@ -8,6 +8,12 @@ connect, insights) can share it without a circular import.
 SDK >=0.14. Public surface (used by lucidlink_api / connect_api / insights_api)
 is unchanged: require_token, require_token_and_filespace, _with_fs,
 _with_filespace, _with_workspace, _list_filespaces_cached.
+
+Two kinds of bearer are accepted (docs/INDEXER.md, "Owner auth"): a LucidLink
+service-account token, used as-is exactly as before, or the owner's Supabase
+session JWT, which is verified and swapped for the LucidLink token stored in
+the vault for `X-Workspace-Id` (or the vault's active workspace). Everything
+below the dependencies only ever sees a LucidLink token.
 """
 from fastapi import HTTPException, Header, Depends
 import lucidlink
@@ -15,8 +21,12 @@ import os
 import time
 import logging
 from collections import OrderedDict
+from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
+
+import owner_auth
+import vault
 
 logger = logging.getLogger("lucidlink_api")
 
@@ -114,8 +124,11 @@ def _extract_token(authorization: Optional[str], x_lucid_token: Optional[str]) -
     return None
 
 
-def _auth_error(e: Exception) -> HTTPException:
+def _auth_error(e: Exception, token: Optional[str] = None) -> HTTPException:
     msg = str(e)
+    # SDK messages are echoed to the caller; make sure a token never is.
+    if token:
+        msg = msg.replace(token, "[redacted]")
     if "401" in msg or "Unauthorized" in msg or "Invalid token" in msg:
         return HTTPException(status_code=401, detail=f"LucidLink auth failed: {msg}")
     if "403" in msg or "Forbidden" in msg:
@@ -123,31 +136,84 @@ def _auth_error(e: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=f"LucidLink upstream error: {msg}")
 
 
-def _require_token(authorization: Optional[str], x_lucid_token: Optional[str]) -> str:
+@dataclass(frozen=True)
+class Caller:
+    """Who is calling and which LucidLink token acts for them.
+
+    `owner` is set only when the bearer was a verified owner JWT; `token` is
+    then the vault's token and must never be logged or echoed.
+    """
+    token: str
+    owner: Optional[owner_auth.Owner] = None
+    workspace_id: Optional[str] = None
+
+
+def vault_token_for_owner(workspace_id: Optional[str]) -> str:
+    """The vault's LucidLink token for an already-verified owner.
+
+    503 when the vault is unusable, 401 when it holds no token for the
+    workspace (the owner has to add one in Settings).
+    """
+    try:
+        token = vault.token_for(workspace_id or None)
+    except vault.VaultError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not token:
+        which = f"workspace '{workspace_id}'" if workspace_id else "the active workspace"
+        raise HTTPException(status_code=401, detail=f"No LucidLink token in the vault for {which}")
+    return token
+
+
+def _resolve_caller(authorization: Optional[str], x_lucid_token: Optional[str],
+                    x_workspace_id: Optional[str]) -> Caller:
     token = _extract_token(authorization, x_lucid_token)
     if not token:
         raise HTTPException(
             status_code=401,
             detail="Missing Authorization: Bearer or X-LucidLink-Token header",
         )
-    return token
+    if not owner_auth.is_jwt(token):
+        return Caller(token=token)
+    owner = owner_auth.verify_owner(token)
+    return Caller(token=vault_token_for_owner(x_workspace_id), owner=owner,
+                  workspace_id=x_workspace_id or None)
+
+
+def _require_token(authorization: Optional[str], x_lucid_token: Optional[str],
+                   x_workspace_id: Optional[str] = None) -> str:
+    return _resolve_caller(authorization, x_lucid_token, x_workspace_id).token
+
+
+def require_caller(
+    authorization: Optional[str] = Header(default=None),
+    x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+) -> Caller:
+    """Like require_token, but also says whether the caller is the owner."""
+    return _resolve_caller(authorization, x_lucid_token, x_workspace_id)
 
 
 def require_token(
     authorization: Optional[str] = Header(default=None),
     x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
 ) -> str:
-    return _require_token(authorization, x_lucid_token)
+    return _require_token(authorization, x_lucid_token, x_workspace_id)
 
 
 def require_token_and_filespace(
     authorization: Optional[str] = Header(default=None),
     x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
     x_lucid_filespace: Optional[str] = Header(default=None, alias="X-LucidLink-Filespace"),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
 ) -> tuple[str, str]:
-    token = _require_token(authorization, x_lucid_token)
+    # Same 401-then-400 order as before, but a request missing the filespace
+    # header is rejected before it costs a Supabase round-trip.
     if not x_lucid_filespace:
+        if not _extract_token(authorization, x_lucid_token):
+            _require_token(authorization, x_lucid_token)  # raises the usual 401
         raise HTTPException(status_code=400, detail="Missing X-LucidLink-Filespace header")
+    token = _require_token(authorization, x_lucid_token, x_workspace_id)
     return token, x_lucid_filespace
 
 
@@ -164,7 +230,7 @@ def _get_session(token: str) -> "_Session":
     try:
         session = _Session(token)
     except Exception as e:
-        raise _auth_error(e)
+        raise _auth_error(e, token)
 
     _clients[token] = session
     while len(_clients) > MAX_CLIENTS:
@@ -207,7 +273,7 @@ def _with_filespace(token: str, filespace_name: str, fn):
         except HTTPException:
             raise
         except Exception as e:
-            raise _auth_error(e)
+            raise _auth_error(e, token)
         return fn(filespace)
 
 
