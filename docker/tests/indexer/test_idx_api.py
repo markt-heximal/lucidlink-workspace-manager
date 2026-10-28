@@ -73,6 +73,7 @@ def test_sync_hint_and_filespace_toggle(make_service):
         # The override survives in index.db.
         assert svc.store.filespace_row("ws1", "fsB")["enabled"] == 0
 
+        svc.scheduler.runtime("ws1", "fsA").full_requested = False   # as if the sync ran
         r = c.post("/index/hint", json={"filespace": "fsA", "op": "write", "path": "/x.md"}, headers=H)
         assert r.status_code == 202 and r.json() == {}
         assert svc.scheduler.runtime("ws1", "fsA").hints[-1]["path"] == "/x.md"
@@ -83,9 +84,14 @@ def test_sync_hint_and_filespace_toggle(make_service):
 def test_workspace_header_is_default_and_body_wins(make_service):
     svc = make_service()
     with client(svc) as c:
+        # Header is the default; wsX is not a configured workspace, so it is dropped.
         c.post("/index/hint", json={"filespace": "fsA", "op": "write", "path": "/h.md"},
                headers={**H, "X-Workspace-Id": "wsX"})
-        assert svc.scheduler.runtime("wsX", "fsA").hints[-1]["path"] == "/h.md"
+        assert ("wsX", "fsA") not in svc.scheduler._runtime
+        c.post("/index/hint", json={"filespace": "fsA", "op": "write", "path": "/h.md"},
+               headers={**H, "X-Workspace-Id": "ws1"})
+        assert svc.scheduler.runtime("ws1", "fsA").hints[-1]["path"] == "/h.md"
+        # Body wins over the header.
         c.post("/index/hint", json={"workspaceId": "ws1", "filespace": "fsA", "op": "write", "path": "/b.md"},
                headers={**H, "X-Workspace-Id": "wsX"})
         assert svc.scheduler.runtime("ws1", "fsA").hints[-1]["path"] == "/b.md"

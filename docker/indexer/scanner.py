@@ -1,7 +1,15 @@
 """Delta detection and indexing for one filespace.
 
 A scan lists metadata only (`read_dir`) and compares it to the ledger in
-index.db, keyed by the SDK's stable `file_id`:
+index.db. SDK 0.14's `read_dir` does not expose `file_id` (every entry has
+""), and its mtime may be in other units than `get_entry`'s, so there are two
+steps per file:
+
+1. Fast path, by path: a live ledger row at this path whose stored listing
+   values (`list_size`, `list_mtime`) equal what read_dir reports -> unchanged,
+   no further call. An unchanged rescan is therefore read_dir only.
+2. Otherwise `get_entry(path)` supplies the stable `file_id` and authoritative
+   (size, mtime), and the ledger is reconciled by file_id:
 
 * unknown file_id, or (size, mtime) differs  -> queued (status `pending`)
 * same file_id at a new path                 -> path updated in place; chunks and
@@ -11,8 +19,9 @@ index.db, keyed by the SDK's stable `file_id`:
 * not seen by a scan in which *every*
   directory listed successfully               -> tombstoned, chunks removed
 
-A listing failure anywhere makes the scan incomplete and nothing is deleted:
-a transient error must never look like a deletion.
+A listing failure anywhere — or a get_entry that fails or returns no file_id —
+makes the scan incomplete and nothing is deleted: a transient error must never
+look like a deletion, and a row is never written without a file_id.
 
 Indexing then drains the queue newest-mtime first. Reading a queued file and
 finding the same sha256 as last time (a touch) only refreshes the ledger;
@@ -65,6 +74,13 @@ def normpath(path: str) -> str:
     return path
 
 
+def _hintable(path: Optional[str]) -> bool:
+    """Absolute, no '.'/'..' components: anything else is not a path we index."""
+    if not path or not path.startswith("/"):
+        return False
+    return not any(p in (".", "..") for p in path.split("/"))
+
+
 def hidden_path(path: str) -> bool:
     """True when any directory component of `path` is skipped by scans."""
     parts = [p for p in path.split("/") if p]
@@ -82,6 +98,8 @@ class ScanResult:
     renamed: int = 0
     deleted: int = 0
     failed_dirs: list[str] = field(default_factory=list)
+    failed_files: list[str] = field(default_factory=list)
+    stats: int = 0          # get_entry calls made
 
     @property
     def changes(self) -> int:
@@ -132,8 +150,20 @@ class FilespaceIndexer:
             return True
         return datetime.now(timezone.utc) - at >= timedelta(seconds=self.config.failed_retry_sec)
 
-    def observe(self, path: str, size: int, mtime: int, file_id: str, scan_id: int, res: ScanResult) -> None:
-        """Reconcile one listed file with the ledger."""
+    def observe(self, path: str, size: int, mtime: int, file_id: str, scan_id: int, res: ScanResult,
+                list_size: Optional[int] = None, list_mtime: Optional[int] = None) -> None:
+        """Reconcile one file (authoritative get_entry values) with the ledger.
+
+        `list_size` / `list_mtime` are the read_dir values for the fast path;
+        None (hints, which only have get_entry) stores "unknown" so the next
+        scan does one get_entry for this path and fills them in.
+        """
+        if not file_id:
+            # Without a stable id we cannot tell new from renamed from deleted.
+            logger.warning("[%s/%s] no file_id for %s; scan marked incomplete", self.ws, self.fs, path)
+            res.failed_files.append(path)
+            res.complete = False
+            return
         name = path.rsplit("/", 1)[-1]
         supported = is_supported(name)
         unsupported_reason = f"unsupported type (.{ext_of(name)})" if ext_of(name) else "unsupported type"
@@ -142,11 +172,12 @@ class FilespaceIndexer:
         if row is None:
             self.store.insert_file(self.ws, self.fs, file_id, path, size, mtime, scan_id,
                                    status="pending" if supported else "skipped",
-                                   reason=None if supported else unsupported_reason)
+                                   reason=None if supported else unsupported_reason,
+                                   list_size=list_size, list_mtime=list_mtime)
             res.new += 1
             return
 
-        cols: dict = {"scan_id": scan_id}
+        cols: dict = {"scan_id": scan_id, "list_size": list_size, "list_mtime": list_mtime}
         if row["path"] != path:
             # Rename/move: same content, same chunks and vectors. Re-upsert
             # mirror metadata (it carries the path) and refresh search caches.
@@ -198,12 +229,45 @@ class FilespaceIndexer:
                     if not skip_dir(e.name):
                         queue.append(path)
                 elif e.type == "file" and not skip_file(e.name):
-                    self.observe(path, e.size, e.mtime, e.file_id, scan_id, res)
+                    self._listed_file(path, e.size, e.mtime, scan_id, res)
         if prune and res.complete:
             res.deleted = self._prune(root, scan_id)
         if root == "/":
             self.store.update_filespace(self.ws, self.fs, last_scan_at=now_iso())
         return res
+
+    def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult) -> None:
+        """One file from read_dir: fast path by path, else get_entry + observe."""
+        for row in self.store.live_files_at_path(self.ws, self.fs, path):
+            if row["list_size"] == list_size and row["list_mtime"] == list_mtime:
+                res.seen += 1
+                cols: dict = {"scan_id": scan_id}
+                if row["status"] == "failed" and self._retry_due(row):
+                    cols["status"] = "pending"
+                self.store.update_file(self.ws, self.fs, row["file_id"], **cols)
+                return
+        res.stats += 1
+        try:
+            entry = self.source.stat(path)
+        except Exception as e:
+            logger.warning("[%s/%s] get_entry %s failed: %s", self.ws, self.fs, path, e)
+            res.failed_files.append(path)
+            res.complete = False
+            return
+        if entry is None or entry.type != "file":
+            return  # vanished (or replaced by a folder) since the listing; next scan settles it
+        self.observe(path, entry.size, entry.mtime, entry.file_id, scan_id, res,
+                     list_size=list_size, list_mtime=list_mtime)
+
+    def _tombstone_under(self, path: str) -> int:
+        """Tombstone ledger rows at `path` or below it (a confirmed deletion)."""
+        prefix = path.rstrip("/") + "/"
+        rows = self.store.query(
+            "SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status != 'deleted' "
+            "AND (path = ? OR substr(path, 1, ?) = ?)", (self.ws, self.fs, path, len(prefix), prefix))
+        for row in rows:
+            self._tombstone(row)
+        return len(rows)
 
     def _prune(self, root: str, scan_id: int) -> int:
         args: list = [self.ws, self.fs, scan_id]
@@ -219,36 +283,54 @@ class FilespaceIndexer:
 
     # ------------------------------------------------------------ hints
     def hint(self, op: str, path: str, src: Optional[str] = None) -> bool:
-        """Apply a file-service change hint. Returns False when the targeted
-        listing failed and a full scan is needed to be sure."""
+        """Apply a file-service change hint with targeted calls only.
+
+        Hints are advisory and never escalate to a full scan: a path that does
+        not exist (or is hidden, or malformed) is ignored, and anything missed
+        is caught by the next periodic scan. Returns False when a targeted
+        listing was incomplete.
+        """
+        if not _hintable(path) or (src is not None and not _hintable(src)):
+            return True
         path = normpath(path)
-        if op == "write":
-            if hidden_path(path):
-                return True
-            entry = self.source.stat(path)
-            if entry is None:
-                return self.scan(parent_of(path)).complete
-            if entry.type == "dir":
-                return self.scan(path).complete
-            res = ScanResult(scan_id=self.store.next_scan_id(self.ws, self.fs), root=path)
-            self.observe(path, entry.size, entry.mtime, entry.file_id, res.scan_id, res)
+        if op in ("write", "mkdir"):
+            return self._hint_present(path)
+        if op == "delete":
+            return self._hint_absent(path)
+        if op == "move":
+            # Destination first, so a moved file is re-pathed by file_id
+            # (keeping its vectors) before the source side is settled.
+            ok = self._hint_present(path)
+            if src:
+                ok = self._hint_absent(normpath(src)) and ok
+            return ok
+        raise ValueError(f"unknown hint op '{op}'")
+
+    def _hint_present(self, path: str) -> bool:
+        if path == "/" or hidden_path(path):
+            return True
+        entry = self.source.stat(path)
+        if entry is None:
+            return True
+        if entry.type == "dir":
+            return self.scan(path).complete
+        if entry.type != "file":
+            return True
+        res = ScanResult(scan_id=self.store.next_scan_id(self.ws, self.fs), root=path)
+        self.observe(path, entry.size, entry.mtime, entry.file_id, res.scan_id, res)
+        if entry.file_id:
             # A write that replaced the file (new file_id) leaves the old row behind.
             for row in self.store.live_files_at_path(self.ws, self.fs, path):
                 if row["file_id"] != entry.file_id:
                     self._tombstone(row)
+        return res.complete
+
+    def _hint_absent(self, path: str) -> bool:
+        """A delete (or move source): tombstone the subtree once confirmed gone."""
+        if path == "/" or self.source.stat(path) is not None:
             return True
-        if op == "mkdir":
-            return self.scan(path).complete
-        if op == "delete":
-            return self.scan(parent_of(path)).complete
-        if op == "move":
-            # Destination first, so a moved file is re-pathed (keeping its
-            # vectors) before the source side would tombstone it.
-            ok = self.scan(parent_of(path)).complete
-            if src:
-                ok = self.scan(parent_of(normpath(src))).complete and ok
-            return ok
-        raise ValueError(f"unknown hint op '{op}'")
+        self._tombstone_under(path)
+        return True
 
     # ------------------------------------------------------------ index
     def index_pending(self, progress: Optional[ProgressFn] = None,

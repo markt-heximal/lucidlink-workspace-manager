@@ -52,13 +52,14 @@ def test_unchanged_rescan_reads_and_embeds_nothing(make_service):
     for i in range(5):
         s.write(f"/f{i}.md", para(f"topic{i}"))
     run(svc)
-    s.reads = 0
+    s.reads = s.stats = 0
     requests, embedded = svc.embedder.requests, svc.embedder.texts_embedded
 
     run(svc)
     run(svc)
 
     assert s.reads == 0
+    assert s.stats == 0                       # no get_entry: the per-path fast path held
     assert svc.embedder.requests == requests
     assert svc.embedder.texts_embedded == embedded
 
@@ -97,7 +98,8 @@ def test_touch_with_same_content_does_not_reembed(make_service):
     assert s.reads == 1                       # the hash check has to read it
     assert svc.embedder.texts_embedded == before
     row = files(svc)["/a.md"]
-    assert row["mtime"] == 5000 and row["status"] == "indexed"
+    assert row["list_mtime"] == 5000 and row["mtime"] == 5000 * s.STAT_MTIME_SCALE
+    assert row["status"] == "indexed"
     assert _point_ids(svc, "/a.md") == pids
     s.reads = 0
     run(svc)

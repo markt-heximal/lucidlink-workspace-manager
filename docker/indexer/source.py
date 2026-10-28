@@ -250,9 +250,14 @@ class SdkSourceProvider(SourceProvider):
 class MemorySource(FilespaceSource):
     """A filespace held in a dict, with stable file ids and failure injection.
 
-    `reads` / `lists` count calls so tests can assert a rescan did no I/O;
+    Shaped like SDK 0.14: `list_dir` returns `file_id=""` for every entry and
+    an mtime in seconds, while `stat` (get_entry) returns the real file_id and
+    an mtime in milliseconds — so code that mixes the two, or trusts read_dir
+    for identity, fails the tests. `reads` / `lists` / `stats` count calls;
     `fail_dirs` makes listing those directories raise.
     """
+
+    STAT_MTIME_SCALE = 1000
 
     def __init__(self):
         self.files: dict[str, dict] = {}   # path -> {data, mtime, file_id}
@@ -261,6 +266,7 @@ class MemorySource(FilespaceSource):
         self.fail_reads: set[str] = set()
         self.reads = 0
         self.lists = 0
+        self.stats = 0
         self._clock = 1_700_000_000
 
     @staticmethod
@@ -323,10 +329,10 @@ class MemorySource(FilespaceSource):
         out = []
         for d in sorted(self.dirs):
             if d != "/" and self._parent(d) == path:
-                out.append(Entry(d.rsplit("/", 1)[-1], "dir", 0, 0, "dir:" + d))
+                out.append(Entry(d.rsplit("/", 1)[-1], "dir", 0, 0, ""))
         for p, f in sorted(self.files.items()):
             if self._parent(p) == path:
-                out.append(Entry(p.rsplit("/", 1)[-1], "file", len(f["data"]), f["mtime"], f["file_id"]))
+                out.append(Entry(p.rsplit("/", 1)[-1], "file", len(f["data"]), f["mtime"], ""))
         return out
 
     def read_file(self, path: str) -> bytes:
@@ -338,9 +344,11 @@ class MemorySource(FilespaceSource):
         return self.files[path]["data"]
 
     def stat(self, path: str) -> Optional[Entry]:
+        self.stats += 1
         f = self.files.get(path)
         if f is not None:
-            return Entry(path.rsplit("/", 1)[-1], "file", len(f["data"]), f["mtime"], f["file_id"])
+            return Entry(path.rsplit("/", 1)[-1], "file", len(f["data"]),
+                         f["mtime"] * self.STAT_MTIME_SCALE, f["file_id"])
         if path in self.dirs:
             return Entry(path.rsplit("/", 1)[-1], "dir", 0, 0, "dir:" + path)
         return None

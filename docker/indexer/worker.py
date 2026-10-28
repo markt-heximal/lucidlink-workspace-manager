@@ -40,6 +40,10 @@ logger = logging.getLogger("indexer.worker")
 
 Key = tuple[str, str]
 
+# Queued hints per filespace beyond this collapse into one full-scan request,
+# so a burst (or a flood of forged hints) costs one scan and bounded memory.
+MAX_QUEUED_HINTS = 50
+
 
 @dataclass
 class Runtime:
@@ -74,9 +78,16 @@ class Scheduler:
         self._pool: Optional[ThreadPoolExecutor] = None
 
     # ------------------------------------------------------------ targets
-    def runtime(self, ws: str, fs: str) -> Runtime:
+    def runtime(self, ws: str, fs: str, create: bool = False) -> Runtime:
+        """Runtime for a filespace. Reads of unknown keys get a throwaway
+        default, so status/search for arbitrary names never grow `_runtime`."""
         with self._cv:
-            return self._runtime.setdefault((ws, fs), Runtime())
+            if create:
+                return self._runtime.setdefault((ws, fs), Runtime())
+            return self._runtime.get((ws, fs)) or Runtime()
+
+    def is_target(self, ws: str, fs: str) -> bool:
+        return (ws, fs) in self.targets()
 
     def refresh_targets(self, force: bool = False) -> list[Key]:
         """(workspace, filespace) pairs from the vault plus explicit overrides."""
@@ -122,9 +133,10 @@ class Scheduler:
     # ------------------------------------------------------------ requests
     def request_sync(self, keys: list[Key]) -> list[Key]:
         queued = []
+        targets = set(self.targets())
         with self._cv:
             for key in keys:
-                if not self.enabled(*key):
+                if key not in targets or not self.enabled(*key):
                     continue
                 self._runtime.setdefault(key, Runtime()).full_requested = True
                 queued.append(key)
@@ -132,10 +144,18 @@ class Scheduler:
         return queued
 
     def add_hint(self, ws: str, fs: str, hint: dict) -> bool:
-        if not self.enabled(ws, fs):
+        """Queue a hint for a known, enabled filespace; anything else is dropped."""
+        if not self.is_target(ws, fs) or not self.enabled(ws, fs):
             return False
         with self._cv:
-            self._runtime.setdefault((ws, fs), Runtime()).hints.append(hint)
+            rt = self._runtime.setdefault((ws, fs), Runtime())
+            if rt.full_requested:
+                pass  # a full scan is already coming; it covers this hint
+            elif len(rt.hints) >= MAX_QUEUED_HINTS:
+                rt.hints = []
+                rt.full_requested = True
+            else:
+                rt.hints.append(hint)
             self._cv.notify_all()
         return True
 
@@ -199,7 +219,7 @@ class Scheduler:
     # ------------------------------------------------------------ job
     def run_job(self, ws: str, fs: str, full: Optional[bool] = None) -> None:
         """One unit of work for a filespace. Callable synchronously (tests)."""
-        rt = self.runtime(ws, fs)
+        rt = self.runtime(ws, fs, create=True)
         with self._cv:
             hints, rt.hints = rt.hints, []
             if full is None:
@@ -211,21 +231,25 @@ class Scheduler:
             with self.svc.sources.lease(ws, fs) as source:
                 idx = FilespaceIndexer(store, source, ws, fs, self.svc.embedder, self.cfg)
                 rt.phase = "scanning"
+                # Hints are advisory: a failed or incomplete one is logged and
+                # left to the next periodic scan, never escalated to a full scan
+                # (a hint names a path, possibly a bogus one).
                 for h in hints:
                     try:
                         if not idx.hint(h["op"], h["path"], h.get("src")):
-                            full = True
+                            logger.info("[%s/%s] hint %s incomplete; next scan will settle it", ws, fs, h)
                     except Exception as e:
                         logger.warning("[%s/%s] hint %s failed: %s", ws, fs, h, e)
-                        full = True
                 if full:
                     res = idx.scan("/")
-                    logger.info("[%s/%s] scan %d: seen=%d new=%d changed=%d renamed=%d deleted=%d%s",
-                                ws, fs, res.scan_id, res.seen, res.new, res.changed, res.renamed,
-                                res.deleted, "" if res.complete else f" INCOMPLETE {res.failed_dirs[:5]}")
+                    logger.info("[%s/%s] scan %d: seen=%d new=%d changed=%d renamed=%d deleted=%d "
+                                "get_entry=%d%s", ws, fs, res.scan_id, res.seen, res.new, res.changed,
+                                res.renamed, res.deleted, res.stats,
+                                "" if res.complete else f" INCOMPLETE {(res.failed_dirs + res.failed_files)[:5]}")
                     if not res.complete:
-                        error = f"listing failed for {len(res.failed_dirs)} folder(s), deletions deferred: " \
-                                f"{', '.join(res.failed_dirs[:3])}"
+                        failed = res.failed_dirs + res.failed_files
+                        error = (f"listing failed for {len(res.failed_dirs)} folder(s) and "
+                                 f"{len(res.failed_files)} file(s), deletions deferred: {', '.join(failed[:3])}")
                 if self.svc.embedder.configured:
                     rt.phase = "indexing"
                     idx.index_pending(progress=lambda d, t, c: rt.progress.update(done=d, total=t, current=c),

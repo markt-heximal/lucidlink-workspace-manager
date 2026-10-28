@@ -144,30 +144,44 @@ unreachable or has nothing indexed.
 
 ## Change detection
 
-The SDK's `DirEntry` carries a stable `file_id`, `size` and `mtime`, so a scan
-lists metadata only and never downloads a file to find out whether it changed.
+A scan lists metadata only and never downloads a file to find out whether it
+changed. SDK 0.14's `fs.read_dir` does **not** expose `file_id` (it is `""` on
+every entry) and its `mtime` may use different units from `fs.get_entry`'s, so
+identity comes from `get_entry`, and only when needed.
 
 1. **Scan** breadth-first with `fs.read_dir`, skipping hidden and system folders
    (same list as the web app). Each scan has an id; every file seen is stamped
    with it.
-2. **New or changed** — no ledger row for the `file_id`, or `(size, mtime)`
+2. **Fast path by path** — the ledger keeps the `(size, mtime)` read_dir last
+   reported for each path (`list_size`, `list_mtime`). A live row at the same
+   path with equal listing values is unchanged: no further call, so an unchanged
+   rescan is `read_dir` only. Otherwise `fs.get_entry(path)` supplies the stable
+   `file_id` and authoritative `(size, mtime)`, and steps 3–5 apply. An entry
+   without a `file_id`, or a failed `get_entry`, makes the scan incomplete
+   (nothing is deleted) and is never written to the ledger.
+3. **New or changed** — no ledger row for the `file_id`, or `(size, mtime)`
    differs → queued. Newest `mtime` first, so a fresh filespace is useful within
    minutes.
-3. **Renamed** — same `file_id`, new path → path updated in place, vectors keep
+4. **Renamed** — same `file_id`, new path → path updated in place, vectors keep
    their embeddings (only metadata is re-upserted).
-4. **Touched, not changed** — content sha256 equals the stored hash → only the
+5. **Touched, not changed** — content sha256 equals the stored hash → only the
    ledger's `mtime` is updated.
-5. **Deleted** — after a scan in which *every* directory listed successfully,
+6. **Deleted** — after a scan in which *every* directory listed successfully,
    files not stamped with this scan id are tombstoned and their chunks removed.
    A directory that fails to list marks its whole subtree as "unknown" for this
    scan: nothing under it is deleted. A transient error must never look like a
    deletion.
-6. **Chunk-level reuse** — embeddings are cached by `(model, sha256(chunk text))`.
+7. **Chunk-level reuse** — embeddings are cached by `(model, sha256(chunk text))`.
    An edit to one paragraph re-embeds one or two chunks, not the file.
 
-Hints from the file service queue the hinted path immediately (and, for deletes
-and moves, run a scan of the parent directory) so in-app changes show up within
-seconds. A full delta scan runs every `SYNC_INTERVAL_SEC`, and on demand.
+Hints from the file service are handled within seconds with targeted calls
+only: `write`/`mkdir` (and a move's destination) `get_entry` the path and
+reconcile that file or list that folder; `delete` (and a move's source)
+tombstones the path's subtree once `get_entry` confirms it is gone. Hints for
+filespaces not being indexed, for paths that do not exist, or malformed paths
+are ignored and never escalate to a full scan; more than 50 queued hints for one
+filespace collapse into one full scan. A full delta scan runs every
+`SYNC_INTERVAL_SEC`, and on demand.
 
 ## Extraction and chunking
 

@@ -43,8 +43,13 @@ CREATE TABLE IF NOT EXISTS files (
     filespace    TEXT NOT NULL,
     file_id      TEXT NOT NULL,
     path         TEXT NOT NULL,
-    size         INTEGER NOT NULL DEFAULT 0,
-    mtime        INTEGER NOT NULL DEFAULT 0,
+    size         INTEGER NOT NULL DEFAULT 0,   -- authoritative, from get_entry
+    mtime        INTEGER NOT NULL DEFAULT 0,   -- authoritative, from get_entry
+    -- (size, mtime) as read_dir last reported them for this path. read_dir has
+    -- no file_id (SDK 0.14) and its mtime may use other units than get_entry's,
+    -- so these only drive the per-path fast path. NULL = unknown (set by hints).
+    list_size    INTEGER,
+    list_mtime   INTEGER,
     content_hash TEXT,
     status       TEXT NOT NULL,   -- pending | indexed | skipped | failed | deleted
     reason       TEXT,
@@ -117,7 +122,14 @@ class Store:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
+        self._migrate()
         self._generation = 0
+
+    def _migrate(self) -> None:
+        cols = {r[1] for r in self._conn.execute("PRAGMA table_info(files)").fetchall()}
+        for col in ("list_size", "list_mtime"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -216,12 +228,15 @@ class Store:
                           "AND status != 'deleted'", (ws, fs, path))
 
     def insert_file(self, ws: str, fs: str, file_id: str, path: str, size: int, mtime: int,
-                    scan_id: int, status: str = "pending", reason: Optional[str] = None) -> None:
+                    scan_id: int, status: str = "pending", reason: Optional[str] = None,
+                    list_size: Optional[int] = None, list_mtime: Optional[int] = None) -> None:
+        if not file_id:
+            raise ValueError("refusing to write a ledger row without a file_id")
         self.execute(
             "INSERT OR REPLACE INTO files (workspace_id, filespace, file_id, path, size, mtime, "
-            "content_hash, status, reason, chunk_count, scan_id, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, NULL)",
-            (ws, fs, file_id, path, size, mtime, status, reason, scan_id))
+            "list_size, list_mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, NULL)",
+            (ws, fs, file_id, path, size, mtime, list_size, list_mtime, status, reason, scan_id))
 
     def update_file(self, ws: str, fs: str, file_id: str, **cols) -> None:
         sets = ", ".join(f"{k}=?" for k in cols)

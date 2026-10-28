@@ -159,7 +159,7 @@ class IndexerService:
         ws = self.resolve_workspace(workspace_id)
         if ws is None:
             return False
-        return self.scheduler.add_hint(ws, filespace, {"op": op, "path": path, "src": src})
+        return self.scheduler.add_hint(ws, filespace, {"op": op, "path": path, "src": src})  # drops non-targets
 
     # ------------------------------------------------------------ query
     def search(self, workspace_id: Optional[str], filespace: Optional[str], query: str, k: int = 20,
