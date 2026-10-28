@@ -46,15 +46,8 @@ set_if_empty() {  # set_if_empty NAME VALUE
   echo "  + $name"
 }
 
-ask() {  # ask NAME PROMPT DEFAULT -> sets NAME if empty, using the answer
-  local name="$1" prompt="$2" default="$3" answer
-  if [ -n "$(get "$name")" ]; then
-    echo "  = $name (kept)"
-    return
-  fi
-  printf '  %s [%s]: ' "$prompt" "$default"
-  read -r answer || true
-  set_if_empty "$name" "${answer:-$default}"
+use_default() {  # use_default NAME DEFAULT -> sets NAME if empty; edit .env later to change
+  set_if_empty "$1" "$2"
 }
 
 rand_hex() { openssl rand -hex "$1"; }
@@ -113,11 +106,11 @@ set_if_empty OWNER_EMAIL "$OWNER_EMAIL_DEFAULT"
 set_if_empty RUVECTOR_URL "$RUVECTOR_URL_DEFAULT"
 
 echo ""
-echo "=== Models (press Enter to accept the default) ==="
-ask EMBED_BASE_URL "Embeddings endpoint (OpenAI-compatible, ends in /v1)" "http://spark-47d8.tail333a1d.ts.net:11434/v1"
-ask EMBED_MODEL "Embedding model" "nomic-embed-text"
-ask LLM_BASE_URL "Chat model endpoint for Ask and topics (ends in /v1)" "$(get EMBED_BASE_URL)"
-ask LLM_MODEL "Chat model" "qwen2.5:32b"
+echo "=== Models (Ollama on the Spark; edit .env to change) ==="
+use_default EMBED_BASE_URL "http://spark-47d8.tail333a1d.ts.net:11434/v1"
+use_default EMBED_MODEL "nomic-embed-text"
+use_default LLM_BASE_URL "$(get EMBED_BASE_URL)"
+use_default LLM_MODEL "qwen2.5:32b"
 
 # Optional: a copy of the vault key in the macOS keychain. Without VAULT_KEY
 # the vault cannot be decrypted, and the tokens would have to be re-entered.
