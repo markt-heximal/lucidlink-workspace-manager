@@ -45,6 +45,7 @@ service's global `_registry_lock` and UI requests never wait on a crawl.
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT` | both | Existing chat endpoint, reused for Ask and the topic survey. |
 | `SYNC_INTERVAL_SEC` | indexer | Background delta scan cadence per filespace. Default 300. |
 | `INDEX_MAX_FILE_BYTES` | indexer | Skip larger files. Default 25 MB. |
+| `INDEX_JOB_BUDGET_SEC` | indexer | Seconds one job may index before yielding its slot, so a huge filespace takes turns with the rest. Default 120. |
 
 ## Owner auth (Option A: existing Supabase sign-in)
 

@@ -56,6 +56,8 @@ class Runtime:
     progress: dict = field(default_factory=lambda: {"done": 0, "total": 0, "current": None})
     survey_error: Optional[str] = None
     jobs: int = 0                          # completed jobs, for tests and diagnostics
+    more_pending: bool = False             # last job stopped with files still queued
+    last_run_end: float = 0.0              # monotonic; least recently run goes first
 
 
 def iso(ts: Optional[float]) -> Optional[str]:
@@ -194,13 +196,16 @@ class Scheduler:
         now = time.time()
         with self._cv:
             running = sum(1 for rt in self._runtime.values() if rt.running)
+            # Round-robin: whichever filespace ran least recently is offered a
+            # slot first, so time-sliced big jobs take turns with small ones.
+            keys = sorted(keys, key=lambda k: self._runtime[k].last_run_end if k in self._runtime else 0.0)
             for key in keys:
                 if running >= self.cfg.concurrency or self._stopping.is_set():
                     break
                 rt = self._runtime.setdefault(key, Runtime())
                 if rt.running or not self.enabled(*key):
                     continue
-                if rt.full_requested or rt.hints or now >= rt.next_scan_at:
+                if rt.full_requested or rt.hints or rt.more_pending or now >= rt.next_scan_at:
                     rt.running = True
                     running += 1
                     assert self._pool is not None
@@ -227,6 +232,7 @@ class Scheduler:
             rt.full_requested = False
         store = self.svc.store
         error: Optional[str] = None
+        scan_took: Optional[float] = None
         try:
             with self.svc.sources.lease(ws, fs) as source:
                 idx = FilespaceIndexer(store, source, ws, fs, self.svc.embedder, self.cfg)
@@ -241,7 +247,9 @@ class Scheduler:
                     except Exception as e:
                         logger.warning("[%s/%s] hint %s failed: %s", ws, fs, h, e)
                 if full:
+                    scan_started = time.monotonic()
                     res = idx.scan("/")
+                    scan_took = time.monotonic() - scan_started
                     logger.info("[%s/%s] scan %d: seen=%d new=%d changed=%d renamed=%d deleted=%d "
                                 "get_entry=%d%s", ws, fs, res.scan_id, res.seen, res.new, res.changed,
                                 res.renamed, res.deleted, res.stats,
@@ -252,8 +260,11 @@ class Scheduler:
                                  f"{len(res.failed_files)} file(s), deletions deferred: {', '.join(failed[:3])}")
                 if self.svc.embedder.configured:
                     rt.phase = "indexing"
+                    deadline = time.monotonic() + self.cfg.job_budget_sec
                     idx.index_pending(progress=lambda d, t, c: rt.progress.update(done=d, total=t, current=c),
-                                      should_stop=self._stopping.is_set)
+                                      should_stop=lambda: self._stopping.is_set() or time.monotonic() >= deadline,
+                                      limit=self.cfg.job_max_files)
+                    rt.more_pending = bool(store.pending_files(ws, fs, 1))
                     idx.backfill_embeddings()
                     self.svc.vectors.sync_mirror()
                 elif store.pending_files(ws, fs):
@@ -270,10 +281,18 @@ class Scheduler:
         finally:
             rt.phase = None
             rt.progress = {"done": 0, "total": 0, "current": None}
+            if error is not None:
+                # Don't spin on a broken embedder or source: the backlog waits
+                # for the next scheduled scan or a manual sync.
+                rt.more_pending = False
             if full:
-                rt.next_scan_at = time.time() + self.cfg.sync_interval_sec
+                interval = self.cfg.sync_interval_sec
+                if scan_took is not None:
+                    interval = max(interval, self.cfg.scan_interval_factor * scan_took)
+                rt.next_scan_at = time.time() + interval
             store.update_filespace(ws, fs, last_error=error)
             rt.jobs += 1
+            rt.last_run_end = time.monotonic()
         if error is None:
             self._maybe_survey(ws, fs, rt)
 

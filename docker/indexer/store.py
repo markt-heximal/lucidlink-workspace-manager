@@ -280,10 +280,13 @@ class Store:
         self.execute(f"UPDATE files SET {sets} WHERE workspace_id=? AND filespace=? AND file_id=?",
                      (*cols.values(), ws, fs, file_id))
 
-    def pending_files(self, ws: str, fs: str) -> list[dict]:
+    def pending_files(self, ws: str, fs: str, limit: Optional[int] = None) -> list[dict]:
         """The work queue: newest mtime first, so a fresh filespace is useful early."""
-        return self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status='pending' "
-                          "ORDER BY mtime DESC, path", (ws, fs))
+        sql = ("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status='pending' "
+               "ORDER BY mtime DESC, path")
+        if limit is not None:
+            return self.query(sql + " LIMIT ?", (ws, fs, int(limit)))
+        return self.query(sql, (ws, fs))
 
     def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int) -> list[dict]:
         """Candidate rows for GET /index/recent: per scope, the newest live files by
