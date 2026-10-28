@@ -291,10 +291,10 @@ def token_for(workspace_id: Optional[str]) -> Optional[str]:
     return tok or None
 
 
-def resolve_workspace_id(workspace_id: Optional[str]) -> Optional[str]:
-    """The workspace id `token_for(workspace_id)` would use."""
-    ws = _pick_workspace(load(), workspace_id)
-    return (ws or {}).get("id")
+def resolve(workspace_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(resolved workspace id, token) in one read; the id `token_for` would use."""
+    ws = _pick_workspace(load(), workspace_id) or {}
+    return ws.get("id"), (ws.get("token") or None)
 
 
 # ---------------------------------------------------------------- HTTP

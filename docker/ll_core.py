@@ -141,27 +141,34 @@ class Caller:
     """Who is calling and which LucidLink token acts for them.
 
     `owner` is set only when the bearer was a verified owner JWT; `token` is
-    then the vault's token and must never be logged or echoed.
+    then the vault's token and must never be logged or echoed, and
+    `workspace_id` is the vault's resolution of X-Workspace-Id (falling back to
+    activeWorkspaceId) — never the raw header. Both are None for token callers.
     """
     token: str
     owner: Optional[owner_auth.Owner] = None
     workspace_id: Optional[str] = None
 
 
-def vault_token_for_owner(workspace_id: Optional[str]) -> str:
-    """The vault's LucidLink token for an already-verified owner.
+def _vault_resolve(workspace_id: Optional[str]) -> tuple[str, str]:
+    """(resolved workspace id, LucidLink token) for an already-verified owner.
 
     503 when the vault is unusable, 401 when it holds no token for the
     workspace (the owner has to add one in Settings).
     """
     try:
-        token = vault.token_for(workspace_id or None)
+        resolved_id, token = vault.resolve(workspace_id or None)
     except vault.VaultError as e:
         raise HTTPException(status_code=503, detail=str(e))
-    if not token:
+    if not token or not resolved_id:
         which = f"workspace '{workspace_id}'" if workspace_id else "the active workspace"
         raise HTTPException(status_code=401, detail=f"No LucidLink token in the vault for {which}")
-    return token
+    return resolved_id, token
+
+
+def vault_token_for_owner(workspace_id: Optional[str]) -> str:
+    """The vault's LucidLink token for an already-verified owner."""
+    return _vault_resolve(workspace_id)[1]
 
 
 def _resolve_caller(authorization: Optional[str], x_lucid_token: Optional[str],
@@ -175,8 +182,8 @@ def _resolve_caller(authorization: Optional[str], x_lucid_token: Optional[str],
     if not owner_auth.is_jwt(token):
         return Caller(token=token)
     owner = owner_auth.verify_owner(token)
-    return Caller(token=vault_token_for_owner(x_workspace_id), owner=owner,
-                  workspace_id=x_workspace_id or None)
+    resolved_id, vault_token = _vault_resolve(x_workspace_id)
+    return Caller(token=vault_token, owner=owner, workspace_id=resolved_id)
 
 
 def _require_token(authorization: Optional[str], x_lucid_token: Optional[str],
@@ -207,14 +214,25 @@ def require_token_and_filespace(
     x_lucid_filespace: Optional[str] = Header(default=None, alias="X-LucidLink-Filespace"),
     x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
 ) -> tuple[str, str]:
+    caller, filespace = require_caller_and_filespace(
+        authorization, x_lucid_token, x_lucid_filespace, x_workspace_id)
+    return caller.token, filespace
+
+
+def require_caller_and_filespace(
+    authorization: Optional[str] = Header(default=None),
+    x_lucid_token: Optional[str] = Header(default=None, alias="X-LucidLink-Token"),
+    x_lucid_filespace: Optional[str] = Header(default=None, alias="X-LucidLink-Filespace"),
+    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+) -> tuple[Caller, str]:
+    """require_token_and_filespace, keeping who the caller is (for index hints)."""
     # Same 401-then-400 order as before, but a request missing the filespace
     # header is rejected before it costs a Supabase round-trip.
     if not x_lucid_filespace:
         if not _extract_token(authorization, x_lucid_token):
             _require_token(authorization, x_lucid_token)  # raises the usual 401
         raise HTTPException(status_code=400, detail="Missing X-LucidLink-Filespace header")
-    token = _require_token(authorization, x_lucid_token, x_workspace_id)
-    return token, x_lucid_filespace
+    return _resolve_caller(authorization, x_lucid_token, x_workspace_id), x_lucid_filespace
 
 
 def _get_session(token: str) -> "_Session":

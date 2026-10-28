@@ -44,6 +44,17 @@ def test_owner_accepted_by_id(env, supabase, monkeypatch):
     assert e.value.status_code == 401
 
 
+def test_owner_user_id_set_ignores_email_match(env, supabase, monkeypatch):
+    # OWNER_EMAIL also matches OTHER's account here, but with OWNER_USER_ID set
+    # only the id counts.
+    monkeypatch.setenv("OWNER_USER_ID", OWNER_ID)
+    monkeypatch.setenv("OWNER_EMAIL", "intruder@example.com")
+    with pytest.raises(HTTPException) as e:
+        owner_auth.verify_owner(OTHER_JWT)
+    assert e.value.status_code == 401
+    assert owner_auth.verify_owner(OWNER_JWT).id == OWNER_ID
+
+
 def test_invalid_session_is_401(env, supabase):
     from auth_helpers import make_jwt
     with pytest.raises(HTTPException) as e:

@@ -11,7 +11,7 @@ hints after successful file mutations.
 from contextlib import asynccontextmanager
 
 from fastapi import (FastAPI, HTTPException, Depends, Request, UploadFile, File, Form,
-                     BackgroundTasks, Header)
+                     BackgroundTasks)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
@@ -19,6 +19,7 @@ from pydantic import BaseModel
 import os
 import time
 import mimetypes
+from urllib.parse import unquote
 import logging
 from typing import Optional
 import httpx
@@ -28,6 +29,8 @@ from datetime import datetime, timezone
 from ll_core import (
     require_token,
     require_token_and_filespace,
+    require_caller_and_filespace,
+    Caller,
     _with_fs,
     _list_filespaces_cached,
     registry_stats,
@@ -147,14 +150,26 @@ def _send_hint(body: dict, workspace_id: Optional[str]) -> None:
         logger.warning("index hint %s %s failed: %s", body.get("op"), body.get("path"), type(e).__name__)
 
 
-def _hint(background: BackgroundTasks, creds: tuple[str, str], workspace_id: Optional[str],
+def _hint(background: BackgroundTasks, ctx: "tuple[Caller, str]",
           op: str, path: str, src: Optional[str] = None) -> None:
-    if not _internal_key():
+    """Queue a hint, for the owner only.
+
+    A LucidLink-token caller may be anyone with a token for any workspace and a
+    filespace that merely shares a name with the owner's; letting them hint
+    would let them force scans of the owner's index. The workspace id sent is
+    the vault's resolution for this request, never the raw header.
+    """
+    caller, filespace = ctx
+    if caller.owner is None or not _internal_key():
         return
-    body = {"filespace": creds[1], "op": op, "path": path}
+    body = {"filespace": filespace, "op": op, "path": path}
     if src is not None:
         body["src"] = src
-    background.add_task(_send_hint, body, workspace_id)
+    background.add_task(_send_hint, body, caller.workspace_id)
+
+
+def _creds(ctx: "tuple[Caller, str]") -> tuple[str, str]:
+    return ctx[0].token, ctx[1]
 
 
 def _files_op(creds: tuple[str, str], fn, *, not_found_on_error: bool = False):
@@ -189,61 +204,56 @@ def read_file(path: str, creds=Depends(require_token_and_filespace)):
 
 @app.post("/files/write")
 def write_file(req: WriteRequest, background: BackgroundTasks,
-               creds=Depends(require_token_and_filespace),
-               x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
+               ctx=Depends(require_caller_and_filespace)):
     def op(fs):
         fs.write_file(req.path, req.content.encode())
         return {"status": "ok"}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "write", req.path)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "write", req.path)
     return result
 
 
 @app.post("/files/mkdir")
 def make_dir(path: str, background: BackgroundTasks,
-             creds=Depends(require_token_and_filespace),
-             x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
+             ctx=Depends(require_caller_and_filespace)):
     def op(fs):
         fs.create_dir(path)
         return {"status": "ok"}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "mkdir", path)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "mkdir", path)
     return result
 
 
 @app.delete("/files")
 def delete_file(path: str, background: BackgroundTasks,
-                creds=Depends(require_token_and_filespace),
-                x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
+                ctx=Depends(require_caller_and_filespace)):
     def op(fs):
         fs.delete(path)
         return {"status": "ok"}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "delete", path)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "delete", path)
     return result
 
 
 @app.delete("/files/dir")
 def delete_dir(path: str, background: BackgroundTasks, recursive: bool = True,
-               creds=Depends(require_token_and_filespace),
-               x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
+               ctx=Depends(require_caller_and_filespace)):
     def op(fs):
         fs.delete_dir(path, recursive=recursive)
         return {"status": "ok"}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "delete", path)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "delete", path)
     return result
 
 
 @app.post("/files/move")
 def move_file(req: MoveRequest, background: BackgroundTasks,
-              creds=Depends(require_token_and_filespace),
-              x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id")):
+              ctx=Depends(require_caller_and_filespace)):
     def op(fs):
         fs.move(req.src, req.dst)
         return {"status": "ok"}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "move", req.dst, src=req.src)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "move", req.dst, src=req.src)
     return result
 
 
@@ -337,16 +347,27 @@ async def upload_file(
     background: BackgroundTasks,
     path: str = Form(...),
     file: UploadFile = File(...),
-    creds=Depends(require_token_and_filespace),
-    x_workspace_id: Optional[str] = Header(default=None, alias="X-Workspace-Id"),
+    ctx=Depends(require_caller_and_filespace),
 ):
     data = await file.read()
     def op(fs):
         fs.write_file(path, data)
         return {"status": "ok", "path": path, "size": len(data)}
-    result = _files_op(creds, op)
-    _hint(background, creds, x_workspace_id, "write", path)
+    result = _files_op(_creds(ctx), op)
+    _hint(background, ctx, "write", path)
     return result
+
+
+def _has_dot_segment(path: str) -> bool:
+    """True if any segment is `.` or `..`, after percent-decoding (repeatedly,
+    so double-encoding does not slip through) and treating `\\` as `/`."""
+    decoded = path
+    for _ in range(3):
+        nxt = unquote(decoded)
+        if nxt == decoded:
+            break
+        decoded = nxt
+    return any(seg in (".", "..") for seg in decoded.replace("\\", "/").split("/"))
 
 
 # --- Management API Proxy: /api/v1/* -> LucidLink Management API container ---
@@ -356,6 +377,10 @@ _http_client = httpx.AsyncClient(base_url=MGMT_API_UPSTREAM, timeout=120.0)
 
 @app.api_route("/api/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_management_api(request: Request, path: str):
+    # httpx normalises dot-segments, so `/api/v1/%2e%2e/...` would otherwise
+    # leave the /api/v1 prefix on the upstream.
+    if _has_dot_segment(path):
+        return JSONResponse(status_code=400, content={"error": {"message": "Invalid path"}})
     url = f"/api/v1/{path}"
     if request.url.query:
         url = f"{url}?{request.url.query}"
@@ -406,7 +431,7 @@ async def proxy_indexer(request: Request, path: str,
     if not key:
         return JSONResponse(status_code=503,
                             content={"detail": "Indexer not configured (set INDEXER_INTERNAL_KEY)"})
-    if any(seg in ("..", ".") for seg in path.split("/")):
+    if _has_dot_segment(path):
         raise HTTPException(status_code=400, detail="Invalid index path")
     url = f"{INDEXER_URL}/index/{path}"
     if request.url.query:

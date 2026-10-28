@@ -124,8 +124,10 @@ def _not_owner() -> HTTPException:
 def _match(user: dict, owner_email: str, owner_id: str) -> Optional[Owner]:
     uid = str(user.get("id") or "")
     email = str(user.get("email") or "")
-    if owner_id and uid and uid == owner_id:
-        return Owner(id=uid, email=email)
+    # When an id is configured it is the only thing that counts: ids are
+    # immutable, emails can be changed or re-registered.
+    if owner_id:
+        return Owner(id=uid, email=email) if uid and uid == owner_id else None
     # An email match also needs the address to be confirmed, so an unconfirmed
     # sign-up using the owner's address can never pass as the owner.
     confirmed = user.get("email_confirmed_at") or user.get("confirmed_at")

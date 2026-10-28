@@ -136,6 +136,35 @@ def test_mgmt_proxy_passes_lucidlink_token_and_rejects_non_owner(client, seeded_
     assert len(rec.requests) == 1
 
 
+@pytest.mark.parametrize("path", [
+    "/api/v1/%2e%2e/%2e%2e/internal/thing",
+    "/api/v1/%2E%2E/internal",
+    "/api/v1/a/%2e/b",
+    "/api/v1/%252e%252e/internal",
+    "/api/v1/..%5cinternal",
+])
+def test_mgmt_proxy_rejects_dot_segments(client, monkeypatch, path):
+    rec = Recorder()
+    _mgmt(monkeypatch, rec)
+    r = client.get(path, headers={"Authorization": f"Bearer {SA_TOKEN}"})
+    assert r.status_code == 400
+    assert rec.requests == []
+
+
+def test_mgmt_proxy_normal_path_still_forwarded(client, monkeypatch):
+    rec = Recorder()
+    _mgmt(monkeypatch, rec)
+    assert client.get("/api/v1/filespaces/a.b", headers={"Authorization": f"Bearer {SA_TOKEN}"}).status_code == 200
+    assert rec.requests[0].url.path == "/api/v1/filespaces/a.b"
+
+
+def test_index_proxy_rejects_dot_segments(client, env, supabase, monkeypatch):
+    rec = Recorder()
+    _indexer(monkeypatch, rec)
+    assert client.get("/index/%2e%2e/health", headers=owner_headers()).status_code == 400
+    assert rec.requests == []
+
+
 # ---------------------------------------------------------------- /index proxy
 def _indexer(monkeypatch, recorder):
     monkeypatch.setattr(lucidlink_api, "_index_transport", httpx.MockTransport(recorder))
@@ -196,14 +225,21 @@ def _hint_bodies(rec):
     return [json.loads(r.content) for r in rec.requests]
 
 
-def test_hint_after_write(client, env, fake_fs, hints):
-    h = {"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"}
-    assert client.post("/files/write", json={"path": "/a.md", "content": "x"}, headers=h).status_code == 200
-    assert _hint_bodies(hints) == [{"filespace": "fs1", "op": "write", "path": "/a.md"}]
+def _owner_fs(**extra):
+    return owner_headers(**{"X-LucidLink-Filespace": "fs1", **extra})
+
+
+def test_hint_after_owner_write(client, seeded_vault, supabase, fake_fs, hints):
+    # No X-Workspace-Id: the hint carries the vault's resolved (active) workspace.
+    assert client.post("/files/write", json={"path": "/a.md", "content": "x"},
+                       headers=_owner_fs()).status_code == 200
+    assert _hint_bodies(hints) == [{"workspaceId": "default", "filespace": "fs1",
+                                    "op": "write", "path": "/a.md"}]
     assert hints.requests[0].headers["x-internal-key"] == "internal-secret"
     assert hints.requests[0].url.path == "/index/hint"
+    assert fake_fs["tokens"] == [(SA_TOKEN, "fs1")]
 
-    h["X-Workspace-Id"] = "ws2"
+    h = _owner_fs(**{"X-Workspace-Id": "ws2"})
     client.post("/files/move", json={"src": "/a.md", "dst": "/b.md"}, headers=h)
     client.post("/files/mkdir", params={"path": "/d"}, headers=h)
     client.delete("/files", params={"path": "/b.md"}, headers=h)
@@ -216,28 +252,45 @@ def test_hint_after_write(client, env, fake_fs, hints):
         {"workspaceId": "ws2", "filespace": "fs1", "op": "delete", "path": "/d"},
         {"workspaceId": "ws2", "filespace": "fs1", "op": "write", "path": "/u.txt"},
     ]
+    assert all(t == SA_TOKEN_2 for t, _ in fake_fs["tokens"][1:])
 
 
-def test_no_hint_after_failed_write(client, env, fake_fs, hints):
+def test_no_hint_for_lucidlink_token_caller(client, seeded_vault, supabase, fake_fs, hints):
+    # Regression: a token caller (possibly not the owner) must not be able to
+    # poke the owner's index, whatever X-Workspace-Id it claims.
+    for ws in (None, "default", "ws2"):
+        h = {"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"}
+        if ws:
+            h["X-Workspace-Id"] = ws
+        assert client.post("/files/mkdir", params={"path": "/x"}, headers=h).status_code == 200
+        assert client.post("/files/write", json={"path": "/a", "content": "x"}, headers=h).status_code == 200
+    assert hints.requests == []
+    assert supabase.calls == 0
+
+
+def test_owner_unknown_workspace_is_401_and_no_hint(client, seeded_vault, supabase, fake_fs, hints):
+    r = client.post("/files/mkdir", params={"path": "/x"}, headers=_owner_fs(**{"X-Workspace-Id": "nope"}))
+    assert r.status_code == 401
+    assert hints.requests == [] and fake_fs["tokens"] == []
+
+
+def test_no_hint_after_failed_write(client, seeded_vault, supabase, fake_fs, hints):
     fake_fs["fs"] = FakeFS(fail=True)
-    r = client.post("/files/write", json={"path": "/a.md", "content": "x"},
-                    headers={"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"})
+    r = client.post("/files/write", json={"path": "/a.md", "content": "x"}, headers=_owner_fs())
     assert r.status_code == 500
     assert hints.requests == []
 
 
-def test_no_hint_without_internal_key(client, env, fake_fs, hints, monkeypatch):
+def test_no_hint_without_internal_key(client, seeded_vault, supabase, fake_fs, hints, monkeypatch):
     monkeypatch.setenv("INDEXER_INTERNAL_KEY", "")
-    client.post("/files/write", json={"path": "/a.md", "content": "x"},
-                headers={"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"})
+    client.post("/files/write", json={"path": "/a.md", "content": "x"}, headers=_owner_fs())
     assert hints.requests == []
 
 
-def test_hint_failure_does_not_break_write(client, env, fake_fs, monkeypatch):
+def test_hint_failure_does_not_break_write(client, seeded_vault, supabase, fake_fs, monkeypatch):
     rec = Recorder(exc=lambda req: httpx.ConnectError("down", request=req))
     monkeypatch.setattr(lucidlink_api, "_hint_transport", httpx.MockTransport(rec))
-    r = client.post("/files/write", json={"path": "/a.md", "content": "x"},
-                    headers={"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"})
+    r = client.post("/files/write", json={"path": "/a.md", "content": "x"}, headers=_owner_fs())
     assert r.status_code == 200 and len(rec.requests) == 1
 
 
