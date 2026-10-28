@@ -4,16 +4,28 @@ The scanner only needs three calls — list a directory, stat a path, read a
 file — so it is written against `FilespaceSource`. `SdkSourceProvider` backs it
 with the LucidLink SDK; `MemorySource` is an in-memory filespace for tests.
 
-The SDK side mirrors ll_core's registry (one Client per service-account token,
-filespaces linked by id, both LRU-bounded because each link carries a ~1 GB
-cache and worker threads) with two differences that matter for a crawler:
+The SDK side (lucidlink 1.0) mirrors ll_core's registry (one Client per
+service-account token, filespaces linked by id with the cache maximums from
+ll_cache, both LRU-bounded because each link carries its own data + metadata
+caches, 5 + 1 GiB by default, and worker threads) with two differences that
+matter for a crawler:
 
 * A *lease* pins a linked filespace for the length of one job, so LRU eviction
   never unlinks a filespace mid-scan; eviction skips pinned links and the cache
   may briefly exceed its bound instead.
-* Each linked filespace has its own lock. The SDK is synchronous and not known
-  to be thread-safe per Filespace, and this indexer's own Client means a crawl
-  never contends with the file service's `_registry_lock`.
+* Each Client (session) has its own lock, held for the whole lease. SDK 1.0:
+  "A Client is not thread safe: do not use it, or the objects obtained from
+  it, from several threads at the same time" — so jobs on two filespaces of
+  the same workspace take turns, and linking, eviction and name lookups happen
+  under that lock too. Different workspaces (Clients) still run in parallel,
+  and this indexer's own Clients mean a crawl never contends with the file
+  service's `_registry_lock`.
+
+Identity: SDK 1.0's `read_dir` returns each entry's real id (`FsEntry.id`)
+and `modified_at`, the same values `get_entry` gives, so the scanner takes both
+from the listing. SDK 0.14 returned `file_id=""` from `read_dir`; an entry
+without an id still falls back to `stat`, and a row is never written without
+one.
 
 Settings (which workspaces exist, their tokens) come from the vault, imported
 lazily because docker/vault.py is owned by the file service and may be absent
@@ -37,10 +49,10 @@ logger = logging.getLogger("indexer.source")
 @dataclass
 class Entry:
     name: str
-    type: str          # "file" | "dir" | "link"
+    type: str          # "file" | "dir" | "symlink"
     size: int
-    mtime: int
-    file_id: str
+    mtime: int         # modified_at, ns since the epoch for the SDK
+    file_id: str       # FsEntry.id; "" when the listing has none
 
 
 class SourceError(Exception):
@@ -115,7 +127,6 @@ class _Link:
     def __init__(self, filespace_id: str, filespace):
         self.filespace_id = filespace_id
         self.filespace = filespace
-        self.lock = threading.Lock()
         self.refs = 0
 
 
@@ -126,12 +137,20 @@ class _SdkSession:
 
     def __init__(self, token: str):
         import lucidlink
-        self.client = lucidlink.Client()  # SANDBOXED storage; own temp root
-        self.client.login(lucidlink.ServiceAccountCredentials(token=token))
-        # Service-account tokens are workspace-scoped, so there is exactly one.
-        self.workspace = self.client.get_workspace(self.client.list_workspaces()[0].id)
+        self.client = lucidlink.Client()  # EPHEMERAL storage; own temp root
+        try:
+            self.client.login(lucidlink.ServiceAccountCredentials(token=token))
+            # Service-account tokens are workspace-scoped, so there is exactly one.
+            self.workspace = self.client.workspace
+        except BaseException:
+            _release(self.client.close, "close client after failed login")
+            raise
         self.links: "OrderedDict[str, _Link]" = OrderedDict()
         self._names: tuple[float, list] = (0.0, [])
+        # Every use of this Client and of what it returned happens under this
+        # lock. Re-entrant so one thread may hold two leases (nested).
+        self.lock = threading.RLock()
+        self.refs = 0          # leases taken or waiting; guarded by the provider lock
 
     def resolve(self, ref: str) -> str:
         """Filespace name (or id) -> id. Names are mutable; we link by id."""
@@ -145,7 +164,7 @@ class _SdkSession:
         raise SourceError(f"filespace '{ref}' not found in workspace")
 
     def busy(self) -> bool:
-        return any(link.refs for link in self.links.values())
+        return self.refs > 0
 
     def close(self) -> None:
         for fid, link in list(self.links.items()):
@@ -155,19 +174,24 @@ class _SdkSession:
 
 
 class SdkFilespaceSource(FilespaceSource):
+    """FilespaceSource over an SDK 1.0 `lucidlink.FileSystem`."""
+
     def __init__(self, fs):
         self._fs = fs
 
     @staticmethod
     def _entry(e) -> Entry:
-        return Entry(name=e.name, type=e.type, size=int(e.size or 0),
-                     mtime=int(e.mtime or 0), file_id=str(e.file_id))
+        # FsEntry (1.0): id, modified_at (ns), type is an EntryType StrEnum.
+        return Entry(name=e.name, type=str(e.type), size=int(e.size or 0),
+                     mtime=int(e.modified_at or 0), file_id=str(e.id or ""))
 
     def list_dir(self, path: str) -> list[Entry]:
         return [self._entry(e) for e in self._fs.read_dir(path)]
 
     def read_file(self, path: str) -> bytes:
-        return self._fs.read_file(path)
+        # What FsUtils.read_bytes does, without its isinstance(FileSystem) check.
+        with self._fs.open(path, "rb") as f:
+            return f.read()
 
     def stat(self, path: str) -> Optional[Entry]:
         try:
@@ -204,10 +228,12 @@ class SdkSourceProvider(SourceProvider):
         return session
 
     def _link(self, session: _SdkSession, filespace: str) -> _Link:
+        """Caller holds `session.lock`, so no other thread is using this Client."""
+        import ll_cache
         fid = session.resolve(filespace)
         link = session.links.get(fid)
         if link is None:
-            link = _Link(fid, session.workspace.link_filespace(id=fid))
+            link = _Link(fid, session.workspace.link_filespace(fid, cache=ll_cache.cache_config()))
             session.links[fid] = link
         session.links.move_to_end(fid)
         for old_id in list(session.links):
@@ -226,18 +252,28 @@ class SdkSourceProvider(SourceProvider):
             raise SourceError(f"no LucidLink token in the vault for workspace '{workspace_id}'")
         with self._lock:
             try:
-                link = self._link(self._session(token), filespace)
-            except SourceError:
-                raise
+                session = self._session(token)
             except Exception as e:
-                raise SourceError(f"could not link filespace '{filespace}': {e}") from e
-            link.refs += 1
+                msg = str(e).replace(token, "[redacted]")
+                raise SourceError(f"could not log in for workspace '{workspace_id}': {msg}") from e
+            session.refs += 1              # pinned: never closed while leased or waiting
         try:
-            with link.lock:
-                yield SdkFilespaceSource(link.filespace.fs)
+            with session.lock:
+                try:
+                    link = self._link(session, filespace)
+                except SourceError:
+                    raise
+                except Exception as e:
+                    msg = str(e).replace(token, "[redacted]")
+                    raise SourceError(f"could not link filespace '{filespace}': {msg}") from e
+                link.refs += 1
+                try:
+                    yield SdkFilespaceSource(link.filespace.file_system)
+                finally:
+                    link.refs -= 1
         finally:
             with self._lock:
-                link.refs -= 1
+                session.refs -= 1
 
     def close(self) -> None:
         with self._lock:
@@ -250,16 +286,20 @@ class SdkSourceProvider(SourceProvider):
 class MemorySource(FilespaceSource):
     """A filespace held in a dict, with stable file ids and failure injection.
 
-    Shaped like SDK 0.14: `list_dir` returns `file_id=""` for every entry and
-    an mtime in seconds, while `stat` (get_entry) returns the real file_id and
-    an mtime in milliseconds — so code that mixes the two, or trusts read_dir
-    for identity, fails the tests. `reads` / `lists` / `stats` count calls;
-    `fail_dirs` makes listing those directories raise.
+    Shaped like SDK 1.0 by default: `list_dir` and `stat` (get_entry) return
+    the same id and mtime, so a scan needs no `stat` per file. With
+    `legacy_listing=True` it is shaped like SDK 0.14 instead: `list_dir`
+    returns `file_id=""` for every entry and an mtime in seconds, while `stat`
+    returns the real id and an mtime in milliseconds — so code that mixes the
+    two, or trusts an id-less listing for identity, fails the tests.
+    `reads` / `lists` / `stats` count calls; `fail_dirs` makes listing those
+    directories raise.
     """
 
-    STAT_MTIME_SCALE = 1000
+    STAT_MTIME_SCALE = 1000            # legacy_listing only
 
-    def __init__(self):
+    def __init__(self, legacy_listing: bool = False):
+        self.legacy_listing = legacy_listing
         self.files: dict[str, dict] = {}   # path -> {data, mtime, file_id}
         self.dirs: set[str] = {"/"}
         self.fail_dirs: set[str] = set()
@@ -327,12 +367,14 @@ class MemorySource(FilespaceSource):
         if path not in self.dirs:
             raise FileNotFoundError(path)
         out = []
+        legacy = self.legacy_listing
         for d in sorted(self.dirs):
             if d != "/" and self._parent(d) == path:
-                out.append(Entry(d.rsplit("/", 1)[-1], "dir", 0, 0, ""))
+                out.append(Entry(d.rsplit("/", 1)[-1], "dir", 0, 0, "" if legacy else "dir:" + d))
         for p, f in sorted(self.files.items()):
             if self._parent(p) == path:
-                out.append(Entry(p.rsplit("/", 1)[-1], "file", len(f["data"]), f["mtime"], ""))
+                out.append(Entry(p.rsplit("/", 1)[-1], "file", len(f["data"]), f["mtime"],
+                                 "" if legacy else f["file_id"]))
         return out
 
     def read_file(self, path: str) -> bytes:
@@ -347,8 +389,9 @@ class MemorySource(FilespaceSource):
         self.stats += 1
         f = self.files.get(path)
         if f is not None:
+            scale = self.STAT_MTIME_SCALE if self.legacy_listing else 1
             return Entry(path.rsplit("/", 1)[-1], "file", len(f["data"]),
-                         f["mtime"] * self.STAT_MTIME_SCALE, f["file_id"])
+                         f["mtime"] * scale, f["file_id"])
         if path in self.dirs:
             return Entry(path.rsplit("/", 1)[-1], "dir", 0, 0, "dir:" + path)
         return None

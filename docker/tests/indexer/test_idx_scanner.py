@@ -98,7 +98,7 @@ def test_touch_with_same_content_does_not_reembed(make_service):
     assert s.reads == 1                       # the hash check has to read it
     assert svc.embedder.texts_embedded == before
     row = files(svc)["/a.md"]
-    assert row["list_mtime"] == 5000 and row["mtime"] == 5000 * s.STAT_MTIME_SCALE
+    assert row["list_mtime"] == 5000 and row["mtime"] == 5000   # SDK 1.0: listing == get_entry
     assert row["status"] == "indexed"
     assert _point_ids(svc, "/a.md") == pids
     s.reads = 0

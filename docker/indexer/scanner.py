@@ -1,15 +1,17 @@
 """Delta detection and indexing for one filespace.
 
 A scan lists metadata only (`read_dir`) and compares it to the ledger in
-index.db. SDK 0.14's `read_dir` does not expose `file_id` (every entry has
-""), and its mtime may be in other units than `get_entry`'s, so there are two
-steps per file:
+index.db. SDK 1.0's `read_dir` returns each entry's stable id (`FsEntry.id`)
+and `modified_at`, the same values `get_entry` reports, so per file:
 
 1. Fast path, by path: a live ledger row at this path whose stored listing
-   values (`list_size`, `list_mtime`) equal what read_dir reports -> unchanged,
-   no further call. An unchanged rescan is therefore read_dir only.
-2. Otherwise `get_entry(path)` supplies the stable `file_id` and authoritative
-   (size, mtime), and the ledger is reconciled by file_id:
+   values (`list_size`, `list_mtime`) equal what read_dir reports, and whose
+   file_id matches the listed id when the listing has one -> unchanged, no
+   further call. An unchanged rescan is therefore read_dir only.
+2. Otherwise the listing's id and (size, mtime) are used directly. Only an
+   entry listed without an id (SDK 0.14 returned `file_id=""` for every entry)
+   costs a `get_entry(path)`, which then supplies the id and authoritative
+   (size, mtime). The ledger is reconciled by file_id:
 
 * unknown file_id, or (size, mtime) differs  -> queued (status `pending`)
 * same file_id at a new path                 -> path updated in place; chunks and
@@ -229,23 +231,31 @@ class FilespaceIndexer:
                     if not skip_dir(e.name):
                         queue.append(path)
                 elif e.type == "file" and not skip_file(e.name):
-                    self._listed_file(path, e.size, e.mtime, scan_id, res)
+                    self._listed_file(path, e.size, e.mtime, scan_id, res, e.file_id)
         if prune and res.complete:
             res.deleted = self._prune(root, scan_id)
         if root == "/":
             self.store.update_filespace(self.ws, self.fs, last_scan_at=now_iso())
         return res
 
-    def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult) -> None:
-        """One file from read_dir: fast path by path, else get_entry + observe."""
+    def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult,
+                     list_id: str = "") -> None:
+        """One file from read_dir: fast path by path; else observe with the
+        listed id, or get_entry + observe when the listing had no id."""
         for row in self.store.live_files_at_path(self.ws, self.fs, path):
-            if row["list_size"] == list_size and row["list_mtime"] == list_mtime:
+            if (row["list_size"] == list_size and row["list_mtime"] == list_mtime
+                    and (not list_id or row["file_id"] == list_id)):
                 res.seen += 1
                 cols: dict = {"scan_id": scan_id}
                 if row["status"] == "failed" and self._retry_due(row):
                     cols["status"] = "pending"
                 self.store.update_file(self.ws, self.fs, row["file_id"], **cols)
                 return
+        if list_id:
+            # SDK 1.0: the listing is as authoritative as get_entry.
+            self.observe(path, list_size, list_mtime, list_id, scan_id, res,
+                         list_size=list_size, list_mtime=list_mtime)
+            return
         res.stats += 1
         try:
             entry = self.source.stat(path)
