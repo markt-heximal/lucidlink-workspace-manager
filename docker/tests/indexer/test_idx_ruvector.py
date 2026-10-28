@@ -23,6 +23,11 @@ class FakeRuvector:
     def restart(self):
         self.collections.clear()
 
+    def restore_empty(self):
+        """A restart followed by a restore script that recreates definitions only."""
+        for col in self.collections.values():
+            col["points"].clear()
+
     def handle(self, req: httpx.Request) -> httpx.Response:
         self.requests.append((req.method, req.url.path))
         if self.fail:
@@ -46,6 +51,12 @@ class FakeRuvector:
                 assert len(p["vector"]) == col["dim"]
                 col["points"][p["id"]] = (np.array(p["vector"], dtype=np.float32), p["metadata"])
             return httpx.Response(200, json={"ids": [p["id"] for p in body["points"]]})
+        if len(parts) == 4 and parts[2] == "points" and req.method == "GET":
+            # Stock server: Json(Option<VectorEntry>) -> null when absent.
+            p = col["points"].get(parts[3])
+            if p is None:
+                return httpx.Response(200, content=b"null", headers={"content-type": "application/json"})
+            return httpx.Response(200, json={"id": parts[3], "metadata": p[1]})
         if parts[2:] == ["points", "search"]:
             q = np.array(body["vector"], dtype=np.float32)
             flt = body.get("filter") or {}
@@ -187,3 +198,22 @@ def test_cross_filespace_search_with_mirror(make_service, ruv):
     assert {h["filespace"] for h in hits} == {"fsA", "fsB"}
     assert hits[0]["filespace"] == "fsB"
     assert files(svc, "fsB")["/b.md"]["status"] == "indexed"
+
+
+def test_rehydrate_when_collection_restored_empty(make_service, ruv):
+    svc = make_service(ruvector=ruv.transport)
+    _index(svc, {"/a.md": para("alpha"), "/b.md": para("beta")})
+    embedded = svc.embedder.texts_embedded
+    name = svc.vectors.mirror.collection
+    ruv.restore_empty()                            # collection exists, points gone
+
+    # Search still answers (locally) instead of returning nothing...
+    hits = svc.search("ws1", "fsA", "beta detail")
+    assert hits and hits[0]["path"] == "/b.md"
+    # ...and the next sync notices and refills the mirror without re-embedding.
+    svc.vectors.sync_mirror()
+    assert svc.vectors.mirror.rehydrations >= 1
+    assert len(ruv.collections[name]["points"]) == svc.store.chunk_count()
+    assert svc.embedder.texts_embedded == embedded + 1
+    hits = svc.search("ws1", "fsA", "alpha detail")
+    assert hits[0]["path"] == "/a.md" and svc.vectors.last_backend == "ruvector"

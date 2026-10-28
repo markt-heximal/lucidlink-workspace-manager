@@ -418,6 +418,11 @@ class Store:
             c.executemany("INSERT OR IGNORE INTO mirror_points (collection, point_id) VALUES (?, ?)",
                           [(collection, p) for p in point_ids])
 
+    def mirror_sample(self, collection: str) -> Optional[int]:
+        """One live point we believe is mirrored, to check the mirror still holds it."""
+        return self.scalar("SELECT m.point_id FROM mirror_points m JOIN chunks c ON c.point_id=m.point_id "
+                           "WHERE m.collection=? ORDER BY m.point_id DESC LIMIT 1", (collection,))
+
     def mirror_clear(self, collection: str) -> None:
         self.execute("DELETE FROM mirror_points WHERE collection=?", (collection,))
 

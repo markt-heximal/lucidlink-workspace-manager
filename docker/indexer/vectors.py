@@ -176,7 +176,27 @@ class RuvectorMirror:
             self._req("GET", f"/collections/{name}")
         except CollectionMissing:
             self._rehydrate(name)
+        else:
+            self._verify(name)
         self._ready = name
+
+    def _verify(self, name: str) -> None:
+        """Rehydrate when the collection exists but no longer holds our points.
+
+        A restart can bring a collection back empty (e.g. a restore script that
+        recreates collection definitions), which the 404 check cannot see.
+        """
+        sample = self.store.mirror_sample(name)
+        if sample is None:
+            return
+        try:
+            r = self._req("GET", f"/collections/{name}/points/{sample}")
+            held = r.text.strip() not in ("", "null")
+        except CollectionMissing:
+            held = False
+        if not held:
+            logger.info("ruvector: %s no longer holds mirrored points", name)
+            self._rehydrate(name)
 
     def _rehydrate(self, name: str) -> None:
         """Recreate the collection and refill it from SQLite (no re-embedding)."""
@@ -237,6 +257,7 @@ class RuvectorMirror:
     def sync(self) -> int:
         """Bring the collection up to date with SQLite; rebuild if too many dead."""
         def op(name):
+            self._verify(name)  # each sync cycle, so a silent restart is caught
             live, dead = self.store.mirror_counts(name)
             if dead and dead > DEAD_RATIO_REBUILD * max(live, 1):
                 self._rebuild(name)
@@ -297,8 +318,13 @@ class VectorService:
         if self.mirror is not None and not (path_prefix and path_prefix != "/"):
             try:
                 hits = self.mirror.search(q, k, scopes)
-                self.last_backend = "ruvector"
-                return hits
+                if hits or not self.local.search(q, 1, scopes):
+                    self.last_backend = "ruvector"
+                    return hits
+                # The mirror came back empty while local has matches: it has
+                # likely lost its points. Answer locally and re-check it next time.
+                logger.warning("ruvector returned no hits but local has some; using local")
+                self.mirror._ready = None
             except MirrorError as e:
                 logger.warning("ruvector search failed, using local: %s", e)
         self.last_backend = "local"
