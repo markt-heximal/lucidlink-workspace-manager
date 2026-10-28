@@ -249,13 +249,20 @@ on block storage (a NAS share, external drive or local disk) is indexed **where
 it lives**, read-only, with 0 bytes moved, and becomes searchable and askable
 next to the filespaces. Check-out to LucidLink and check-in are later phases.
 
+**iCloud Drive.** `~/Library/Mobile Documents/com~apple~CloudDocs` works like
+any folder, but with "Optimize Mac Storage" on, files evicted to iCloud must be
+downloaded when read, which makes the first index slower and can fail for
+files macOS will not fetch on demand; those are recorded as failed and retried.
+If Desktop & Documents are synced to iCloud, ~/Desktop is already inside iCloud
+Drive, so index one or the other, not both.
+
 **Mounting.** The share is mounted on the Mini (e.g. `/Volumes/<share>`) and
 bind-mounted into the indexer container **read-only** (`:ro`), so the container
 cannot write to it whatever the code does.
 
 | Variable | Meaning |
 |---|---|
-| `BLOCK_SOURCE_PATH` | Host path of the share, e.g. `/Volumes/Projects`. Mounted at `/block/source1:ro`. Unset: an empty placeholder folder is mounted and nothing is indexed. |
+| `BLOCK_SOURCE_PATH`, `BLOCK_SOURCE_PATH_2` … `_6` | Host folders (a NAS share, drive, iCloud Drive, Desktop), each mounted read-only in its own slot, `/block/source1` … `/block/source6`, so the container sees only those folders. Unset slots get an empty placeholder. |
 | `BLOCK_SOURCES` | `name=/container/path` entries separated by `;`, e.g. `NAS=/block/source1`. Empty: no block sources. |
 | `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to (they appear in that workspace's "all filespaces" search). Default: the vault's active workspace. |
 
