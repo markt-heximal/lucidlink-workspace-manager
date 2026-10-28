@@ -127,6 +127,13 @@ def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
     return {"files": svc.recent(_ws(workspaceId, x_ws), filespace or None, limit)}
 
 
+@router.get("/profile")
+def profile(filespace: str, workspaceId: Optional[str] = None, svc: IndexerService = Depends(_service),
+            x_ws: Optional[str] = WorkspaceHeader):
+    """What a source holds (types, ages, largest folders, skips), from the ledger only."""
+    return svc.profile(_ws(workspaceId, x_ws), filespace)
+
+
 @router.post("/ask")
 def ask(body: AskBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
     return svc.ask(_ws(body.workspaceId, x_ws), body.filespace, body.question, body.k)

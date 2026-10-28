@@ -322,3 +322,59 @@ def test_kind_in_search_recent_and_citations_workspace_wide(block, share, make_s
         assert {c_["kind"] for c_ in body["citations"]} == {"lucidlink", "block"}
         nas_only = c.post("/index/search", json={"query": "roses", "filespace": "NAS"}, headers=H).json()
         assert {r["kind"] for r in nas_only["results"]} == {"block"}
+
+
+def test_profile_shape_and_numbers(block, share):
+    now = time.time()
+    day = 86400
+    write(share, "/Clients/Harbor/brief.docx", "x" * 100, mtime=now - 1 * day)
+    write(share, "/Clients/Harbor/plan.md", para("plan"), mtime=now - 3 * day)
+    write(share, "/Clients/budget.xlsx", "y" * 50, mtime=now - 20 * day)
+    write(share, "/Media/clip.mov", "z" * 400, mtime=now - 60 * day)
+    write(share, "/Media/still.jpg", "z" * 40, mtime=now - 400 * day)
+    write(share, "/readme.txt", para("readme"), mtime=now - 200 * day)
+    svc = block()
+    run(svc, "NAS")
+    with client(svc) as c:
+        assert c.get("/index/profile", params={"filespace": "NAS"}).status_code == 401
+        r = c.get("/index/profile", params={"workspaceId": "ws1", "filespace": "NAS"}, headers=H)
+        assert c.get("/index/profile", params={"filespace": "nope"}, headers=H).status_code == 404
+    assert r.status_code == 200
+    p = r.json()
+    assert set(p) == {"workspaceId", "filespace", "kind", "totals", "byType", "ages", "largestFolders", "skipped",
+                      "lastScanAt"}
+    sizes = {rel: (share / rel.lstrip("/")).stat().st_size for rel in (
+        "/Clients/Harbor/brief.docx", "/Clients/Harbor/plan.md", "/Clients/budget.xlsx", "/Media/clip.mov",
+        "/Media/still.jpg", "/readme.txt")}
+    assert p["workspaceId"] == "ws1" and p["filespace"] == "NAS" and p["kind"] == "block"
+    assert p["totals"] == {"files": 6, "bytes": sum(sizes.values())}
+    by_type = {t["type"]: t for t in p["byType"]}
+    assert set(by_type) == {"document", "spreadsheet", "video", "image"}
+    assert by_type["document"] == {"type": "document", "files": 3, "bytes": sizes["/Clients/Harbor/brief.docx"]
+                                   + sizes["/Clients/Harbor/plan.md"] + sizes["/readme.txt"]}
+    assert by_type["video"] == {"type": "video", "files": 1, "bytes": 400}
+    assert [t["bytes"] for t in p["byType"]] == sorted((t["bytes"] for t in p["byType"]), reverse=True)
+    assert p["ages"] == {"7d": 2, "30d": 1, "90d": 1, "older": 2}
+    assert p["largestFolders"] == [
+        {"path": "/Clients", "files": 3, "bytes": sizes["/Clients/Harbor/brief.docx"]
+         + sizes["/Clients/Harbor/plan.md"] + 50},
+        {"path": "/Media", "files": 2, "bytes": 440}]
+    assert p["skipped"] == [{"reason": "unextractable: not a valid OOXML (zip) file", "files": 2},
+                            {"reason": "unsupported type (.jpg)", "files": 1},
+                            {"reason": "unsupported type (.mov)", "files": 1}]
+    assert p["lastScanAt"]
+
+
+def test_profile_from_ledger_only(block, share, monkeypatch):
+    write(share, "/a.md", para("alpha"))
+    svc = block()
+    run(svc, "NAS")
+
+    def boom(*a, **k):
+        raise AssertionError("profile touched the source")
+
+    monkeypatch.setattr(LocalSource, "list_dir", boom)
+    monkeypatch.setattr(LocalSource, "read_file", boom)
+    monkeypatch.setattr(LocalSource, "stat", boom)
+    assert svc.profile("ws1", "NAS")["totals"]["files"] == 1
+    assert svc.profile(None, "fsA")["kind"] == "lucidlink"
