@@ -13,6 +13,11 @@
 
   "pinDigests": true,
 
+  "automerge": false,
+  "automergeType": "pr",
+  "platformAutomerge": false,
+  "internalChecksFilter": "strict",
+
   "packageRules": [
     {
       "description": "The LucidLink SDK is pre-1.0, so a minor bump can break the API. Never group it, split minor from patch, and let it soak for a few days before proposing it.",
@@ -37,6 +42,7 @@
       "matchDatasources": ["pypi"],
       "matchPackageNames": ["lucidlink-mcp"],
       "groupName": null,
+      "minimumReleaseAge": "3 days",
       "labels": ["dependencies", "mcp"]
     },
     {
@@ -51,12 +57,49 @@
       "matchDatasources": ["docker"],
       "matchPackageNames": ["lucidlink/lucidlink-api"],
       "groupName": null,
+      "minimumReleaseAge": "2 days",
       "labels": ["dependencies", "mgmt-api"],
       "prBodyNotes": [
         "Both `docker-compose.yml` and `docker-compose.test.yml` must land on the same digest.",
         "Validate on the test stack first — `docker compose -p lltest -f docker-compose.test.yml up -d` on ports 3004/8002, which bypasses the gateway catch-all."
       ]
     },
+
+    {
+      "description": "AUTOMERGE POLICY 1/4 — patch updates merge themselves once CI is green. platformAutomerge is off, so Renovate merges only after it has itself seen every status check pass (the `ci` workflow), with or without branch protection. The Mini then picks main up with docker/updates/redeploy.sh (docs/UPDATES.md).",
+      "matchUpdateTypes": ["patch"],
+      "automerge": true
+    },
+    {
+      "description": "AUTOMERGE POLICY 2/4 — minor updates merge themselves only from >= 1.0, where semver promises compatibility.",
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "!/^v?0\\./",
+      "automerge": true
+    },
+    {
+      "description": "AUTOMERGE POLICY 3/4 — below 1.0 a minor bump may break the API (lucidlink went 0.14 -> 0.15 -> 1.0 with renames each time), and below 0.1 even a patch may. A PR for review, never automerged.",
+      "matchUpdateTypes": ["minor"],
+      "matchCurrentVersion": "/^v?0\\./",
+      "automerge": false,
+      "addLabels": ["needs-review", "breaking-risk"]
+    },
+    {
+      "matchUpdateTypes": ["patch"],
+      "matchCurrentVersion": "/^v?0\\.0\\./",
+      "automerge": false,
+      "addLabels": ["needs-review", "breaking-risk"]
+    },
+    {
+      "description": "AUTOMERGE POLICY 4/4 — majors, a re-pushed digest of the same tag, digest pinning and anything else: a PR for a human.",
+      "matchUpdateTypes": ["major", "digest", "pin", "pinDigest", "rollback", "replacement"],
+      "automerge": false,
+      "addLabels": ["needs-review"]
+    },
+    {
+      "matchUpdateTypes": ["major"],
+      "addLabels": ["major-update"]
+    },
+
     {
       "description": "Base image: take patch updates automatically, hold the Python minor line for a deliberate decision.",
       "matchDatasources": ["docker"],

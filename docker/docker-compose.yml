@@ -2,7 +2,7 @@ name: lucidlink
 
 services:
   lucidlink-api:
-    image: lucidlink/lucidlink-api:1.5.0@sha256:faed972d4191e89dde1e83f32ddb2196f7ce86bbe477172a99de623ca709b831
+    image: lucidlink/lucidlink-api:1.5.7@sha256:78d705e2c62b0572981a73fa599405e2f465d15e6f038a2b971a4ce417225297
     container_name: lucidlink-api
     restart: unless-stopped
     ports:
@@ -41,8 +41,24 @@ services:
       - OWNER_USER_ID=${OWNER_USER_ID:-}
       - INDEXER_URL=http://lucidlink-indexer:8100
       - INDEXER_INTERNAL_KEY=${INDEXER_INTERNAL_KEY:-}
+      # LucidLink update monitor (docs/UPDATES.md). Alerts go to every
+      # configured channel; leave all blank to only record them.
+      - NTFY_URL=${NTFY_URL:-}
+      - NTFY_TOPIC=${NTFY_TOPIC:-}
+      - NTFY_TOKEN=${NTFY_TOKEN:-}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - ALERT_EMAIL_TO=${ALERT_EMAIL_TO:-}
+      - ALERT_EMAIL_FROM=${ALERT_EMAIL_FROM:-}
+      - UPDATE_CHECK_INTERVAL_SEC=${UPDATE_CHECK_INTERVAL_SEC:-21600}
+      - UPDATES_PIN_DIR=/app/pins
     volumes:
       - lucidlink-data:/data
+      # Pin files the image does not contain, so the monitor compares against
+      # what is actually declared.
+      - ./docker-compose.yml:/app/pins/docker-compose.yml:ro
+      - ./requirements.txt:/app/pins/requirements.txt:ro
+      - ../.mcp.json:/app/pins/.mcp.json:ro
     depends_on:
       lucidlink-api:
         condition: service_healthy

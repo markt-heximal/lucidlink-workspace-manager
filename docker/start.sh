@@ -8,8 +8,8 @@ echo ""
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 export GIT_SHA
 
-echo "[1/3] Building file service container (git ${GIT_SHA})..."
-docker compose build --quiet lucidlink-fileservice
+echo "[1/3] Building file service and indexer containers (git ${GIT_SHA})..."
+docker compose build --quiet lucidlink-fileservice lucidlink-indexer
 
 echo "[2/3] Starting services..."
 docker compose up -d

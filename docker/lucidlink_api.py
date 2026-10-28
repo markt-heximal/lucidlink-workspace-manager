@@ -40,6 +40,7 @@ from ll_core import (
 from connect_api import router as connect_router
 from insights_api import router as insights_router
 from vault import router as vault_router
+from updates import router as updates_router, start_scheduler, stop_scheduler
 import owner_auth
 
 logger = logging.getLogger("lucidlink_api")
@@ -49,7 +50,9 @@ BOOT_MONO = time.monotonic()
 
 @asynccontextmanager
 async def _lifespan(_app):
+    start_scheduler()
     yield
+    stop_scheduler()
     _ll_shutdown()
 
 
@@ -66,6 +69,8 @@ app.add_middleware(
 app.include_router(connect_router)
 app.include_router(insights_router)
 app.include_router(vault_router)
+# Owner only: this service is the public catch-all and the router has no auth.
+app.include_router(updates_router, dependencies=[Depends(owner_auth.require_owner)])
 
 
 class WriteRequest(BaseModel):
