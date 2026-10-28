@@ -115,6 +115,7 @@ active workspace.
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}]}` |
+| GET | `/index/recent` | `?workspaceId&filespace&limit=20` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace) | `{"files": [RecentFile]}`, newest first |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
@@ -129,6 +130,23 @@ active workspace.
  "chunks": 5120, "lastError": null,
  "progress": {"done": 0, "total": 3, "current": "/path|null"}}
 ```
+
+`RecentFile`:
+
+```json
+{"workspaceId": "default", "filespace": "my-app-bucket", "path": "/Board/minutes.docx",
+ "size": 48211, "mtime": "ISO|null", "status": "indexed|pending|skipped|failed|deleted",
+ "indexedAt": "ISO|null", "change": "new|modified|renamed|deleted|null",
+ "changedAt": "ISO|null", "previousPath": "/old/path|null"}
+```
+
+Live files are ordered by their own `mtime`; deletions and renames by `changedAt`
+(when the indexer saw them). `change` is recorded by the ledger as it updates a
+row (`Store.update_file` / `insert_file`): a size/mtime change is `modified`, a
+new path for the same `file_id` is `renamed` (with `previousPath`), a tombstone
+is `deleted`, and a file first seen after the filespace's first completed sync
+(or one that reappears after a deletion) is `new`. Files found by the first
+crawl, and rows written before this field existed, have `change: null`.
 
 `Topic` matches the web app's `DiscoveredTopic`:
 `{"name","description","dateRange","documents":[{"path","title","date"}]}`.
@@ -196,7 +214,7 @@ characters, 150 overlap, breaking on newline or sentence end.
 `/data/index.db` (SQLite, WAL) is the durable source of truth:
 
 - `filespaces(workspace_id, filespace, enabled, last_scan_at, last_sync_at, last_error, …)`
-- `files(workspace_id, filespace, file_id, path, size, mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at)`
+- `files(workspace_id, filespace, file_id, path, size, mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at, change_kind, changed_at, prev_path)`
 - `chunks(point_id, workspace_id, filespace, file_id, chunk_index, text_hash, text)`
 - `embeddings(model, text_hash, dim, vector BLOB)` — the embedding cache
 - `surveys(workspace_id, filespace, scope, payload, generated_at, stale)`

@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS files (
     chunk_count  INTEGER NOT NULL DEFAULT 0,
     scan_id      INTEGER NOT NULL DEFAULT 0,
     indexed_at   TEXT,
+    -- Last user-visible change seen by the indexer (GET /index/recent):
+    -- new | modified | renamed | deleted, or NULL when not derivable (e.g. the
+    -- first crawl of a filespace, where every file would otherwise look "new").
+    change_kind  TEXT,
+    changed_at   TEXT,
+    prev_path    TEXT,
     PRIMARY KEY (workspace_id, filespace, file_id)
 );
 CREATE INDEX IF NOT EXISTS files_path ON files (workspace_id, filespace, path);
@@ -130,6 +136,9 @@ class Store:
         for col in ("list_size", "list_mtime"):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} INTEGER")
+        for col in ("change_kind", "changed_at", "prev_path"):
+            if col not in cols:
+                self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -232,13 +241,41 @@ class Store:
                     list_size: Optional[int] = None, list_mtime: Optional[int] = None) -> None:
         if not file_id:
             raise ValueError("refusing to write a ledger row without a file_id")
+        # A file is "new" only once the filespace has been synced before; during
+        # the first crawl everything is unseen, which says nothing to the user.
+        synced_before = bool(self.scalar("SELECT last_sync_at FROM filespaces WHERE workspace_id=? "
+                                         "AND filespace=?", (ws, fs)))
+        kind, at = ("new", now_iso()) if synced_before else (None, None)
         self.execute(
             "INSERT OR REPLACE INTO files (workspace_id, filespace, file_id, path, size, mtime, "
-            "list_size, list_mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, NULL)",
-            (ws, fs, file_id, path, size, mtime, list_size, list_mtime, status, reason, scan_id))
+            "list_size, list_mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at, "
+            "change_kind, changed_at, prev_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, NULL, ?, ?, NULL)",
+            (ws, fs, file_id, path, size, mtime, list_size, list_mtime, status, reason, scan_id, kind, at))
+
+    @staticmethod
+    def change_of(old: dict, cols: dict) -> tuple[Optional[str], Optional[str]]:
+        """(change_kind, prev_path) implied by applying `cols` to ledger row `old`, or (None, None)."""
+        new_status = cols.get("status", old["status"])
+        if new_status == "deleted":
+            return ("deleted", None) if old["status"] != "deleted" else (None, None)
+        if old["status"] == "deleted":
+            return "new", None                       # reappeared after a deletion
+        moved = "path" in cols and cols["path"] != old["path"]
+        modified = "mtime" in cols and cols["mtime"] != old["mtime"]
+        if modified:
+            return "modified", old["path"] if moved else None
+        if moved:
+            return "renamed", old["path"]
+        return None, None
 
     def update_file(self, ws: str, fs: str, file_id: str, **cols) -> None:
+        if {"status", "path", "mtime"} & cols.keys():
+            old = self.get_file(ws, fs, file_id)
+            if old is not None:
+                kind, prev = self.change_of(old, cols)
+                if kind:
+                    cols = {**cols, "change_kind": kind, "changed_at": now_iso(), "prev_path": prev}
         sets = ", ".join(f"{k}=?" for k in cols)
         self.execute(f"UPDATE files SET {sets} WHERE workspace_id=? AND filespace=? AND file_id=?",
                      (*cols.values(), ws, fs, file_id))
@@ -247,6 +284,19 @@ class Store:
         """The work queue: newest mtime first, so a fresh filespace is useful early."""
         return self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status='pending' "
                           "ORDER BY mtime DESC, path", (ws, fs))
+
+    def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int) -> list[dict]:
+        """Candidate rows for GET /index/recent: per scope, the newest live files by
+        mtime and the latest deletions/renames by changed_at. The caller merges
+        and orders them (mtime units vary, see service.mtime_seconds)."""
+        out: list[dict] = []
+        for ws, fs in scopes:
+            out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status != 'deleted' "
+                              "ORDER BY mtime DESC, path LIMIT ?", (ws, fs, limit))
+            out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND changed_at IS NOT NULL "
+                              "AND (status = 'deleted' OR change_kind = 'renamed') "
+                              "ORDER BY changed_at DESC LIMIT ?", (ws, fs, limit))
+        return out
 
     # ------------------------------------------------------------ chunks
     def file_chunks(self, ws: str, fs: str, file_id: str) -> list[dict]:
