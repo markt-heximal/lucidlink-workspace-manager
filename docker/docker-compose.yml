@@ -52,6 +52,9 @@ services:
       - ALERT_EMAIL_FROM=${ALERT_EMAIL_FROM:-}
       - UPDATE_CHECK_INTERVAL_SEC=${UPDATE_CHECK_INTERVAL_SEC:-21600}
       - UPDATES_PIN_DIR=/app/pins
+      # Per linked filespace cache maximums (GiB): see ll_cache.py.
+      - LUCIDLINK_CACHE_DATA_GB=${LUCIDLINK_CACHE_DATA_GB:-5}
+      - LUCIDLINK_CACHE_METADATA_GB=${LUCIDLINK_CACHE_METADATA_GB:-1}
     volumes:
       - lucidlink-data:/data
       # Pin files the image does not contain, so the monitor compares against
@@ -94,6 +97,8 @@ services:
       - LLM_TIMEOUT=${LLM_TIMEOUT:-180}
       - SYNC_INTERVAL_SEC=${SYNC_INTERVAL_SEC:-300}
       - INDEX_MAX_FILE_BYTES=${INDEX_MAX_FILE_BYTES:-26214400}
+      - LUCIDLINK_CACHE_DATA_GB=${LUCIDLINK_CACHE_DATA_GB:-5}
+      - LUCIDLINK_CACHE_METADATA_GB=${LUCIDLINK_CACHE_METADATA_GB:-1}
     volumes:
       - lucidlink-data:/data
     healthcheck:
