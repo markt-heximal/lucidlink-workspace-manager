@@ -260,8 +260,12 @@ cannot write to it whatever the code does.
 | `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to (they appear in that workspace's "all filespaces" search). Default: the vault's active workspace. |
 
 **Keys.** A block source is a target `(workspaceId, name)` like a filespace,
-with `kind: "block"`. A name that collides with a filespace in that workspace
-is refused (recorded as `lastError`). Enable/disable, sync, status, search,
+with `kind: "block"`. A name that collides with a vault filespace in that
+workspace is refused and not indexed: the filespace keeps the key and keeps
+working, and the refusal shows as that entry's `lastError` (when it has no
+error of its own) and in `/index/status` → `blockSources`. A missing, empty or
+placeholder folder records `lastError: "block source path not mounted"` and
+neither indexes nor deletes anything. Enable/disable, sync, status, search,
 ask, survey and recent work unchanged. Hints never apply (the file service
 never writes there).
 
@@ -280,6 +284,9 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
 
 - `FilespaceStatus` gains `"kind": "lucidlink" | "block"`.
 - Search results, recent files and ask citations gain `"kind"`.
+- `/index/status` gains `"blockSources": [{"name", "workspaceId", "path",
+  "kind": "block", "accepted": bool, "error": "…"|null}]` (configuration
+  problems and refusals).
 - `GET /index/profile?workspaceId&filespace` — what the source holds, from the
   ledger only (no reads):
   ```json
@@ -287,10 +294,13 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
    "totals": {"files": 1234, "bytes": 5678901},
    "byType": [{"type": "document", "files": 120, "bytes": 3456}],
    "ages": {"7d": 12, "30d": 40, "90d": 100, "older": 1082},
-   "largestFolders": [{"path": "/Clients/Harbor", "files": 300, "bytes": 123456}],
+   "largestFolders": [{"path": "/Clients", "files": 300, "bytes": 123456}],
    "skipped": [{"reason": "unsupported type (.mov)", "files": 400}],
    "lastScanAt": "ISO|null"}
   ```
   Types follow the AI Lab's classes: document, spreadsheet, presentation, pdf,
-  image, design, audio, video, code, archive, project, other. `largestFolders`
-  is the top 10 folders one level below the root by bytes.
+  image, design, audio, video, code, archive, project, other; `byType` lists
+  the non-empty ones, largest first. `ages` buckets live files by `mtime` and
+  are exclusive (8–30 days counts under `30d`, not `7d`). `largestFolders`
+  is the top 10 folders one level below the root by bytes (files directly in
+  the root are in no folder).
