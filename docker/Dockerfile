@@ -7,7 +7,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ll_core.py connect_api.py insights_api.py lucidlink_api.py ./
+COPY ll_core.py connect_api.py insights_api.py lucidlink_api.py owner_auth.py vault.py ./
+COPY indexer ./indexer
 
 # Surface SDK deprecations in the logs instead of letting them pass silently.
 ENV PYTHONWARNINGS=default::DeprecationWarning

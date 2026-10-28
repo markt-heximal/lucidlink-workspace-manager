@@ -30,7 +30,19 @@ services:
       # /agent/query returns 503. Point at any reachable OpenAI-compatible endpoint.
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_TIMEOUT=${LLM_TIMEOUT:-180}
+      # Owner sign-in (Supabase session) and the encrypted token vault.
+      # See docs/INDEXER.md.
+      - VAULT_KEY=${VAULT_KEY:-}
+      - SUPABASE_URL=${SUPABASE_URL:-}
+      - SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY:-}
+      - OWNER_EMAIL=${OWNER_EMAIL:-}
+      - OWNER_USER_ID=${OWNER_USER_ID:-}
+      - INDEXER_URL=http://lucidlink-indexer:8100
+      - INDEXER_INTERNAL_KEY=${INDEXER_INTERNAL_KEY:-}
+    volumes:
+      - lucidlink-data:/data
     depends_on:
       lucidlink-api:
         condition: service_healthy
@@ -40,3 +52,40 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+
+  # Delta crawler + search/ask/survey. Not published: reached only through the
+  # file service's /index/* proxy. Own SDK client, so crawls never block the UI.
+  lucidlink-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
+    container_name: lucidlink-indexer
+    restart: unless-stopped
+    command: ["uvicorn", "indexer.app:app", "--host", "0.0.0.0", "--port", "8100"]
+    environment:
+      - VAULT_KEY=${VAULT_KEY:-}
+      - INDEXER_INTERNAL_KEY=${INDEXER_INTERNAL_KEY:-}
+      - EMBED_BASE_URL=${EMBED_BASE_URL:-}
+      - EMBED_MODEL=${EMBED_MODEL:-}
+      - EMBED_API_KEY=${EMBED_API_KEY:-}
+      - RUVECTOR_URL=${RUVECTOR_URL:-}
+      - RUVECTOR_API_KEY=${RUVECTOR_API_KEY:-}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - LLM_TIMEOUT=${LLM_TIMEOUT:-180}
+      - SYNC_INTERVAL_SEC=${SYNC_INTERVAL_SEC:-300}
+      - INDEX_MAX_FILE_BYTES=${INDEX_MAX_FILE_BYTES:-26214400}
+    volumes:
+      - lucidlink-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  lucidlink-data:
