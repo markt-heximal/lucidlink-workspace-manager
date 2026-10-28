@@ -15,6 +15,7 @@ import httpx
 
 from . import ask as ask_mod
 from . import survey as survey_mod
+from .block import KIND_LUCIDLINK, RoutingSourceProvider
 from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
@@ -91,6 +92,10 @@ class IndexerService:
                                     transport=ruvector_transport)
         self.vectors = VectorService(self.store, LocalIndex(self.store, self.embedder.model), mirror)
         self.scheduler = Scheduler(self)
+        # Block keys get a LocalSource; everything else the filespace provider
+        # (looked up per lease, so `self.sources` can be swapped in tests).
+        self.router = RoutingSourceProvider(lambda ws, fs: self.scheduler.block_root(ws, fs),
+                                            lambda: self.sources)
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -128,6 +133,10 @@ class IndexerService:
             return {(ws, filespace)}
         return {k for k in self.scheduler.targets() if k[0] == ws and self.scheduler.enabled(*k)}
 
+    def kinds(self) -> dict[tuple[str, str], str]:
+        """(workspace, filespace) -> "lucidlink" | "block", from the ledger."""
+        return self.store.kinds()
+
     # ------------------------------------------------------------ status
     def filespace_status(self, ws: str, fs: str) -> dict:
         row = self.store.filespace_row(ws, fs) or {}
@@ -136,6 +145,7 @@ class IndexerService:
         return {
             "workspaceId": ws,
             "filespace": fs,
+            "kind": row.get("kind") or KIND_LUCIDLINK,
             "enabled": enabled,
             "state": self.scheduler.state(ws, fs),
             "lastScanAt": row.get("last_scan_at"),
@@ -144,7 +154,9 @@ class IndexerService:
             if enabled else None,
             "files": self.store.file_counts(ws, fs),
             "chunks": self.store.chunk_count(ws, fs),
-            "lastError": row.get("last_error"),
+            # A refused block source with this name shows here too (the
+            # filespace itself keeps working).
+            "lastError": row.get("last_error") or self.scheduler.block_conflict(ws, fs),
             "progress": dict(rt.progress),
             "surveyError": rt.survey_error,
         }
@@ -154,6 +166,7 @@ class IndexerService:
             "filespaces": [self.filespace_status(ws, fs) for ws, fs in self.scheduler.targets()],
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
+            "blockSources": list(self.scheduler.block_sources),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
         }
 
@@ -189,6 +202,7 @@ class IndexerService:
         q = self.embedder.embed_query(query)
         hits = self.vectors.search(q, max(1, min(k, 200)), scopes, path_prefix)
         rows = self.store.chunk_rows([pid for pid, _ in hits])
+        kinds = self.kinds()
         out = []
         for pid, score in hits:
             r = rows.get(pid)
@@ -196,7 +210,8 @@ class IndexerService:
                 continue
             text = " ".join(r["text"].split())
             out.append({
-                "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"],
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+                "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
                 "chunkIndex": r["chunk_index"], "score": round(score, 4),
                 "snippet": text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else ""),
                 "mtime": mtime_iso(r["mtime"]),
@@ -213,6 +228,7 @@ class IndexerService:
         """
         limit = max(1, min(int(limit), RECENT_MAX))
         scopes = sorted(self.scopes(workspace_id, filespace))
+        kinds = self.kinds()
         seen: set[tuple[str, str, str]] = set()
         items: list[tuple[float, dict]] = []
         for r in self.store.recent_files(scopes, limit):
@@ -224,7 +240,8 @@ class IndexerService:
             by_change = r["status"] == "deleted" or kind == "renamed"
             when = (_iso_seconds(r.get("changed_at")) if by_change else None) or mtime_seconds(r["mtime"]) or 0.0
             items.append((when, {
-                "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"],
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+                "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
                 "size": r["size"], "mtime": mtime_iso(r["mtime"]), "status": r["status"],
                 "indexedAt": r.get("indexed_at"), "change": kind, "changedAt": r.get("changed_at"),
                 "previousPath": r.get("prev_path"),

@@ -17,6 +17,11 @@ A job: apply queued hints (targeted listings), run a full delta scan when one
 is due or requested (or a hint could not be applied with certainty), drain the
 pending queue, backfill vectors for a changed model, sync the Ruvector mirror,
 and regenerate the stored survey when it is stale and allowed.
+
+Targets are the vault's filespaces plus the connected block sources from
+BLOCK_SOURCES (kind "block", see block.py). A block source whose name collides
+with a vault filespace of its workspace is refused and not indexed; block
+sources never take hints (the file service never writes there).
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
+from .block import KIND_BLOCK, KIND_LUCIDLINK, BlockSpec, NotMounted, parse_block_sources
 from .embedder import EmbedError
 from .scanner import FilespaceIndexer
 from .source import SourceError, configured_filespaces
@@ -74,6 +80,11 @@ class Scheduler:
         self._runtime: dict[Key, Runtime] = {}
         self._targets: list[Key] = []
         self._targets_at: Optional[float] = None
+        self._block_specs: list[BlockSpec] = parse_block_sources(self.cfg.block_sources)
+        self._block_roots: dict[Key, str] = {}        # accepted block targets -> container path
+        self._block_conflicts: dict[Key, str] = {}    # refused block names -> why
+        self._block_ws: Optional[str] = None          # last resolved block workspace
+        self.block_sources: list[dict] = []           # for /index/status
         self.settings_error: Optional[str] = None
         self._stopping = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -102,28 +113,90 @@ class Scheduler:
         except Exception as e:  # vault.VaultError: no/invalid VAULT_KEY, corrupt vault
             self.settings_error = f"{type(e).__name__}: {e}"
             logger.warning("cannot read vault settings: %s", self.settings_error)
+            workspaces = None
+        if workspaces is None and not self._block_specs:
             self._targets_at = now
             return list(self._targets)
+        block_ws = self._block_workspace() if self._block_specs else None
+        block_names = {(block_ws, b.name) for b in self._block_specs if b.error is None}
         keys: list[Key] = []
-        ws_ids = set()
-        for w in workspaces:
-            wid = w.get("id")
-            if not wid:
-                continue
-            ws_ids.add(wid)
-            for name in configured_filespaces(w):
-                keys.append((wid, name))
-        # Filespaces enabled by hand via PUT /index/filespaces, in known workspaces.
-        for row in self.svc.store.filespace_rows():
-            key = (row["workspace_id"], row["filespace"])
-            if row["enabled_override"] and row["enabled"] and row["workspace_id"] in ws_ids and key not in keys:
-                keys.append(key)
-        for ws, fs in keys:
-            self.svc.store.ensure_filespace(ws, fs)
+        if workspaces is None:
+            # Keep the last known filespaces; block sources do not need the vault.
+            keys = [k for k in self._targets if k not in self._block_roots]
+        else:
+            ws_ids = set()
+            for w in workspaces:
+                wid = w.get("id")
+                if not wid:
+                    continue
+                ws_ids.add(wid)
+                for name in configured_filespaces(w):
+                    keys.append((wid, name))
+            # Filespaces enabled by hand via PUT /index/filespaces, in known workspaces.
+            # A block source's own enable/disable row is not a filespace override.
+            for row in self.svc.store.filespace_rows():
+                key = (row["workspace_id"], row["filespace"])
+                if (row["enabled_override"] and row["enabled"] and row["workspace_id"] in ws_ids
+                        and key not in keys and key not in block_names and row.get("kind") != KIND_BLOCK):
+                    keys.append(key)
+        roots, conflicts, listing = self._block_targets(block_ws, keys)
+        keys += list(roots)
+        for key in keys:
+            self.svc.store.set_filespace_kind(*key, KIND_BLOCK if key in roots else KIND_LUCIDLINK)
         with self._cv:
             self._targets = keys
+            self._block_roots = roots
+            self._block_conflicts = conflicts
+            self.block_sources = listing
             self._targets_at = now
         return list(keys)
+
+    def _block_workspace(self) -> str:
+        """BLOCK_SOURCE_WORKSPACE, else the vault's active workspace, else "local"."""
+        if self.cfg.block_source_workspace:
+            return self.cfg.block_source_workspace
+        try:
+            active = self.svc.settings.active_workspace_id()
+        except Exception:
+            active = None   # vault unreadable: keep the last answer so keys do not flap
+        if active:
+            self._block_ws = active
+        return self._block_ws or "local"
+
+    def _block_targets(self, block_ws: Optional[str], filespaces: list[Key]
+                       ) -> tuple[dict[Key, str], dict[Key, str], list[dict]]:
+        roots: dict[Key, str] = {}
+        conflicts: dict[Key, str] = {}
+        listing: list[dict] = []
+        for b in self._block_specs:
+            error = b.error
+            key = (block_ws or "local", b.name)
+            if error is None and key in filespaces:
+                error = (f"block source '{b.name}' refused: a filespace with that name exists in workspace "
+                         f"'{key[0]}'; rename it in BLOCK_SOURCES")
+                conflicts[key] = error
+            elif error is None and key not in roots:
+                roots[key] = b.path
+            listing.append({"name": b.name, "workspaceId": key[0], "path": b.path, "kind": KIND_BLOCK,
+                            "accepted": error is None, "error": error})
+        if conflicts:
+            logger.warning("block sources refused: %s", "; ".join(conflicts.values()))
+        return roots, conflicts, listing
+
+    def block_root(self, ws: str, fs: str) -> Optional[str]:
+        """Container path of a block target, or None for a filespace."""
+        if not self._block_specs:
+            return None
+        self.targets()
+        with self._cv:
+            return self._block_roots.get((ws, fs))
+
+    def is_block(self, ws: str, fs: str) -> bool:
+        return self.block_root(ws, fs) is not None
+
+    def block_conflict(self, ws: str, fs: str) -> Optional[str]:
+        with self._cv:
+            return self._block_conflicts.get((ws, fs))
 
     def targets(self) -> list[Key]:
         return self.refresh_targets()
@@ -147,7 +220,7 @@ class Scheduler:
 
     def add_hint(self, ws: str, fs: str, hint: dict) -> bool:
         """Queue a hint for a known, enabled filespace; anything else is dropped."""
-        if not self.is_target(ws, fs) or not self.enabled(ws, fs):
+        if not self.is_target(ws, fs) or not self.enabled(ws, fs) or self.is_block(ws, fs):
             return False
         with self._cv:
             rt = self._runtime.setdefault((ws, fs), Runtime())
@@ -234,7 +307,7 @@ class Scheduler:
         error: Optional[str] = None
         scan_took: Optional[float] = None
         try:
-            with self.svc.sources.lease(ws, fs) as source:
+            with self.svc.router.lease(ws, fs) as source:
                 idx = FilespaceIndexer(store, source, ws, fs, self.svc.embedder, self.cfg)
                 rt.phase = "scanning"
                 # Hints are advisory: a failed or incomplete one is logged and
@@ -272,6 +345,9 @@ class Scheduler:
             store.update_filespace(ws, fs, last_sync_at=now_iso())
         except EmbedError as e:
             error = f"embedding failed: {e}"
+        except NotMounted as e:    # block share missing or empty: index nothing, delete nothing
+            logger.warning("[%s/%s] %s", ws, fs, e)
+            error = str(e)
         except SourceError as e:   # no token, bad token, filespace gone: expected, no traceback
             logger.warning("[%s/%s] %s", ws, fs, e)
             error = f"SourceError: {e}"
