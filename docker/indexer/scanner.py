@@ -23,6 +23,13 @@ A listing failure anywhere â€” or a get_entry that fails or returns no file_id â
 makes the scan incomplete and nothing is deleted: a transient error must never
 look like a deletion, and a row is never written without a file_id.
 
+iWork packages (a directory named X.pages / X.numbers / X.key) are one file:
+never recursed into, their (size, mtime) are the sum of the contained file
+sizes and the newest contained mtime from a bounded walk (listings only), and
+their id is the directory's own get_entry id. Reading one for extraction
+builds an in-memory zip of just the members the extractor needs. A path
+inside a package (from a hint) stands for the package.
+
 Indexing then drains the queue newest-mtime first. Reading a queued file and
 finding the same sha256 as last time (a touch) only refreshes the ledger;
 otherwise text is extracted, chunked, and embedded through the cache, so an edit
@@ -31,7 +38,9 @@ re-embeds only the chunks whose text changed.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
+import zipfile
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -41,6 +50,7 @@ from .chunker import chunk_text
 from .config import Config
 from .embedder import Embedder, text_hash
 from .extract import ext_of, extract, is_supported
+from .iwork import is_iwork_name, package_member_wanted
 from .source import FilespaceSource
 from .store import Store, now_iso
 
@@ -50,6 +60,11 @@ logger = logging.getLogger("indexer.scanner")
 # any name starting with "." is skipped as well.
 SKIP_DIRS = {"node_modules", ".git", ".cache", ".trash", ".tmp", "$RECYCLE.BIN",
              ".lucidlink", ".DS_Store", "System Volume Information"}
+
+
+# Bounds on walking inside one iWork package (metadata walk and member read).
+PACKAGE_MAX_ENTRIES = 5000
+PACKAGE_MAX_DEPTH = 8
 
 
 def skip_dir(name: str) -> bool:
@@ -72,6 +87,36 @@ def parent_of(path: str) -> str:
 def normpath(path: str) -> str:
     path = "/" + "/".join(p for p in (path or "").split("/") if p)
     return path
+
+
+def is_package(name: str) -> bool:
+    """A directory with this name is an iWork package: indexed as one file."""
+    return is_iwork_name(name) and not skip_dir(name)
+
+
+def package_root(path: str) -> Optional[str]:
+    """The package containing `path` (strictly inside it), or None."""
+    parts = [p for p in (path or "").split("/") if p]
+    for i, part in enumerate(parts[:-1]):
+        if is_package(part):
+            return "/" + "/".join(parts[:i + 1])
+    return None
+
+
+class PackageTooLarge(Exception):
+    """The members needed to extract a package exceed INDEX_MAX_FILE_BYTES."""
+
+
+def _zip_members(members: list[tuple[str, bytes]]) -> bytes:
+    """A deterministic zip (fixed timestamps, stored), so an untouched package
+    always hashes the same."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as z:
+        for rel, data in members:
+            info = zipfile.ZipInfo(rel, date_time=(1980, 1, 1, 0, 0, 0))
+            info.external_attr = 0o644 << 16
+            z.writestr(info, data)
+    return buf.getvalue()
 
 
 def _hintable(path: Optional[str]) -> bool:
@@ -211,8 +256,8 @@ class FilespaceIndexer:
         root = normpath(root)
         scan_id = self.store.next_scan_id(self.ws, self.fs)
         res = ScanResult(scan_id=scan_id, root=root)
-        if root != "/" and hidden_path(root + "/x"):
-            return res
+        if root != "/" and (hidden_path(root + "/x") or package_root(root + "/x")):
+            return res   # hidden, or a package (handled as a file, never walked)
         queue = deque([root])
         while queue:
             d = queue.popleft()
@@ -226,7 +271,9 @@ class FilespaceIndexer:
             for e in entries:
                 path = join(d, e.name)
                 if e.type == "dir":
-                    if not skip_dir(e.name):
+                    if is_package(e.name):
+                        self._listed_package(path, scan_id, res)
+                    elif not skip_dir(e.name):
                         queue.append(path)
                 elif e.type == "file" and not skip_file(e.name):
                     self._listed_file(path, e.size, e.mtime, scan_id, res)
@@ -236,8 +283,44 @@ class FilespaceIndexer:
             self.store.update_filespace(self.ws, self.fs, last_scan_at=now_iso())
         return res
 
-    def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult) -> None:
-        """One file from read_dir: fast path by path, else get_entry + observe."""
+    def _package_meta(self, path: str) -> tuple[int, int]:
+        """(sum of contained file sizes, newest contained mtime) of a package,
+        from listings only; bounded by PACKAGE_MAX_ENTRIES / _DEPTH, walked in
+        name order so a truncated walk is still deterministic. Listing errors
+        propagate."""
+        size = mtime = entries = 0
+        queue = deque([(path, 0)])
+        while queue:
+            d, depth = queue.popleft()
+            for e in sorted(self.source.list_dir(d), key=lambda e: e.name):
+                entries += 1
+                if entries > PACKAGE_MAX_ENTRIES:
+                    return size, mtime
+                if e.type == "dir" and not skip_dir(e.name):
+                    mtime = max(mtime, e.mtime)
+                    if depth + 1 < PACKAGE_MAX_DEPTH:
+                        queue.append((join(d, e.name), depth + 1))
+                elif e.type == "file" and not skip_file(e.name):
+                    size += e.size
+                    mtime = max(mtime, e.mtime)
+        return size, mtime
+
+    def _listed_package(self, path: str, scan_id: int, res: ScanResult) -> None:
+        try:
+            size, mtime = self._package_meta(path)
+        except Exception as e:
+            # Unknown contents: like a directory that failed to list, nothing
+            # may be deleted on the strength of this scan.
+            logger.warning("[%s/%s] listing package %s failed: %s", self.ws, self.fs, path, e)
+            res.failed_dirs.append(path)
+            res.complete = False
+            return
+        self._listed_file(path, size, mtime, scan_id, res, package=True)
+
+    def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult,
+                     package: bool = False) -> None:
+        """One file from read_dir (or a package from its metadata walk): fast
+        path by path, else get_entry + observe."""
         for row in self.store.live_files_at_path(self.ws, self.fs, path):
             if row["list_size"] == list_size and row["list_mtime"] == list_mtime:
                 res.seen += 1
@@ -254,8 +337,14 @@ class FilespaceIndexer:
             res.failed_files.append(path)
             res.complete = False
             return
-        if entry is None or entry.type != "file":
-            return  # vanished (or replaced by a folder) since the listing; next scan settles it
+        if entry is None or entry.type != ("dir" if package else "file"):
+            return  # vanished (or changed kind) since the listing; next scan settles it
+        if package:
+            # A package's (size, mtime) only exist as walk values; get_entry
+            # supplies its id. Packages use the same walk everywhere, so units agree.
+            self.observe(path, list_size, list_mtime, entry.file_id, scan_id, res,
+                         list_size=list_size, list_mtime=list_mtime)
+            return
         self.observe(path, entry.size, entry.mtime, entry.file_id, scan_id, res,
                      list_size=list_size, list_mtime=list_mtime)
 
@@ -293,6 +382,21 @@ class FilespaceIndexer:
         if not _hintable(path) or (src is not None and not _hintable(src)):
             return True
         path = normpath(path)
+        if op not in ("write", "mkdir", "delete", "move"):
+            raise ValueError(f"unknown hint op '{op}'")
+        # A path inside an iWork package stands for the package (one file).
+        pkg = package_root(path)
+        if op == "move":
+            s = normpath(src) if src else None
+            spkg = package_root(s) if s else None
+            ok = self._hint_settle(pkg) if pkg else self._hint_present(path)
+            if spkg:
+                ok = (spkg == pkg or self._hint_settle(spkg)) and ok
+            elif s:
+                ok = self._hint_absent(s) and ok
+            return ok
+        if pkg:
+            return self._hint_settle(pkg)
         if op in ("write", "mkdir"):
             return self._hint_present(path)
         if op == "delete":
@@ -304,7 +408,13 @@ class FilespaceIndexer:
             if src:
                 ok = self._hint_absent(normpath(src)) and ok
             return ok
-        raise ValueError(f"unknown hint op '{op}'")
+        raise AssertionError(op)   # validated above
+
+    def _hint_settle(self, path: str) -> bool:
+        """Present or absent, whichever `path` now is (a package touched from inside)."""
+        if path == "/" or hidden_path(path):
+            return True
+        return self._hint_present(path) if self.source.stat(path) is not None else self._hint_absent(path)
 
     def _hint_present(self, path: str) -> bool:
         if path == "/" or hidden_path(path):
@@ -312,12 +422,21 @@ class FilespaceIndexer:
         entry = self.source.stat(path)
         if entry is None:
             return True
-        if entry.type == "dir":
+        package = entry.type == "dir" and is_package(path.rsplit("/", 1)[-1])
+        if entry.type == "dir" and not package:
             return self.scan(path).complete
-        if entry.type != "file":
+        if entry.type not in ("file", "dir"):
             return True
         res = ScanResult(scan_id=self.store.next_scan_id(self.ws, self.fs), root=path)
-        self.observe(path, entry.size, entry.mtime, entry.file_id, res.scan_id, res)
+        if package:
+            try:
+                size, mtime = self._package_meta(path)
+            except Exception as e:
+                logger.warning("[%s/%s] listing package %s failed: %s", self.ws, self.fs, path, e)
+                return False
+            self.observe(path, size, mtime, entry.file_id, res.scan_id, res, list_size=size, list_mtime=mtime)
+        else:
+            self.observe(path, entry.size, entry.mtime, entry.file_id, res.scan_id, res)
         if entry.file_id:
             # A write that replaced the file (new file_id) leaves the old row behind.
             for row in self.store.live_files_at_path(self.ws, self.fs, path):
@@ -377,21 +496,29 @@ class FilespaceIndexer:
         limit = self.config.max_file_bytes
         if not is_supported(name):
             return self._skip(row, f"unsupported type (.{ext_of(name)})")
-        if row["size"] > limit:
-            return self._skip(row, f"too large ({row['size']} bytes > {limit})")
+        package = False
         try:
-            data = self.source.read_file(path)
+            if is_iwork_name(name):
+                entry = self.source.stat(path)
+                package = entry is not None and entry.type == "dir"
+            if not package and row["size"] > limit:
+                return self._skip(row, f"too large ({row['size']} bytes > {limit})")
+            data = self._read_package(path, limit) if package else self.source.read_file(path)
+        except PackageTooLarge as e:
+            return self._skip(row, str(e))
         except Exception as e:
             self._set(row, status="failed", reason=f"read failed: {type(e).__name__}: {e}"[:300],
                       indexed_at=now_iso())
             return "failed"
-        if len(data) > limit:
+        if not package and len(data) > limit:
             return self._skip(row, f"too large ({len(data)} bytes > {limit})")
+        # A package's ledger size is its walk total, not the size of the zip built here.
+        sized = {} if package else {"size": len(data)}
 
         digest = hashlib.sha256(data).hexdigest()
         if row["content_hash"] and digest == row["content_hash"]:
             # Touched, not changed: the previous outcome still holds.
-            self._set(row, status="skipped" if row["reason"] else "indexed", size=len(data))
+            self._set(row, status="skipped" if row["reason"] else "indexed", **sized)
             return "touched"
 
         ext = extract(name, data)
@@ -408,8 +535,45 @@ class FilespaceIndexer:
             self._changed()
         out.chunks_written += written
         self._set(row, status="indexed", reason=None, content_hash=digest, chunk_count=len(pieces),
-                  size=len(data), indexed_at=now_iso())
+                  indexed_at=now_iso(), **sized)
         return "indexed"
+
+    def _read_package(self, path: str, limit: int) -> bytes:
+        """The members of package `path` the extractor needs (Index/**,
+        index.xml/apxl(.gz), Index.zip, QuickLook/Preview.pdf), as a zip.
+        Nothing else (images, previews, Data/) is listed deeply or read."""
+        found: list[tuple[str, int]] = []
+        entries = 0
+        queue = deque([("", 0)])
+        while queue and entries <= PACKAGE_MAX_ENTRIES:
+            rel_dir, depth = queue.popleft()
+            for e in sorted(self.source.list_dir(join(path, rel_dir) if rel_dir else path), key=lambda e: e.name):
+                entries += 1
+                if entries > PACKAGE_MAX_ENTRIES:
+                    break
+                rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
+                if e.type == "dir":
+                    if (not skip_dir(e.name) and depth + 1 < PACKAGE_MAX_DEPTH
+                            and (rel in ("Index", "QuickLook") or rel.startswith("Index/"))):
+                        queue.append((rel, depth + 1))
+                elif e.type == "file" and not skip_file(e.name) and package_member_wanted(rel):
+                    found.append((rel, e.size))
+        preview = [m for m in found if m[0] == "QuickLook/Preview.pdf"]
+        wanted = [m for m in found if m[0] != "QuickLook/Preview.pdf"]
+        total = sum(size for _, size in wanted)
+        if total > limit:
+            raise PackageTooLarge(f"too large ({total} bytes of iWork index > {limit})")
+        if preview and total + preview[0][1] <= limit:
+            wanted += preview        # only a fallback, so only when it fits
+        members: list[tuple[str, bytes]] = []
+        read = 0
+        for rel, _ in wanted:
+            data = self.source.read_file(join(path, rel))
+            read += len(data)
+            if read > limit:
+                raise PackageTooLarge(f"too large ({read} bytes of iWork index > {limit})")
+            members.append((rel, data))
+        return _zip_members(members)
 
     def backfill_embeddings(self, batch: int = 256) -> int:
         """Embed chunks that have no vector for the current model (model change)."""
