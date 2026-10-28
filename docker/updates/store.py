@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS releases (
     security INTEGER DEFAULT 0,
     notes_url TEXT,
     summary TEXT,
+    summary_ctx TEXT,
     PRIMARY KEY (component, version)
 );
 CREATE TABLE IF NOT EXISTS alerts (
@@ -80,6 +81,9 @@ class UpdateStore:
         # A shared in-memory DB would vanish between connections; tests use a tmp file.
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            cols = {r[1] for r in c.execute("PRAGMA table_info(releases)").fetchall()}
+            if "summary_ctx" not in cols:   # databases from before audit-fed summaries
+                c.execute("ALTER TABLE releases ADD COLUMN summary_ctx TEXT")
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -144,10 +148,10 @@ class UpdateStore:
                  int(security), notes_url))
         return self.get_release(component, version) or {}
 
-    def set_summary(self, component: str, version: str, summary: str) -> None:
+    def set_summary(self, component: str, version: str, summary: str, ctx: Optional[str] = None) -> None:
         with self._conn() as c:
-            c.execute("UPDATE releases SET summary = ? WHERE component = ? AND version = ?",
-                      (summary, component, version))
+            c.execute("UPDATE releases SET summary = ?, summary_ctx = ? WHERE component = ? AND version = ?",
+                      (summary, ctx, component, version))
 
     # -- alerts -----------------------------------------------------------
     def has_alert(self, component: str, version: str, kind: str = "release") -> bool:

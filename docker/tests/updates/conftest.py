@@ -10,7 +10,7 @@ from updates.monitor import UpdateMonitor, set_monitor
 from updates.store import UpdateStore
 from upd_helpers import FakeRegistry, Recorder, docker_component, pypi_component
 
-_ENV = ["LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "NTFY_URL", "NTFY_TOPIC", "NTFY_TOKEN",
+_ENV = ["UPDATES_AUDIT_FILE", "LLM_BASE_URL", "LLM_MODEL", "LLM_API_KEY", "NTFY_URL", "NTFY_TOPIC", "NTFY_TOKEN",
         "ALERT_WEBHOOK_URL", "ALERT_WEBHOOK_TOKEN", "RESEND_API_KEY", "ALERT_EMAIL_TO",
         "ALERT_EMAIL_FROM", "UPDATES_DB", "UPDATES_PIN_DIR", "UPDATES_COMPONENTS_FILE",
         "UPDATE_CHECK_INTERVAL_SEC", "UPDATE_CHECK_INITIAL_DELAY_SEC",
