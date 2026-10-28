@@ -2,7 +2,7 @@
 
 Core file CRUD + filespace listing + a Range-aware download, plus the Connect
 (external S3/HTTP files) and insights (stats / data preview / agent) routers.
-Shared daemon plumbing lives in ll_core; SDK is lucidlink >=0.12.
+Shared client plumbing lives in ll_core; SDK is lucidlink 1.0 (pinned 1.0.1).
 
 Also the owner-facing pieces of docs/INDEXER.md: the `/vault/*` router, the
 owner-only `/index/*` proxy to the indexer container, and best-effort index
@@ -24,6 +24,7 @@ import logging
 from typing import Optional
 import httpx
 import lucidlink
+from lucidlink import exceptions as llx
 from datetime import datetime, timezone
 
 from ll_core import (
@@ -56,7 +57,7 @@ async def _lifespan(_app):
     _ll_shutdown()
 
 
-app = FastAPI(title="LucidLink File Service", version="0.14", lifespan=_lifespan)
+app = FastAPI(title="LucidLink File Service", version=lucidlink.__version__, lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -178,20 +179,47 @@ def _creds(ctx: "tuple[Caller, str]") -> tuple[str, str]:
 
 
 def _files_op(creds: tuple[str, str], fn, *, not_found_on_error: bool = False):
+    """Run `fn(fs)`, mapping SDK 1.0's typed file-system errors to statuses.
+
+    Read routes (`not_found_on_error`) keep answering 404 for any failure, as
+    they always have. Mutations now say what went wrong instead of a blanket
+    500: a missing path is 404, an existing destination (or a non-empty
+    directory) 409, a file/directory mix-up 400 and a path the service account may not touch 403.
+    """
     token, filespace_name = creds
     try:
         return _with_fs(token, filespace_name, fn)
     except HTTPException:
         raise
     except Exception as e:
-        status = 404 if not_found_on_error else 500
+        if not_found_on_error:
+            status = 404
+        elif isinstance(e, FileNotFoundError):
+            status = 404
+        elif isinstance(e, (FileExistsError, llx.FsDirectoryNotEmptyError)):
+            status = 409
+        elif isinstance(e, (IsADirectoryError, NotADirectoryError)):
+            status = 400
+        elif isinstance(e, PermissionError):
+            status = 403
+        else:
+            status = 500
         raise HTTPException(status_code=status, detail=str(e))
+
+
+def _exists(fs, path: str) -> bool:
+    """SDK 1.0 has no file_exists/dir_exists: get_entry raises FileNotFoundError."""
+    try:
+        fs.get_entry(path)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 @app.get("/files")
 def list_files(path: str = "/", creds=Depends(require_token_and_filespace)):
     return _files_op(creds, lambda fs: [
-        {"name": e.name, "is_dir": e.is_dir(), "size": e.size,
+        {"name": e.name, "is_dir": e.is_dir, "size": e.size,
          "path": path.rstrip("/") + "/" + e.name}
         for e in fs.read_dir(path)
     ], not_found_on_error=True)
@@ -199,7 +227,7 @@ def list_files(path: str = "/", creds=Depends(require_token_and_filespace)):
 
 @app.get("/files/read")
 def read_file(path: str, creds=Depends(require_token_and_filespace)):
-    data = _files_op(creds, lambda fs: fs.read_file(path), not_found_on_error=True)
+    data = _files_op(creds, lambda fs: lucidlink.FsUtils(fs).read_bytes(path), not_found_on_error=True)
     try:
         return {"content": data.decode("utf-8"), "encoding": "utf-8"}
     except UnicodeDecodeError:
@@ -211,7 +239,7 @@ def read_file(path: str, creds=Depends(require_token_and_filespace)):
 def write_file(req: WriteRequest, background: BackgroundTasks,
                ctx=Depends(require_caller_and_filespace)):
     def op(fs):
-        fs.write_file(req.path, req.content.encode())
+        lucidlink.FsUtils(fs).write_bytes(req.path, req.content.encode())
         return {"status": "ok"}
     result = _files_op(_creds(ctx), op)
     _hint(background, ctx, "write", req.path)
@@ -244,7 +272,10 @@ def delete_file(path: str, background: BackgroundTasks,
 def delete_dir(path: str, background: BackgroundTasks, recursive: bool = True,
                ctx=Depends(require_caller_and_filespace)):
     def op(fs):
-        fs.delete_dir(path, recursive=recursive)
+        if recursive:
+            lucidlink.FsUtils(fs).delete_tree(path)
+        else:
+            fs.delete_dir(path)
         return {"status": "ok"}
     result = _files_op(_creds(ctx), op)
     _hint(background, ctx, "delete", path)
@@ -267,13 +298,13 @@ def stat_file(path: str, creds=Depends(require_token_and_filespace)):
     def op(fs):
         entry = fs.get_entry(path)
         return {"name": entry.name, "size": entry.size,
-                "is_dir": entry.is_dir(), "is_file": entry.is_file()}
+                "is_dir": entry.is_dir, "is_file": entry.is_file}
     return _files_op(creds, op, not_found_on_error=True)
 
 
 @app.get("/files/exists")
 def file_exists(path: str, creds=Depends(require_token_and_filespace)):
-    return _files_op(creds, lambda fs: {"exists": fs.file_exists(path) or fs.dir_exists(path)})
+    return _files_op(creds, lambda fs: {"exists": _exists(fs, path)})
 
 
 def _parse_range(range_header: str, total: int):
@@ -314,6 +345,8 @@ def download_file(path: str, request: Request, creds=Depends(require_token_and_f
             if rng is None:
                 return {"satisfiable": False, "total": total}
             start, end = rng
+            # 1.0's close() reports native errors; a read already done is
+            # still served, the close failure is only logged.
             f = fs.open(path, "rb")
             try:
                 f.seek(start)
@@ -322,7 +355,7 @@ def download_file(path: str, request: Request, creds=Depends(require_token_and_f
                 try:
                     f.close()
                 except Exception:
-                    pass
+                    logger.warning("closing %s after a range read failed", path, exc_info=True)
             return {"satisfiable": True, "start": start, "end": end,
                     "total": total, "data": data}
 
@@ -339,7 +372,7 @@ def download_file(path: str, request: Request, creds=Depends(require_token_and_f
             },
         )
 
-    data = _files_op(creds, lambda fs: fs.read_file(path), not_found_on_error=True)
+    data = _files_op(creds, lambda fs: lucidlink.FsUtils(fs).read_bytes(path), not_found_on_error=True)
     return Response(
         content=data, media_type=content_type,
         headers={"Accept-Ranges": "bytes",
@@ -356,7 +389,7 @@ async def upload_file(
 ):
     data = await file.read()
     def op(fs):
-        fs.write_file(path, data)
+        lucidlink.FsUtils(fs).write_bytes(path, data)
         return {"status": "ok", "path": path, "size": len(data)}
     result = _files_op(_creds(ctx), op)
     _hint(background, ctx, "write", path)

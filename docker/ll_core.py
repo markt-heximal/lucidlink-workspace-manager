@@ -5,7 +5,7 @@ and the `_with_fs` / `_with_filespace` / `_with_workspace` helpers that every
 route module builds on. Split out of lucidlink_api.py so feature routers (files,
 connect, insights) can share it without a circular import.
 
-SDK >=0.14. Public surface (used by lucidlink_api / connect_api / insights_api)
+SDK 1.0 (lucidlink==1.0.1). Public surface (used by lucidlink_api / connect_api / insights_api)
 is unchanged: require_token, require_token_and_filespace, _with_fs,
 _with_filespace, _with_workspace, _list_filespaces_cached.
 
@@ -15,8 +15,9 @@ session JWT, which is verified and swapped for the LucidLink token stored in
 the vault for `X-Workspace-Id` (or the vault's active workspace). Everything
 below the dependencies only ever sees a LucidLink token.
 """
-from fastapi import HTTPException, Header, Depends
+from fastapi import HTTPException, Header
 import lucidlink
+from lucidlink import exceptions as llx
 import os
 import time
 import logging
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from threading import Lock
 from typing import Optional
 
+import ll_cache
 import owner_auth
 import vault
 
@@ -35,18 +37,22 @@ logger = logging.getLogger("lucidlink_api")
 #
 #   1. Daemon carried a single-instance-per-process guard (C++ global state).
 #      Client has none — concurrent clients are supported, given a distinct
-#      StorageConfig each (SANDBOXED, the default, allocates its own temp root).
+#      StorageConfig each (EPHEMERAL, the default, allocates its own temp root).
 #   2. `daemon.authenticate()` called `_stop_active_workspace()` first, and
 #      `Workspace.stop()` unlinks every linked filespace. So re-authenticating
 #      to list filespaces silently tore down the hot link while the cache went
 #      on holding the dead handle. `Client.login()` is idempotent for the same
 #      token and never re-authenticates, which removes that failure mode.
 #
-# Each level of the registry costs real resources — a Client owns a sandbox
+# Each level of the registry costs real resources — a Client owns an ephemeral
 # cache directory, and each linked filespace runs a full client stack with its
-# own disk cache (~1 GB by default) plus worker threads — so both levels are
-# bounded LRUs whose eviction actually releases: `Filespace.unlink()` (which
-# flushes pending writes first, under the default SYNC_ALL) and `Client.close()`.
+# own data and metadata caches plus worker threads — so both levels are bounded
+# LRUs whose eviction actually releases: `Filespace.unlink()` (which runs a
+# best-effort final sync first, under the default SyncBarrier.ON_UNLINK) and
+# `Client.close()`. The cache maximums are set explicitly per link (ll_cache:
+# LUCIDLINK_CACHE_DATA_GB, default 5, and LUCIDLINK_CACHE_METADATA_GB, default
+# 1), so the disk worst case is MAX_CLIENTS x MAX_LINKS_PER_CLIENT x 6 GiB.
+# (SDK 0.14 defaulted to 25 GiB + 5 GiB per link; 1.0's default is 5 + 1.)
 #
 # Floored at 1: a limit of 0 would evict the entry the caller is about to use.
 MAX_CLIENTS = max(1, int(os.environ.get("LUCIDLINK_MAX_CLIENTS", "1")))
@@ -85,10 +91,14 @@ class _Session:
     """
 
     def __init__(self, token: str):
-        self.client = lucidlink.Client()  # SANDBOXED storage; own temp root
-        self.client.login(lucidlink.ServiceAccountCredentials(token=token))
-        # Service-account tokens are workspace-scoped, so there is exactly one.
-        self.workspace = self.client.get_workspace(self.client.list_workspaces()[0].id)
+        self.client = lucidlink.Client()  # EPHEMERAL storage; own temp root
+        try:
+            self.client.login(lucidlink.ServiceAccountCredentials(token=token))
+            # Service-account tokens are workspace-scoped, so there is exactly one.
+            self.workspace = self.client.workspace
+        except BaseException:
+            _release(self.client.close, "close client after failed login")
+            raise
         self.links: "OrderedDict[str, object]" = OrderedDict()
 
     def link(self, filespace_id: str):
@@ -98,7 +108,7 @@ class _Session:
             self.links.move_to_end(filespace_id)
             return existing
 
-        filespace = self.workspace.link_filespace(id=filespace_id)
+        filespace = self.workspace.link_filespace(filespace_id, cache=ll_cache.cache_config())
         self.links[filespace_id] = filespace
         while len(self.links) > MAX_LINKS_PER_CLIENT:
             old_id, old = self.links.popitem(last=False)
@@ -124,15 +134,38 @@ def _extract_token(authorization: Optional[str], x_lucid_token: Optional[str]) -
     return None
 
 
+# SDK 1.0 errors that say something about the caller's credentials or the
+# service rather than about the operation: mapped the same way wherever they
+# surface (login, link, or a call on a linked filespace).
+_UPSTREAM_ERRORS = (
+    llx.AuthenticationError,
+    llx.NotLoggedInError,
+    llx.AccessDeniedError,
+    llx.RateLimitedError,
+    llx.ServiceUnavailableError,
+    llx.OperationTimeoutError,
+)
+
+
 def _auth_error(e: Exception, token: Optional[str] = None) -> HTTPException:
+    """Map an SDK error from login/link to an HTTP error by its type.
+
+    The SDK message is echoed to the caller (it helps the owner fix a token or
+    a permission), so a token in it is always redacted first.
+    """
     msg = str(e)
-    # SDK messages are echoed to the caller; make sure a token never is.
     if token:
         msg = msg.replace(token, "[redacted]")
-    if "401" in msg or "Unauthorized" in msg or "Invalid token" in msg:
+    if isinstance(e, (llx.AuthenticationError, llx.NotLoggedInError)):
         return HTTPException(status_code=401, detail=f"LucidLink auth failed: {msg}")
-    if "403" in msg or "Forbidden" in msg:
+    if isinstance(e, llx.AccessDeniedError):
         return HTTPException(status_code=403, detail=f"LucidLink forbidden: {msg}")
+    if isinstance(e, llx.FilespaceNotFoundError):
+        return HTTPException(status_code=404, detail=f"LucidLink filespace not found: {msg}")
+    if isinstance(e, llx.RateLimitedError):
+        return HTTPException(status_code=429, detail=f"LucidLink rate limited: {msg}")
+    if isinstance(e, (llx.ServiceUnavailableError, llx.OperationTimeoutError)):
+        return HTTPException(status_code=503, detail=f"LucidLink unavailable: {msg}")
     return HTTPException(status_code=502, detail=f"LucidLink upstream error: {msg}")
 
 
@@ -247,6 +280,10 @@ def _get_session(token: str) -> "_Session":
 
     try:
         session = _Session(token)
+    except llx.InvalidArgumentError as e:
+        # ServiceAccountCredentials refuses a malformed token before any call.
+        raise HTTPException(status_code=401,
+                            detail=f"LucidLink auth failed: {str(e).replace(token, '[redacted]')}")
     except Exception as e:
         raise _auth_error(e, token)
 
@@ -282,7 +319,11 @@ def _resolve_filespace_id(token: str, ref: str) -> str:
 
 def _with_filespace(token: str, filespace_name: str, fn):
     """Run `fn(filespace)` with a live linked Filespace object (for `.connect`,
-    `.fs.get_size()`, etc.). Serialized via _registry_lock."""
+    `.file_system.statistics()`, etc.). Serialized via _registry_lock.
+
+    Credential and service errors raised by `fn` (an expired or revoked token,
+    a missing permission, rate limiting) get the same typed status as at login.
+    """
     filespace_id = _resolve_filespace_id(token, filespace_name)
     with _registry_lock:
         session = _get_session(token)
@@ -292,12 +333,22 @@ def _with_filespace(token: str, filespace_name: str, fn):
             raise
         except Exception as e:
             raise _auth_error(e, token)
-        return fn(filespace)
+        try:
+            return fn(filespace)
+        except _UPSTREAM_ERRORS as e:
+            raise _auth_error(e, token)
 
 
 def _with_fs(token: str, filespace_name: str, fn):
-    """Run `fn(fs)` with the linked Filesystem (the common case)."""
-    return _with_filespace(token, filespace_name, lambda filespace: fn(filespace.fs))
+    """Run `fn(fs)` with the linked FileSystem (the common case)."""
+    return _with_filespace(token, filespace_name, lambda filespace: fn(filespace.file_system))
+
+
+def _iso(dt) -> Optional[str]:
+    """SDK 1.0's aware-UTC datetime as an ISO 8601 string ("...Z"); 0.14 gave a string."""
+    if dt is None:
+        return None
+    return dt.isoformat().replace("+00:00", "Z")
 
 
 def _list_filespaces_cached(token: str) -> list[dict]:
@@ -307,7 +358,7 @@ def _list_filespaces_cached(token: str) -> list[dict]:
         if cached and cached[0] > now:
             return cached[1]
     items = _with_workspace(token, lambda ws: [
-        {"id": fi.id, "name": fi.name, "created": fi.created}
+        {"id": fi.id, "name": fi.name, "created": _iso(fi.created_at)}
         for fi in ws.list_filespaces()
     ])
     with _cache_lock:
@@ -324,6 +375,7 @@ def registry_stats() -> dict:
             "limits": {
                 "max_clients": MAX_CLIENTS,
                 "max_links_per_client": MAX_LINKS_PER_CLIENT,
+                "cache_bytes_per_link": dict(zip(("data", "metadata"), ll_cache.cache_sizes())),
             },
         }
 

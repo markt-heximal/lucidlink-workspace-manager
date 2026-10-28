@@ -1,7 +1,7 @@
 """Filespace insights routes: stats, tabular data preview, and the RAG agent.
 
-- /filespaces/{name}/stats  -> SDK Filesystem.get_statistics()
-- /data/preview             -> bounded CSV/TSV preview via Filesystem.open() (no OOM)
+- /filespaces/{name}/stats  -> SDK FileSystem.statistics()
+- /data/preview             -> bounded CSV/TSV preview via FileSystem.open() (no OOM)
 - /agent/query              -> the indexer's /index/ask (owner callers), else
                                shallow retrieval over the filespace + an
                                OpenAI-compatible LLM (configured via env)
@@ -34,18 +34,23 @@ _TEXT_EXT = {".txt", ".md", ".csv", ".tsv", ".json", ".log", ".yaml", ".yml"}
 # ---------------------------------------------------------------- stats
 @router.get("/filespaces/{name}/stats")
 def filespace_stats(name: str, token: str = Depends(require_token)):
+    # SDK 1.0's statistics() keeps only entries_count, storage_size and the two
+    # external_files_* counters. The response keeps every key the web app
+    # reads; the counters 1.0 no longer reports are null (the UI shows "—"),
+    # and `entriesCount` (files + directories + symlinks) is new.
     def op(fs):
-        s = fs.get_statistics()
+        s = fs.statistics()
         return {
             "sizeBytes": s.storage_size,
-            "fileCount": s.file_count,
-            "dirCount": s.directory_count,
-            "symlinkCount": s.symlink_count,
+            "fileCount": None,
+            "dirCount": None,
+            "symlinkCount": None,
             "externalFileCount": s.external_files_count,
-            "dataSize": s.data_size,
+            "dataSize": None,
             "storageSize": s.storage_size,
-            "entriesSize": s.entries_size,
+            "entriesSize": None,
             "externalFilesSize": s.external_files_size,
+            "entriesCount": s.entries_count,
         }
     try:
         return _with_fs(token, name, op)
@@ -128,7 +133,7 @@ def _gather_context(fs, max_files: int = CONTEXT_MAX_FILES,
             continue
         for e in entries:
             full = path.rstrip("/") + "/" + e.name
-            if e.is_dir():
+            if e.is_dir:
                 if depth < 2 and dirs_scanned < 25:
                     dirs_scanned += 1
                     q.append((full, depth + 1))
@@ -139,7 +144,9 @@ def _gather_context(fs, max_files: int = CONTEXT_MAX_FILES,
     parts, sources = [], []
     for fp in picked:
         try:
-            data = fs.read_file(fp)[:per_file_bytes]
+            # Only the head is used: read that much, not the whole file.
+            with fs.open(fp, "rb") as f:
+                data = f.read(per_file_bytes)
             parts.append(f"### {fp}\n{data.decode('utf-8', 'replace')}")
             sources.append(fp)
         except Exception:

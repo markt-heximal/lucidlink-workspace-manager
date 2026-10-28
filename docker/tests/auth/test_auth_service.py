@@ -11,19 +11,13 @@ import insights_api
 import ll_core
 import lucidlink_api
 from auth_helpers import OWNER_JWT, OTHER_JWT, SA_TOKEN, SA_TOKEN_2, owner_headers
+from sdk_fake import make_fs
 
 
-class FakeFS:
-    def __init__(self, fail: bool = False):
-        self.fail = fail
-        self.calls = []
-
-    def __getattr__(self, name):
-        def op(*args, **kwargs):
-            if self.fail:
-                raise RuntimeError("disk on fire")
-            self.calls.append((name, args))
-        return op
+def FakeFS(fail: bool = False):
+    """A real SDK 1.0 `lucidlink.FileSystem` over an in-memory native fake
+    (tests/sdk_fake.py); `fail` makes every native call raise."""
+    return make_fs(fail=fail)
 
 
 @pytest.fixture
@@ -262,7 +256,7 @@ def test_no_hint_for_lucidlink_token_caller(client, seeded_vault, supabase, fake
         h = {"Authorization": f"Bearer {SA_TOKEN}", "X-LucidLink-Filespace": "fs1"}
         if ws:
             h["X-Workspace-Id"] = ws
-        assert client.post("/files/mkdir", params={"path": "/x"}, headers=h).status_code == 200
+        assert client.post("/files/mkdir", params={"path": f"/x-{ws}"}, headers=h).status_code == 200
         assert client.post("/files/write", json={"path": "/a", "content": "x"}, headers=h).status_code == 200
     assert hints.requests == []
     assert supabase.calls == 0
