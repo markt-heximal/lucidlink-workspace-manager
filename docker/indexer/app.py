@@ -119,6 +119,14 @@ def search(body: SearchBody, svc: IndexerService = Depends(_service), x_ws: Opti
                                   body.pathPrefix)}
 
 
+@router.get("/recent")
+def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
+           limit: int = Query(default=20, ge=1), svc: IndexerService = Depends(_service),
+           x_ws: Optional[str] = WorkspaceHeader):
+    """Recently changed files; `limit` is capped at 200."""
+    return {"files": svc.recent(_ws(workspaceId, x_ws), filespace or None, limit)}
+
+
 @router.post("/ask")
 def ask(body: AskBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
     return svc.ask(_ws(body.workspaceId, x_ws), body.filespace, body.question, body.k)

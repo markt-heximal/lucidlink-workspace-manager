@@ -28,18 +28,37 @@ logger = logging.getLogger("indexer.service")
 SNIPPET_CHARS = 300
 
 
-def mtime_iso(v: Optional[int]) -> Optional[str]:
-    """SDK mtimes are Unix timestamps of unspecified unit; normalise to ISO."""
+RECENT_MAX = 200
+
+
+def mtime_seconds(v: Optional[int]) -> Optional[float]:
+    """SDK mtimes are Unix timestamps of unspecified unit (s, ms, us or ns); normalise to seconds."""
     if not v:
         return None
     x = float(v)
     for limit, div in ((1e17, 1e9), (1e14, 1e6), (1e11, 1e3)):
         if x > limit:
-            x /= div
-            break
+            return x / div
+    return x
+
+
+def mtime_iso(v: Optional[int]) -> Optional[str]:
+    """SDK mtime → ISO 8601 UTC."""
+    x = mtime_seconds(v)
+    if x is None:
+        return None
     try:
         return datetime.fromtimestamp(x, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _iso_seconds(v: Optional[str]) -> Optional[float]:
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
+    except ValueError:
         return None
 
 
@@ -183,6 +202,35 @@ class IndexerService:
                 "mtime": mtime_iso(r["mtime"]),
             })
         return out
+
+    def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
+        """Most recently changed files, newest first, from the ledger.
+
+        Live files are ordered by their own mtime (when the file changed, not when
+        the indexer noticed); deletions and renames by when the indexer saw them.
+        `change` is new | modified | renamed | deleted, or null when it can't be
+        derived (e.g. files found by a filespace's first crawl).
+        """
+        limit = max(1, min(int(limit), RECENT_MAX))
+        scopes = sorted(self.scopes(workspace_id, filespace))
+        seen: set[tuple[str, str, str]] = set()
+        items: list[tuple[float, dict]] = []
+        for r in self.store.recent_files(scopes, limit):
+            key = (r["workspace_id"], r["filespace"], r["file_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            kind = r.get("change_kind")
+            by_change = r["status"] == "deleted" or kind == "renamed"
+            when = (_iso_seconds(r.get("changed_at")) if by_change else None) or mtime_seconds(r["mtime"]) or 0.0
+            items.append((when, {
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"],
+                "size": r["size"], "mtime": mtime_iso(r["mtime"]), "status": r["status"],
+                "indexedAt": r.get("indexed_at"), "change": kind, "changedAt": r.get("changed_at"),
+                "previousPath": r.get("prev_path"),
+            }))
+        items.sort(key=lambda it: (-it[0], it[1]["path"]))
+        return [it[1] for it in items[:limit]]
 
     def ask(self, workspace_id: Optional[str], filespace: Optional[str], question: str, k: int = 12) -> dict:
         return ask_mod.answer(self, self.scopes(workspace_id, filespace), question, k)
