@@ -1,0 +1,35 @@
+{
+  "_comment": "Our own findings per release, from reading the package's code (docs/UPDATES.md, 'Audit notes'). The summarizer treats these as authoritative over thin release notes. Keys: component -> version (or '*' for every version) -> {status, notes}. A file at UPDATES_AUDIT_FILE (default /data/updates-audit.json) is merged over this one, so new findings need no rebuild.",
+  "lucidlink": {
+    "*": {
+      "notes": "Linux wheels are x86_64 only in every version, so the engine runs under emulation on the Apple-silicon Mini; an arm64 wheel would be a real speed-up. There is no public change-notification or watch API; the filespace audit trail (/.lucid_audit, admin-enabled) is the pull-based alternative for the indexer."
+    },
+    "1.0.0": {
+      "status": "Superseded by 1.0.1 (same Python code, rebuilt native library).",
+      "notes": "See 1.0.1."
+    },
+    "1.0.1": {
+      "status": "Already migrated and tested on branch claude/sdk-1.0 (file service, Connect, indexer; all tests pass, with a one-time re-key so the index is kept). Deploy it after a clean overnight run of the current branch.",
+      "notes": "Breaking for this app: client.workspace replaces list_workspaces/get_workspace; link_filespace(id, cache=CacheConfig(...)) with the cache per link; filespace.file_system replaces .fs; FsEntry has id, modified_at, created_at (ns), inode_id; is_dir/is_file are properties (calling them raises TypeError); symlink type is 'symlink'; read_file/write_file/file_exists/dir_exists removed (FsUtils.read_bytes/write_bytes, get_entry + FileNotFoundError); recursive delete is FsUtils.delete_tree; statistics() replaces get_statistics() and drops file/dir/symlink counts and data size (the Storage cards lose those figures); Connect redesigned (data_stores.add/get/list/remove, store.link, store.rekey(S3Credentials), iter_files without a cursor, kind 's3'/'http_link', no key_id; HTTP links need an http_link store on format 3.8+). Useful for this app: read_dir now returns real entry ids, so indexer scans need no per-file lookup; typed exceptions (authentication, access denied, rate limited, service unavailable, not found) instead of string matching; Filespace.sync(); token-redacting credential repr. Cache defaults dropped from 25 GiB + 5 GiB to 5 GiB + 1 GiB per link (now set explicitly). Thread safety unchanged: a Client and its objects must not be used from several threads at once. Removed with no replacement: byte-range locks, get_size(). Security: 1.0.1 only rebuilt the native library, the same day as lucidlink-mcp 1.0.1's third-party certificate fix; probably the same fix, unconfirmed. Requires Python 3.11+ (the image uses 3.12)."
+    },
+    "0.15.0": {
+      "status": "Skip: go straight to 1.0.1.",
+      "notes": "Adds entry_id/inode_id/num_hard_links and deprecates file_id; adds hard links and HTTP-link data stores. Not worth a stop on the way to 1.0."
+    }
+  },
+  "lucidlink-api": {
+    "*": {
+      "notes": "Multi-arch image (amd64 + arm64): runs natively on the Mini. Reachable through the public /api/v1/* proxy, so security fixes matter."
+    },
+    "1.5.7": {
+      "status": "Deployed: both compose files pin 1.5.7.",
+      "notes": "1.5.1 to 1.5.7 shipped weekly with no published changelog except 1.5.5, which added a guest links API (create a guest link, add/remove guest emails, delete a link). Those endpoints become reachable through the public /api/v1/* proxy for any caller with a valid token or the owner session; consider allow-listing proxy paths."
+    }
+  },
+  "lucidlink-mcp": {
+    "1.0.1": {
+      "status": "Adopted: .mcp.json pins 1.0.1.",
+      "notes": "Explicit security release (third-party certificate issue). Requires lucidlink==1.0.1, mcp==2.0.0 and Python 3.11+. 1.0 adds read-only mode (LUCIDLINK_MCP_READ_ONLY=1), core/admin toolsets, several linked filespaces at once, Connect tools, audit-trail queries and a pull-based change subscription. Used only by coding agents, not by the running engine."
+    }
+  }
+}

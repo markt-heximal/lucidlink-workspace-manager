@@ -282,3 +282,21 @@ applied without code changes anyway (0.14 -> 1.0 needed one: see INDEXER.md,
 "SDK notes"). The panel should read `GET /engine/updates`
 instead: show the status, the breaking flag and the summary, and link to the
 Renovate PR. See the audit for the exact UI change.
+
+## Audit notes
+
+Release notes for LucidLink packages are often a single line, so a summary
+written from them alone says "not stated" for most things that matter. The
+summarizer is therefore also given our own audit of each release, from reading
+the package's code: `docker/updates/audit.json`, keyed by component and version
+(`"*"` for notes that apply to every version), each entry with `notes` (what
+changes for this app) and `status` (where the upgrade stands here). The
+summary treats the audit as authoritative over the release notes and takes the
+status into account in its recommendation.
+
+To add a finding without rebuilding, write the same shape to
+`/data/updates-audit.json` (or `UPDATES_AUDIT_FILE`); it is merged over the
+packaged file per component and version. Summaries are cached per release
+together with a fingerprint of the audit, status and prompt: when those change,
+the next check rewrites the summary shown in Engine › Status, without sending a
+second alert. Without an LLM, an alert carries the audit text itself.

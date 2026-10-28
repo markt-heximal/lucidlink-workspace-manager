@@ -32,7 +32,8 @@ from .components import Component, Pin, load_components, resolve_pin
 from .notifiers import Alert, Notifier, fan_out, notifiers_from_env
 from .sources import HTTP_TIMEOUT, Release, SourceError, fetch_latest
 from .store import UpdateStore, now_iso
-from .summarize import llm_configured, summarize
+from . import audit as audit_notes
+from .summarize import PROMPT_VERSION, llm_configured, summarize
 from .versions import classify, count_between
 
 logger = logging.getLogger("lucidlink_api.updates")
@@ -132,6 +133,10 @@ class UpdateMonitor:
                 alert = self._release_alert(comp, pin, release, cls, security)
                 if self._deliver(alert):
                     alerts.append(self._alert_dict(alert))
+            else:
+                # Already announced: only refresh the summary shown in Engine
+                # when the audit notes or prompt changed. Never a second alert.
+                self._summary(comp, pin, release, cls)
 
         for vuln in release.pinned_vulnerabilities:
             kind = f"security:{vuln.get('id') or 'unknown'}"
@@ -143,16 +148,24 @@ class UpdateMonitor:
 
     # ----------------------------------------------------------------- alerts
     def _summary(self, comp: Component, pin: Pin, release: Release, cls) -> tuple[str, bool]:
-        """(text, from_llm). Cached per release so a retry does not pay twice."""
-        cached = (self.store.get_release(comp.key, release.version) or {}).get("summary")
-        if cached:
-            return cached, True
+        """(text, from_llm). Cached per release and per context (our audit notes,
+        the prompt), so a retry does not pay twice but a new finding is used."""
+        audit, status = audit_notes.for_release(audit_notes.load(), comp.key, release.version)
+        ctx = audit_notes.fingerprint(PROMPT_VERSION, audit, status, pin.version or "")
+        row = self.store.get_release(comp.key, release.version) or {}
+        if row.get("summary") and row.get("summary_ctx") == ctx:
+            return row["summary"], True
         text = summarize(label=comp.label, package=comp.package, relevance=comp.relevance,
                          current=pin.version, latest=release.version, update_type=cls.update_type,
-                         breaking=cls.breaking, notes=release.notes, transport=self.llm_transport)
+                         breaking=cls.breaking, notes=release.notes, audit=audit, status=status,
+                         transport=self.llm_transport)
         if text:
-            self.store.set_summary(comp.key, release.version, text)
+            self.store.set_summary(comp.key, release.version, text, ctx)
             return text, True
+        if row.get("summary"):
+            return row["summary"], True   # LLM unavailable now: keep the older summary
+        if audit:
+            return f"Our audit: {audit}" + (f"\nStatus: {status}" if status else ""), False
         return _excerpt(release.notes) or "(no release notes published)", False
 
     def _release_alert(self, comp: Component, pin: Pin, release: Release, cls, security: bool) -> Alert:
@@ -177,7 +190,9 @@ class UpdateMonitor:
                             if comp.public else ""))
         if release.digest and pin.digest and release.pinned_digest_now and release.pinned_digest_now != pin.digest:
             lines.append("Note: the pinned tag has since been re-pushed with a different digest.")
-        lines += ["", "What matters for this app:" if from_llm else "Release notes (excerpt):", summary, ""]
+        heading = ("What matters for this app:" if from_llm or summary.startswith("Our audit:")
+                   else "Release notes (excerpt):")
+        lines += ["", heading, summary, ""]
         if cls.automerge_eligible:
             lines.append("Renovate may automerge this once CI passes; the Mini then redeploys on its next pull.")
         else:
