@@ -17,6 +17,7 @@ class FakeRuvector:
     def __init__(self):
         self.collections: dict[str, dict] = {}
         self.fail = False
+        self.max_body = None  # bytes; stock axum default is 2 MB
         self.requests: list[tuple[str, str]] = []
         self.transport = httpx.MockTransport(self.handle)
 
@@ -32,6 +33,8 @@ class FakeRuvector:
         self.requests.append((req.method, req.url.path))
         if self.fail:
             return httpx.Response(500, text="internal error")
+        if self.max_body is not None and len(req.content) > self.max_body:
+            return httpx.Response(413, text="Failed to buffer the request body: length limit exceeded")
         parts = req.url.path.strip("/").split("/")
         body = json.loads(req.content) if req.content else {}
         if parts == ["collections"] and req.method == "POST":
@@ -169,7 +172,14 @@ def test_fallback_to_local_on_error(make_service, ruv):
     assert vs["ok"] is False and vs["backend"] == "local" and "500" in vs["error"]
     assert vs["points"] == svc.store.chunk_count()
 
+    # While cooling down, Ruvector is left alone and search stays local.
     ruv.fail = False
+    sent = len(ruv.requests)
+    svc.search("ws1", "fsA", "alpha detail")
+    svc.vectors.sync_mirror()
+    assert len(ruv.requests) == sent and svc.vectors.last_backend == "local"
+
+    svc.vectors._mirror_retry_at = 0.0   # cooldown over
     svc.search("ws1", "fsA", "alpha detail")
     assert svc.status()["vectorStore"]["ok"] is True
 
@@ -217,3 +227,18 @@ def test_rehydrate_when_collection_restored_empty(make_service, ruv):
     assert svc.embedder.texts_embedded == embedded + 1
     hits = svc.search("ws1", "fsA", "alpha detail")
     assert hits[0]["path"] == "/a.md" and svc.vectors.last_backend == "ruvector"
+
+
+def test_upserts_respect_body_limit(make_service, ruv, monkeypatch):
+    import indexer.vectors as vectors
+    # Batches sized for a tight limit, and a server limit tighter still, so
+    # both the byte batching and the halving-on-413 path are exercised.
+    monkeypatch.setattr(vectors, "UPSERT_MAX_BYTES", 4000)
+    ruv.max_body = 2500
+    svc = make_service(ruvector=ruv.transport)
+    _index(svc, {f"/d{i}.md": para(f"topic{i}") for i in range(8)})
+    name = svc.vectors.mirror.collection
+    puts = [r for r in ruv.requests if r[0] == "PUT"]
+    assert len(puts) > 1
+    assert len(ruv.collections[name]["points"]) == svc.store.chunk_count()
+    assert svc.status()["vectorStore"]["ok"] is True

@@ -26,9 +26,11 @@ clamped to [0, 1].
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
+import time
 from typing import Optional
 
 import httpx
@@ -42,6 +44,14 @@ Scope = tuple[str, str]  # (workspace_id, filespace)
 
 DEAD_RATIO_REBUILD = 0.2
 UPSERT_BATCH = 256
+# ruvector-server (axum) rejects bodies over 2 MB. Stay well under it: a
+# 768-dim vector is ~10 KB of JSON at 6 decimals, so this is ~90 points.
+UPSERT_MAX_BYTES = 900_000
+# After a mirror failure, leave Ruvector alone for this long (search runs
+# locally meanwhile) instead of retrying on every request.
+MIRROR_COOLDOWN_SEC = 60.0
+
+
 
 
 def model_slug(model: str) -> str:
@@ -121,6 +131,25 @@ class CollectionMissing(MirrorError):
     pass
 
 
+class PayloadTooLarge(MirrorError):
+    pass
+
+
+def _byte_batches(points: list[dict], max_bytes: int):
+    """Split points into runs whose JSON stays under `max_bytes`."""
+    batch: list[dict] = []
+    size = 0
+    for p in points:
+        n = len(json.dumps(p, separators=(",", ":"))) + 1
+        if batch and size + n > max_bytes:
+            yield batch
+            batch, size = [], 0
+        batch.append(p)
+        size += n
+    if batch:
+        yield batch
+
+
 class RuvectorMirror:
     def __init__(self, base_url: str, api_key: str, store: Store, model: str, dim_getter,
                  transport: Optional[httpx.BaseTransport] = None, timeout: float = 30.0):
@@ -156,6 +185,8 @@ class RuvectorMirror:
             raise MirrorError(f"ruvector unreachable: {type(e).__name__}: {e}") from e
         if r.status_code == 404 or "CollectionNotFound" in r.text[:500]:
             raise CollectionMissing(f"{method} {path}: {r.status_code} {r.text[:200]}")
+        if r.status_code == 413:
+            raise PayloadTooLarge(f"{method} {path}: {r.text[:200]}")
         if r.status_code >= 400:
             raise MirrorError(f"ruvector {method} {path}: HTTP {r.status_code} {r.text[:200]}")
         return r
@@ -223,14 +254,28 @@ class RuvectorMirror:
             if not rows:
                 return pushed
             points = [{
+                # 6 decimals keeps cosine scores exact to ~1e-6 and halves the JSON.
                 "id": str(r["point_id"]),
-                "vector": blob_to_vec(r["vector"]).tolist(),
+                "vector": [round(float(x), 6) for x in blob_to_vec(r["vector"])],
                 "metadata": {"workspaceId": r["workspace_id"], "filespace": r["filespace"],
                              "fileId": r["file_id"], "path": r["path"], "chunkIndex": r["chunk_index"]},
             } for r in rows]
+            for batch in _byte_batches(points, UPSERT_MAX_BYTES):
+                self._upsert(name, batch)
+                pushed += len(batch)
+
+    def _upsert(self, name: str, points: list[dict]) -> None:
+        """PUT points, halving the batch if the server still finds it too large."""
+        try:
             self._req("PUT", f"/collections/{name}/points", {"points": points})
-            self.store.mirror_add(name, [r["point_id"] for r in rows])
-            pushed += len(rows)
+        except PayloadTooLarge:
+            if len(points) == 1:
+                raise MirrorError(f"ruvector rejects even a single point for {name} as too large")
+            mid = len(points) // 2
+            self._upsert(name, points[:mid])
+            self._upsert(name, points[mid:])
+            return
+        self.store.mirror_add(name, [int(p["id"]) for p in points])
 
     def _run(self, fn):
         """Run `fn(name)`, healing a vanished collection once; record health."""
@@ -310,12 +355,20 @@ class VectorService:
         self.local = local
         self.mirror = mirror
         self.last_backend = "ruvector" if mirror else "local"
+        self._mirror_retry_at = 0.0  # monotonic time before which the mirror is skipped
+
+    def _mirror_usable(self) -> bool:
+        return self.mirror is not None and time.monotonic() >= self._mirror_retry_at
+
+    def _mirror_failed(self, e: Exception, what: str) -> None:
+        self._mirror_retry_at = time.monotonic() + MIRROR_COOLDOWN_SEC
+        logger.warning("ruvector %s failed, using local for %.0fs: %s", what, MIRROR_COOLDOWN_SEC, e)
 
     def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
                path_prefix: Optional[str] = None) -> list[tuple[int, float]]:
         # A path filter is applied exactly by the local index; the mirror is
         # only an accelerator for the plain case.
-        if self.mirror is not None and not (path_prefix and path_prefix != "/"):
+        if self._mirror_usable() and not (path_prefix and path_prefix != "/"):
             try:
                 hits = self.mirror.search(q, k, scopes)
                 if hits or not self.local.search(q, 1, scopes):
@@ -326,17 +379,17 @@ class VectorService:
                 logger.warning("ruvector returned no hits but local has some; using local")
                 self.mirror._ready = None
             except MirrorError as e:
-                logger.warning("ruvector search failed, using local: %s", e)
+                self._mirror_failed(e, "search")
         self.last_backend = "local"
         return self.local.search(q, k, scopes, path_prefix)
 
     def sync_mirror(self) -> None:
-        if self.mirror is None:
+        if not self._mirror_usable():
             return
         try:
             self.mirror.sync()
         except MirrorError as e:
-            logger.warning("ruvector sync failed: %s", e)
+            self._mirror_failed(e, "sync")
 
     def status(self) -> dict:
         if self.mirror is None:
