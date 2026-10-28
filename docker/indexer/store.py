@@ -1,0 +1,372 @@
+"""SQLite persistence for the indexer: `/data/index.db`, the source of truth.
+
+Everything durable lives here — the per-file ledger that makes delta scans
+possible, chunk text, the embedding cache and stored surveys — so a restart, a
+lost Ruvector collection or a model change never forces a re-crawl. Ruvector is
+only ever a mirror of what is in this file.
+
+Concurrency: one connection in WAL mode shared behind an RLock. The indexer's
+writes are small and frequent, reads are short, and at personal scale a single
+serialized connection is simpler and safer than a pool. `generation` bumps on
+every change that affects search results so the in-memory numpy index knows
+when to reload.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Iterable, Iterator, Optional
+
+import numpy as np
+
+logger = logging.getLogger("indexer.store")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS filespaces (
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    -- 1 when `enabled` was set explicitly via PUT /index/filespaces.
+    enabled_override INTEGER NOT NULL DEFAULT 0,
+    last_scan_at TEXT,
+    last_sync_at TEXT,
+    last_error   TEXT,
+    last_scan_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, filespace)
+);
+CREATE TABLE IF NOT EXISTS files (
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    file_id      TEXT NOT NULL,
+    path         TEXT NOT NULL,
+    size         INTEGER NOT NULL DEFAULT 0,
+    mtime        INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT,
+    status       TEXT NOT NULL,   -- pending | indexed | skipped | failed | deleted
+    reason       TEXT,
+    chunk_count  INTEGER NOT NULL DEFAULT 0,
+    scan_id      INTEGER NOT NULL DEFAULT 0,
+    indexed_at   TEXT,
+    PRIMARY KEY (workspace_id, filespace, file_id)
+);
+CREATE INDEX IF NOT EXISTS files_path ON files (workspace_id, filespace, path);
+CREATE INDEX IF NOT EXISTS files_status ON files (workspace_id, filespace, status, mtime);
+CREATE TABLE IF NOT EXISTS chunks (
+    point_id     INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused: Ruvector ids
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    file_id      TEXT NOT NULL,
+    chunk_index  INTEGER NOT NULL,
+    text_hash    TEXT NOT NULL,
+    text         TEXT NOT NULL,
+    UNIQUE (workspace_id, filespace, file_id, chunk_index)
+);
+CREATE INDEX IF NOT EXISTS chunks_hash ON chunks (text_hash);
+CREATE TABLE IF NOT EXISTS embeddings (
+    model     TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    dim       INTEGER NOT NULL,
+    vector    BLOB NOT NULL,      -- float32, L2-normalised
+    PRIMARY KEY (model, text_hash)
+);
+CREATE TABLE IF NOT EXISTS surveys (
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    generated_at TEXT NOT NULL,
+    stale        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (workspace_id, filespace, scope)
+);
+-- Point ids known to be in a Ruvector collection. Rows whose chunk is gone are
+-- the "dead" points the stock server cannot delete.
+CREATE TABLE IF NOT EXISTS mirror_points (
+    collection TEXT NOT NULL,
+    point_id   INTEGER NOT NULL,
+    PRIMARY KEY (collection, point_id)
+);
+"""
+
+LIVE_STATUSES = ("pending", "indexed", "skipped", "failed")
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def vec_to_blob(v: np.ndarray) -> bytes:
+    return np.asarray(v, dtype=np.float32).tobytes()
+
+
+def blob_to_vec(b: bytes) -> np.ndarray:
+    return np.frombuffer(b, dtype=np.float32)
+
+
+class Store:
+    def __init__(self, path: str):
+        if path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._conn.executescript(SCHEMA)
+        self._generation = 0
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # ------------------------------------------------------------ primitives
+    @property
+    def generation(self) -> int:
+        return self._generation
+
+    def bump(self) -> None:
+        """Signal that search-visible data (chunks, vectors, paths) changed."""
+        with self._lock:
+            self._generation += 1
+
+    @contextmanager
+    def tx(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._conn
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+
+    def query(self, sql: str, args: Iterable = ()) -> list[dict]:
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql, tuple(args)).fetchall()]
+
+    def one(self, sql: str, args: Iterable = ()) -> Optional[dict]:
+        with self._lock:
+            r = self._conn.execute(sql, tuple(args)).fetchone()
+            return dict(r) if r else None
+
+    def scalar(self, sql: str, args: Iterable = ()):
+        with self._lock:
+            r = self._conn.execute(sql, tuple(args)).fetchone()
+            return r[0] if r else None
+
+    def execute(self, sql: str, args: Iterable = ()) -> int:
+        with self._lock:
+            return self._conn.execute(sql, tuple(args)).rowcount
+
+    # ------------------------------------------------------------ filespaces
+    def ensure_filespace(self, ws: str, fs: str) -> None:
+        self.execute("INSERT OR IGNORE INTO filespaces (workspace_id, filespace) VALUES (?, ?)", (ws, fs))
+
+    def filespace_row(self, ws: str, fs: str) -> Optional[dict]:
+        return self.one("SELECT * FROM filespaces WHERE workspace_id=? AND filespace=?", (ws, fs))
+
+    def filespace_rows(self) -> list[dict]:
+        return self.query("SELECT * FROM filespaces ORDER BY workspace_id, filespace")
+
+    def set_filespace_enabled(self, ws: str, fs: str, enabled: bool) -> None:
+        self.ensure_filespace(ws, fs)
+        self.execute("UPDATE filespaces SET enabled=?, enabled_override=1 "
+                     "WHERE workspace_id=? AND filespace=?", (int(enabled), ws, fs))
+
+    def update_filespace(self, ws: str, fs: str, **cols) -> None:
+        if not cols:
+            return
+        self.ensure_filespace(ws, fs)
+        sets = ", ".join(f"{k}=?" for k in cols)
+        self.execute(f"UPDATE filespaces SET {sets} WHERE workspace_id=? AND filespace=?",
+                     (*cols.values(), ws, fs))
+
+    def next_scan_id(self, ws: str, fs: str) -> int:
+        with self.tx() as c:
+            c.execute("INSERT OR IGNORE INTO filespaces (workspace_id, filespace) VALUES (?, ?)", (ws, fs))
+            c.execute("UPDATE filespaces SET last_scan_id = last_scan_id + 1 "
+                      "WHERE workspace_id=? AND filespace=?", (ws, fs))
+            return c.execute("SELECT last_scan_id FROM filespaces WHERE workspace_id=? AND filespace=?",
+                             (ws, fs)).fetchone()[0]
+
+    def file_counts(self, ws: str, fs: str) -> dict:
+        counts = {"indexed": 0, "pending": 0, "failed": 0, "skipped": 0}
+        for r in self.query("SELECT status, COUNT(*) AS n FROM files WHERE workspace_id=? AND filespace=? "
+                            "GROUP BY status", (ws, fs)):
+            if r["status"] in counts:
+                counts[r["status"]] = r["n"]
+        return counts
+
+    def chunk_count(self, ws: Optional[str] = None, fs: Optional[str] = None) -> int:
+        if ws is None:
+            return self.scalar("SELECT COUNT(*) FROM chunks") or 0
+        return self.scalar("SELECT COUNT(*) FROM chunks WHERE workspace_id=? AND filespace=?", (ws, fs)) or 0
+
+    # ------------------------------------------------------------ files
+    def get_file(self, ws: str, fs: str, file_id: str) -> Optional[dict]:
+        return self.one("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND file_id=?",
+                        (ws, fs, file_id))
+
+    def live_files_at_path(self, ws: str, fs: str, path: str) -> list[dict]:
+        return self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND path=? "
+                          "AND status != 'deleted'", (ws, fs, path))
+
+    def insert_file(self, ws: str, fs: str, file_id: str, path: str, size: int, mtime: int,
+                    scan_id: int, status: str = "pending", reason: Optional[str] = None) -> None:
+        self.execute(
+            "INSERT OR REPLACE INTO files (workspace_id, filespace, file_id, path, size, mtime, "
+            "content_hash, status, reason, chunk_count, scan_id, indexed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, 0, ?, NULL)",
+            (ws, fs, file_id, path, size, mtime, status, reason, scan_id))
+
+    def update_file(self, ws: str, fs: str, file_id: str, **cols) -> None:
+        sets = ", ".join(f"{k}=?" for k in cols)
+        self.execute(f"UPDATE files SET {sets} WHERE workspace_id=? AND filespace=? AND file_id=?",
+                     (*cols.values(), ws, fs, file_id))
+
+    def pending_files(self, ws: str, fs: str) -> list[dict]:
+        """The work queue: newest mtime first, so a fresh filespace is useful early."""
+        return self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status='pending' "
+                          "ORDER BY mtime DESC, path", (ws, fs))
+
+    # ------------------------------------------------------------ chunks
+    def file_chunks(self, ws: str, fs: str, file_id: str) -> list[dict]:
+        return self.query("SELECT point_id, chunk_index, text_hash FROM chunks WHERE workspace_id=? "
+                          "AND filespace=? AND file_id=? ORDER BY chunk_index", (ws, fs, file_id))
+
+    def replace_chunks(self, ws: str, fs: str, file_id: str,
+                       chunks: list[tuple[str, str]]) -> int:
+        """Set a file's chunks to `[(text_hash, text), ...]`, reusing unchanged rows.
+
+        A chunk whose hash is unchanged at the same index keeps its point id (so
+        Ruvector needs nothing); a changed one gets a fresh id, leaving the old
+        one dead in the mirror. Returns the number of rows written.
+        """
+        written = 0
+        with self.tx() as c:
+            existing = {r["chunk_index"]: r for r in c.execute(
+                "SELECT point_id, chunk_index, text_hash FROM chunks WHERE workspace_id=? AND filespace=? "
+                "AND file_id=?", (ws, fs, file_id)).fetchall()}
+            for idx, (text_hash, text) in enumerate(chunks):
+                old = existing.pop(idx, None)
+                if old is not None and old["text_hash"] == text_hash:
+                    continue
+                if old is not None:
+                    c.execute("DELETE FROM chunks WHERE point_id=?", (old["point_id"],))
+                c.execute("INSERT INTO chunks (workspace_id, filespace, file_id, chunk_index, text_hash, text) "
+                          "VALUES (?, ?, ?, ?, ?, ?)", (ws, fs, file_id, idx, text_hash, text))
+                written += 1
+            for old in existing.values():
+                c.execute("DELETE FROM chunks WHERE point_id=?", (old["point_id"],))
+                written += 1
+        if written:
+            self.bump()
+        return written
+
+    def delete_file_chunks(self, ws: str, fs: str, file_id: str) -> int:
+        n = self.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=? AND file_id=?",
+                         (ws, fs, file_id))
+        if n:
+            self.bump()
+        return n
+
+    def chunk_rows(self, point_ids: list[int]) -> dict[int, dict]:
+        if not point_ids:
+            return {}
+        out: dict[int, dict] = {}
+        for i in range(0, len(point_ids), 500):
+            part = point_ids[i:i + 500]
+            marks = ",".join("?" * len(part))
+            for r in self.query(
+                    f"SELECT c.point_id, c.workspace_id, c.filespace, c.file_id, c.chunk_index, c.text, "
+                    f"f.path, f.mtime FROM chunks c JOIN files f ON f.workspace_id=c.workspace_id "
+                    f"AND f.filespace=c.filespace AND f.file_id=c.file_id "
+                    f"WHERE c.point_id IN ({marks}) AND f.status != 'deleted'", part):
+                out[r["point_id"]] = r
+        return out
+
+    # ------------------------------------------------------------ embeddings
+    def get_embeddings(self, model: str, hashes: list[str]) -> dict[str, np.ndarray]:
+        out: dict[str, np.ndarray] = {}
+        uniq = list(dict.fromkeys(hashes))
+        for i in range(0, len(uniq), 500):
+            part = uniq[i:i + 500]
+            marks = ",".join("?" * len(part))
+            for r in self.query(f"SELECT text_hash, vector FROM embeddings WHERE model=? "
+                                f"AND text_hash IN ({marks})", (model, *part)):
+                out[r["text_hash"]] = blob_to_vec(r["vector"])
+        return out
+
+    def put_embeddings(self, model: str, items: list[tuple[str, np.ndarray]]) -> None:
+        if not items:
+            return
+        with self.tx() as c:
+            c.executemany("INSERT OR REPLACE INTO embeddings (model, text_hash, dim, vector) VALUES (?, ?, ?, ?)",
+                          [(model, h, int(len(v)), vec_to_blob(v)) for h, v in items])
+        self.bump()
+
+    def model_dim(self, model: str) -> Optional[int]:
+        return self.scalar("SELECT dim FROM embeddings WHERE model=? LIMIT 1", (model,))
+
+    def chunks_missing_embeddings(self, model: str, limit: int = 256) -> list[dict]:
+        """Chunks with no cached vector for `model` (e.g. after a model change)."""
+        return self.query(
+            "SELECT DISTINCT c.text_hash, c.text FROM chunks c WHERE NOT EXISTS "
+            "(SELECT 1 FROM embeddings e WHERE e.model=? AND e.text_hash=c.text_hash) LIMIT ?",
+            (model, limit))
+
+    def live_vectors(self, model: str) -> list[dict]:
+        """Every searchable chunk: its scope, path and vector for `model`."""
+        return self.query(
+            "SELECT c.point_id, c.workspace_id, c.filespace, f.path, e.vector FROM chunks c "
+            "JOIN embeddings e ON e.model=? AND e.text_hash=c.text_hash "
+            "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace "
+            "AND f.file_id=c.file_id WHERE f.status != 'deleted'", (model,))
+
+    # ------------------------------------------------------------ surveys
+    def get_survey(self, ws: str, fs: str, scope: str) -> Optional[dict]:
+        return self.one("SELECT * FROM surveys WHERE workspace_id=? AND filespace=? AND scope=?", (ws, fs, scope))
+
+    def put_survey(self, ws: str, fs: str, scope: str, payload: str, generated_at: str) -> None:
+        self.execute("INSERT OR REPLACE INTO surveys (workspace_id, filespace, scope, payload, generated_at, stale) "
+                     "VALUES (?, ?, ?, ?, ?, 0)", (ws, fs, scope, payload, generated_at))
+
+    def mark_surveys_stale(self, ws: str, fs: str) -> None:
+        self.execute("UPDATE surveys SET stale=1 WHERE workspace_id=? AND filespace=?", (ws, fs))
+
+    # ------------------------------------------------------------ ruvector mirror
+    def mirror_missing(self, collection: str, model: str, limit: int = 256) -> list[dict]:
+        return self.query(
+            "SELECT c.point_id, c.workspace_id, c.filespace, c.file_id, c.chunk_index, f.path, e.vector "
+            "FROM chunks c JOIN embeddings e ON e.model=? AND e.text_hash=c.text_hash "
+            "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace AND f.file_id=c.file_id "
+            "WHERE f.status != 'deleted' AND NOT EXISTS "
+            "(SELECT 1 FROM mirror_points m WHERE m.collection=? AND m.point_id=c.point_id) "
+            "ORDER BY c.point_id LIMIT ?", (model, collection, limit))
+
+    def mirror_add(self, collection: str, point_ids: list[int]) -> None:
+        with self.tx() as c:
+            c.executemany("INSERT OR IGNORE INTO mirror_points (collection, point_id) VALUES (?, ?)",
+                          [(collection, p) for p in point_ids])
+
+    def mirror_clear(self, collection: str) -> None:
+        self.execute("DELETE FROM mirror_points WHERE collection=?", (collection,))
+
+    def mirror_forget_file(self, ws: str, fs: str, file_id: str) -> None:
+        """Make a file's live points look unmirrored so metadata is re-upserted."""
+        self.execute("DELETE FROM mirror_points WHERE point_id IN (SELECT point_id FROM chunks "
+                     "WHERE workspace_id=? AND filespace=? AND file_id=?)", (ws, fs, file_id))
+
+    def mirror_counts(self, collection: str) -> tuple[int, int]:
+        """(live mirrored points, dead mirrored points)."""
+        total = self.scalar("SELECT COUNT(*) FROM mirror_points WHERE collection=?", (collection,)) or 0
+        dead = self.scalar("SELECT COUNT(*) FROM mirror_points m WHERE m.collection=? AND NOT EXISTS "
+                           "(SELECT 1 FROM chunks c WHERE c.point_id=m.point_id)", (collection,)) or 0
+        return total - dead, dead
+
+    def live_point_ids(self, point_ids: list[int]) -> set[int]:
+        return set(self.chunk_rows(point_ids).keys())
