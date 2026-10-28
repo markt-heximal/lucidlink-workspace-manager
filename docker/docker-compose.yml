@@ -94,8 +94,14 @@ services:
       - LLM_TIMEOUT=${LLM_TIMEOUT:-180}
       - SYNC_INTERVAL_SEC=${SYNC_INTERVAL_SEC:-300}
       - INDEX_MAX_FILE_BYTES=${INDEX_MAX_FILE_BYTES:-26214400}
+      # Connected block storage (docs/INDEXER.md, In Place, Phase A).
+      - BLOCK_SOURCES=${BLOCK_SOURCES:-}
+      - BLOCK_SOURCE_WORKSPACE=${BLOCK_SOURCE_WORKSPACE:-}
     volumes:
       - lucidlink-data:/data
+      # A NAS share / drive indexed in place, read-only. Unset: an empty
+      # placeholder is mounted and nothing is indexed.
+      - ${BLOCK_SOURCE_PATH:-./block-empty}:/block/source1:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
       interval: 30s
