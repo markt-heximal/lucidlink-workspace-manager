@@ -344,20 +344,31 @@ class FilespaceIndexer:
 
     # ------------------------------------------------------------ index
     def index_pending(self, progress: Optional[ProgressFn] = None,
-                      should_stop: Optional[Callable[[], bool]] = None) -> IndexResult:
-        """Drain the queue, newest first. EmbedError propagates (the embedder is
-        down: stop, leave files pending); per-file problems are recorded."""
+                      should_stop: Optional[Callable[[], bool]] = None,
+                      limit: Optional[int] = None) -> IndexResult:
+        """Work through the queue, newest first, up to `limit` files or until
+        `should_stop`. EmbedError propagates (the embedder is down: stop, leave
+        files pending); per-file problems are recorded."""
         out = IndexResult()
-        queue = self.store.pending_files(self.ws, self.fs)
-        for done, row in enumerate(queue):
+        queue = self.store.pending_files(self.ws, self.fs, limit)
+        # Progress is against the whole backlog, not just this job's slice.
+        if not queue:
+            total = 0
+        elif limit is None:
+            total = len(queue)
+        else:
+            total = self.store.file_counts(self.ws, self.fs)["pending"]
+        done = 0
+        for row in queue:
             if should_stop and should_stop():
                 break
             if progress:
-                progress(done, len(queue), row["path"])
+                progress(done, total, row["path"])
             outcome = self._index_file(row, out)
             setattr(out, outcome, getattr(out, outcome) + 1)
+            done += 1
         if progress:
-            progress(len(queue), len(queue), None)
+            progress(done, total, None)
         return out
 
     def _set(self, row: dict, **cols) -> None:

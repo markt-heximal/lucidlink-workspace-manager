@@ -57,6 +57,14 @@ class Config:
     targets_refresh_sec: float = 30.0
     # A file that failed to read/extract is retried after this long.
     failed_retry_sec: int = 3600
+    # A job indexes for at most this long, then yields its slot so one huge
+    # filespace cannot starve the others (or their hints) for hours.
+    job_budget_sec: float = 120.0
+    # Files taken from the queue per job (the budget usually ends it sooner).
+    job_max_files: int = 2000
+    # Full rescans wait at least this many times the last scan's duration, so
+    # a filespace whose metadata walk takes minutes is not walked back to back.
+    scan_interval_factor: float = 5.0
 
     @property
     def llm_configured(self) -> bool:
@@ -87,4 +95,5 @@ class Config:
             concurrency=_int("INDEX_CONCURRENCY", links, floor=1),
             max_linked_filespaces=links,
             max_clients=_int("INDEX_MAX_CLIENTS", 2, floor=1),
+            job_budget_sec=_float("INDEX_JOB_BUDGET_SEC", 120.0),
         )

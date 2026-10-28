@@ -46,6 +46,7 @@ service's global `_registry_lock` and UI requests never wait on a crawl.
 | `SYNC_INTERVAL_SEC` | indexer | Background delta scan cadence per filespace. Default 300. |
 | `INDEX_MAX_FILE_BYTES` | indexer | Skip larger files. Default 25 MB. |
 | `LUCIDLINK_CACHE_DATA_GB`, `LUCIDLINK_CACHE_METADATA_GB` | both | SDK cache maximums per linked filespace, in GiB. Default 5 and 1 (see "SDK notes"). |
+| `INDEX_JOB_BUDGET_SEC` | indexer | Seconds one job may index before yielding its slot, so a huge filespace takes turns with the rest. Default 120. |
 
 ## Owner auth (Option A: existing Supabase sign-in)
 
