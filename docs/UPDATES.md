@@ -101,7 +101,7 @@ Adding a component: a dict in `DEFAULT_COMPONENTS` or in
 Both routes must be mounted owner-only (the file service is the public
 catch-all). The router applies no auth itself.
 
-`GET /engine/updates[?alerts=N]`
+`GET /engine/updates[?alerts=N]` (example from before the 1.0.1 migration)
 
 ```json
 {
@@ -277,7 +277,8 @@ Adjust the paths if the checkout lives elsewhere. Logs are also appended to
 ends in the 501 "does not expose an SDK upgrade endpoint" error. That is the
 right outcome for an in-place upgrade: an endpoint that pip-installs a version
 into the running, publicly reachable service would be remote code execution
-on a timer, and 0.14 -> 1.0 is a breaking migration that cannot be applied
-without code changes anyway. The panel should read `GET /engine/updates`
+on a timer, and a major SDK bump is a breaking migration that cannot be
+applied without code changes anyway (0.14 -> 1.0 needed one: see INDEXER.md,
+"SDK notes"). The panel should read `GET /engine/updates`
 instead: show the status, the breaking flag and the summary, and link to the
 Renovate PR. See the audit for the exact UI change.

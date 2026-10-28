@@ -45,6 +45,7 @@ service's global `_registry_lock` and UI requests never wait on a crawl.
 | `LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY`, `LLM_TIMEOUT` | both | Existing chat endpoint, reused for Ask and the topic survey. |
 | `SYNC_INTERVAL_SEC` | indexer | Background delta scan cadence per filespace. Default 300. |
 | `INDEX_MAX_FILE_BYTES` | indexer | Skip larger files. Default 25 MB. |
+| `LUCIDLINK_CACHE_DATA_GB`, `LUCIDLINK_CACHE_METADATA_GB` | both | SDK cache maximums per linked filespace, in GiB. Default 5 and 1 (see "SDK notes"). |
 
 ## Owner auth (Option A: existing Supabase sign-in)
 
@@ -145,20 +146,25 @@ unreachable or has nothing indexed.
 ## Change detection
 
 A scan lists metadata only and never downloads a file to find out whether it
-changed. SDK 0.14's `fs.read_dir` does **not** expose `file_id` (it is `""` on
-every entry) and its `mtime` may use different units from `fs.get_entry`'s, so
-identity comes from `get_entry`, and only when needed.
+changed. SDK 1.0's `file_system.read_dir` returns each entry's stable id
+(`FsEntry.id`, the ledger's `file_id`) and `modified_at` (ns), the same values
+`get_entry` reports, so a scan normally needs one call per directory and none
+per file. (SDK 0.14's `read_dir` returned `file_id=""` for every entry, so
+identity had to come from a `get_entry` per new or changed file; that path is
+kept as a fallback for any entry listed without an id.)
 
-1. **Scan** breadth-first with `fs.read_dir`, skipping hidden and system folders
-   (same list as the web app). Each scan has an id; every file seen is stamped
-   with it.
+1. **Scan** breadth-first with `file_system.read_dir`, skipping hidden and
+   system folders (same list as the web app; `.lucid_audit` is hidden). Each
+   scan has an id; every file seen is stamped with it.
 2. **Fast path by path** — the ledger keeps the `(size, mtime)` read_dir last
    reported for each path (`list_size`, `list_mtime`). A live row at the same
-   path with equal listing values is unchanged: no further call, so an unchanged
-   rescan is `read_dir` only. Otherwise `fs.get_entry(path)` supplies the stable
-   `file_id` and authoritative `(size, mtime)`, and steps 3–5 apply. An entry
-   without a `file_id`, or a failed `get_entry`, makes the scan incomplete
-   (nothing is deleted) and is never written to the ledger.
+   path with equal listing values, and the same `file_id` as the listing, is
+   unchanged: no further call, so an unchanged rescan is `read_dir` only.
+   Otherwise the listed id and `(size, mtime)` are used directly and steps 3–5
+   apply. Only an entry listed without an id costs a `get_entry(path)` for the
+   id and authoritative `(size, mtime)`. An entry with no `file_id` from either,
+   or a failed `get_entry`, makes the scan incomplete (nothing is deleted) and
+   is never written to the ledger.
 3. **New or changed** — no ledger row for the `file_id`, or `(size, mtime)`
    differs → queued. Newest `mtime` first, so a fresh filespace is useful within
    minutes.
@@ -222,3 +228,65 @@ After a sync that changed something, and at most every 10 minutes, the indexer
 regenerates the root-scope survey for that filespace with the same probes and
 prompt the edge function used, and stores it. Discover opens instantly from
 the stored survey; "Refresh topics" forces a regeneration.
+
+## SDK notes
+
+Both services pin `lucidlink==1.0.1` (docker/requirements.txt; Python >= 3.11,
+x86_64 wheel only, hence `--platform=linux/amd64`). What the 0.14 -> 1.0
+migration changed for this code:
+
+- **Client and links.** `client.workspace` (one per service-account token)
+  replaces `list_workspaces()`/`get_workspace()`. Filespaces are linked by id
+  with `workspace.link_filespace(id, cache=CacheConfig(data_size=...,
+  metadata_size=...))`; `filespace.file_system` replaces `.fs`. A Client is
+  not thread safe ("do not use it, or the objects obtained from it, from
+  several threads at the same time"), hence the file service's
+  `_registry_lock` and the indexer's per-Client lock: indexer jobs on two
+  filespaces of one workspace take turns. `unlink()` and `close()` now raise on failure; both
+  registries log and carry on (`_release`).
+- **Caches.** Each linked filespace has its own data and metadata cache, grown
+  on demand up to a maximum. 0.14 defaulted to 25 GiB + 5 GiB per link, 1.0 to
+  5 GiB + 1 GiB; both services now set it explicitly from
+  `LUCIDLINK_CACHE_DATA_GB` / `LUCIDLINK_CACHE_METADATA_GB` (ll_cache.py,
+  default 5 and 1). Worst case per service: clients x links x (data +
+  metadata), 2 x 2 x 6 GiB for the indexer with the defaults. `/version`
+  reports the values under `limits.cache_bytes_per_link`.
+- **Entries.** `FsEntry` has `id`, `modified_at`, `created_at` (ns) and
+  `inode_id`; `is_dir`/`is_file`/`is_symlink` are properties; symlinks are
+  `type == "symlink"` (was `"link"`). `id` is per entry (hard links differ);
+  the ledger keys on it.
+- **Reads.** The indexer reads through `file_system.open(path, "rb")` (what
+  `FsUtils.read_bytes` does). `statistics()` replaces `get_statistics()` and no
+  longer reports file/directory/symlink counts or data size: the file
+  service's `/filespaces/{name}/stats` returns null for those keys and adds
+  `entriesCount`.
+- **Errors.** Typed errors in `lucidlink.exceptions`; the file service maps
+  authentication (401), access (403), filespace not found (404), rate limiting
+  (429) and service unavailable (503) by type, and still redacts the token
+  from every message it echoes.
+- **No change feed.** 1.0 has no public watch API. The filespace audit trail
+  (`/.lucid_audit/...`, admin-enabled, admin-readable) is the pull-based
+  alternative if scans ever become too slow.
+
+What the web app sees (file service HTTP API; routes unchanged):
+
+- `GET /filespaces/{name}/stats`: `fileCount`, `dirCount`, `symlinkCount`,
+  `dataSize`, `entriesSize` are null; new `entriesCount`.
+- `GET /filespaces`: `created` is still an ISO 8601 string (now always
+  `...Z`).
+- `/connect/datastores`: `kind` is `"s3"` / `"http_link"` (was
+  `"S3DataStore"`), `keyId` is null, HTTP-link stores appear with null S3
+  fields; when Connect is unavailable the list answers
+  `{"available": false, "dataStores": []}` instead of an error.
+- `POST /connect/link-url` takes an optional `dataStore` (format 3.8+; default
+  `LUCIDLINK_HTTP_LINK_STORE`, "http-links", created on first use).
+- `GET /connect/external-files`: `cursor` is an integer offset as a string;
+  pass back what the previous page returned.
+- `DELETE /connect/link` refuses (400) a path that is not an external file of
+  a data store; 3.6 HTTP links have no store and are deleted with
+  `DELETE /files`.
+- File mutations answer 404 / 409 / 400 / 403 for a missing path, an existing
+  destination or non-empty directory, a file/directory mix-up, or a denied
+  path, instead of 500. Read routes still answer 404 for any failure.
+- `GET /version` adds `limits.cache_bytes_per_link`; the OpenAPI version is the
+  SDK's (`1.0.1`).
