@@ -104,9 +104,16 @@ services:
       - BLOCK_SOURCE_WORKSPACE=${BLOCK_SOURCE_WORKSPACE:-}
     volumes:
       - lucidlink-data:/data
-      # A NAS share / drive indexed in place, read-only. Unset: an empty
-      # placeholder is mounted and nothing is indexed.
+      # Up to six folders (NAS shares, drives, iCloud Drive, Desktop) indexed
+      # in place, each in its own read-only slot so the container sees only
+      # those folders. Unset slots mount an empty placeholder. Name them in
+      # BLOCK_SOURCES, e.g. "UGREEN-personal=/block/source1;iCloud=/block/source4".
       - ${BLOCK_SOURCE_PATH:-./block-empty}:/block/source1:ro
+      - ${BLOCK_SOURCE_PATH_2:-./block-empty}:/block/source2:ro
+      - ${BLOCK_SOURCE_PATH_3:-./block-empty}:/block/source3:ro
+      - ${BLOCK_SOURCE_PATH_4:-./block-empty}:/block/source4:ro
+      - ${BLOCK_SOURCE_PATH_5:-./block-empty}:/block/source5:ro
+      - ${BLOCK_SOURCE_PATH_6:-./block-empty}:/block/source6:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
       interval: 30s
