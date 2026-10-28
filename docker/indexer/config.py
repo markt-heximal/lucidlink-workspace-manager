@@ -65,6 +65,10 @@ class Config:
     # Full rescans wait at least this many times the last scan's duration, so
     # a filespace whose metadata walk takes minutes is not walked back to back.
     scan_interval_factor: float = 5.0
+    # Connected block storage (In Place, Phase A): "name=/container/path;…"
+    # and the workspace they belong to ("" = the vault's active workspace).
+    block_sources: str = ""
+    block_source_workspace: str = ""
 
     @property
     def llm_configured(self) -> bool:
@@ -96,4 +100,6 @@ class Config:
             max_linked_filespaces=links,
             max_clients=_int("INDEX_MAX_CLIENTS", 2, floor=1),
             job_budget_sec=_float("INDEX_JOB_BUDGET_SEC", 120.0),
+            block_sources=os.environ.get("BLOCK_SOURCES", "").strip(),
+            block_source_workspace=os.environ.get("BLOCK_SOURCE_WORKSPACE", "").strip(),
         )

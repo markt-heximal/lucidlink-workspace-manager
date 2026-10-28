@@ -8,6 +8,8 @@ run the whole thing against an in-memory filespace, a fake embedder and
 from __future__ import annotations
 
 import logging
+import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,6 +17,7 @@ import httpx
 
 from . import ask as ask_mod
 from . import survey as survey_mod
+from .block import KIND_LUCIDLINK, TYPES, RoutingSourceProvider, type_of
 from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
@@ -29,6 +32,11 @@ SNIPPET_CHARS = 300
 
 
 RECENT_MAX = 200
+
+DAY = 86400.0
+# GET /index/profile age buckets: (key, max age in days), exclusive, oldest last.
+AGE_BUCKETS = (("7d", 7), ("30d", 30), ("90d", 90), ("older", None))
+LARGEST_FOLDERS = 10
 
 
 def mtime_seconds(v: Optional[int]) -> Optional[float]:
@@ -91,6 +99,10 @@ class IndexerService:
                                     transport=ruvector_transport)
         self.vectors = VectorService(self.store, LocalIndex(self.store, self.embedder.model), mirror)
         self.scheduler = Scheduler(self)
+        # Block keys get a LocalSource; everything else the filespace provider
+        # (looked up per lease, so `self.sources` can be swapped in tests).
+        self.router = RoutingSourceProvider(lambda ws, fs: self.scheduler.block_root(ws, fs),
+                                            lambda: self.sources)
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -128,6 +140,10 @@ class IndexerService:
             return {(ws, filespace)}
         return {k for k in self.scheduler.targets() if k[0] == ws and self.scheduler.enabled(*k)}
 
+    def kinds(self) -> dict[tuple[str, str], str]:
+        """(workspace, filespace) -> "lucidlink" | "block", from the ledger."""
+        return self.store.kinds()
+
     # ------------------------------------------------------------ status
     def filespace_status(self, ws: str, fs: str) -> dict:
         row = self.store.filespace_row(ws, fs) or {}
@@ -136,6 +152,7 @@ class IndexerService:
         return {
             "workspaceId": ws,
             "filespace": fs,
+            "kind": row.get("kind") or KIND_LUCIDLINK,
             "enabled": enabled,
             "state": self.scheduler.state(ws, fs),
             "lastScanAt": row.get("last_scan_at"),
@@ -144,7 +161,9 @@ class IndexerService:
             if enabled else None,
             "files": self.store.file_counts(ws, fs),
             "chunks": self.store.chunk_count(ws, fs),
-            "lastError": row.get("last_error"),
+            # A refused block source with this name shows here too (the
+            # filespace itself keeps working).
+            "lastError": row.get("last_error") or self.scheduler.block_conflict(ws, fs),
             "progress": dict(rt.progress),
             "surveyError": rt.survey_error,
         }
@@ -154,6 +173,7 @@ class IndexerService:
             "filespaces": [self.filespace_status(ws, fs) for ws, fs in self.scheduler.targets()],
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
+            "blockSources": list(self.scheduler.block_sources),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
         }
 
@@ -189,6 +209,7 @@ class IndexerService:
         q = self.embedder.embed_query(query)
         hits = self.vectors.search(q, max(1, min(k, 200)), scopes, path_prefix)
         rows = self.store.chunk_rows([pid for pid, _ in hits])
+        kinds = self.kinds()
         out = []
         for pid, score in hits:
             r = rows.get(pid)
@@ -196,7 +217,8 @@ class IndexerService:
                 continue
             text = " ".join(r["text"].split())
             out.append({
-                "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"],
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+                "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
                 "chunkIndex": r["chunk_index"], "score": round(score, 4),
                 "snippet": text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else ""),
                 "mtime": mtime_iso(r["mtime"]),
@@ -213,6 +235,7 @@ class IndexerService:
         """
         limit = max(1, min(int(limit), RECENT_MAX))
         scopes = sorted(self.scopes(workspace_id, filespace))
+        kinds = self.kinds()
         seen: set[tuple[str, str, str]] = set()
         items: list[tuple[float, dict]] = []
         for r in self.store.recent_files(scopes, limit):
@@ -224,13 +247,53 @@ class IndexerService:
             by_change = r["status"] == "deleted" or kind == "renamed"
             when = (_iso_seconds(r.get("changed_at")) if by_change else None) or mtime_seconds(r["mtime"]) or 0.0
             items.append((when, {
-                "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"],
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+                "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
                 "size": r["size"], "mtime": mtime_iso(r["mtime"]), "status": r["status"],
                 "indexedAt": r.get("indexed_at"), "change": kind, "changedAt": r.get("changed_at"),
                 "previousPath": r.get("prev_path"),
             }))
         items.sort(key=lambda it: (-it[0], it[1]["path"]))
         return [it[1] for it in items[:limit]]
+
+    def profile(self, workspace_id: Optional[str], filespace: str, now: Optional[float] = None) -> dict:
+        """What a source holds, from the ledger only (nothing is read from the source)."""
+        ws = self.resolve_workspace(workspace_id)
+        row = self.store.filespace_row(ws, filespace) if ws else None
+        if row is None:
+            raise NotFound(f"'{filespace}' is not indexed")
+        now = time.time() if now is None else now
+        by_type = {t: {"type": t, "files": 0, "bytes": 0} for t in TYPES}
+        ages = {key: 0 for key, _ in AGE_BUCKETS}
+        folders: dict[str, dict] = defaultdict(lambda: {"files": 0, "bytes": 0})
+        files = total = 0
+        for f in self.store.live_file_stats(ws, filespace):
+            size = int(f["size"] or 0)
+            files += 1
+            total += size
+            t = by_type[type_of(f["path"].rsplit("/", 1)[-1])]
+            t["files"] += 1
+            t["bytes"] += size
+            secs = mtime_seconds(f["mtime"])
+            age = (now - secs) / DAY if secs else float("inf")
+            ages[next(k for k, days in AGE_BUCKETS if days is None or age <= days)] += 1
+            parts = [p for p in f["path"].split("/") if p][:-1]
+            if parts:   # files directly in the root belong to no folder
+                top = folders["/" + parts[0]]
+                top["files"] += 1
+                top["bytes"] += size
+        largest = sorted(folders.items(), key=lambda kv: (-kv[1]["bytes"], kv[0]))[:LARGEST_FOLDERS]
+        return {
+            "workspaceId": ws, "filespace": filespace, "kind": row.get("kind") or KIND_LUCIDLINK,
+            "totals": {"files": files, "bytes": total},
+            "byType": sorted((t for t in by_type.values() if t["files"]),
+                             key=lambda t: (-t["bytes"], TYPES.index(t["type"]))),
+            "ages": ages,
+            "largestFolders": [{"path": p, **v} for p, v in largest],
+            "skipped": [{"reason": r["reason"] or "skipped", "files": r["files"]}
+                        for r in self.store.skipped_reasons(ws, filespace)],
+            "lastScanAt": row.get("last_scan_at"),
+        }
 
     def ask(self, workspace_id: Optional[str], filespace: Optional[str], question: str, k: int = 12) -> dict:
         return ask_mod.answer(self, self.scopes(workspace_id, filespace), question, k)

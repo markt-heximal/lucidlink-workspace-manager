@@ -36,6 +36,9 @@ CREATE TABLE IF NOT EXISTS filespaces (
     last_sync_at TEXT,
     last_error   TEXT,
     last_scan_id INTEGER NOT NULL DEFAULT 0,
+    -- "lucidlink" (a filespace, read through the SDK) | "block" (a connected
+    -- block storage folder, read in place).
+    kind         TEXT NOT NULL DEFAULT 'lucidlink',
     PRIMARY KEY (workspace_id, filespace)
 );
 CREATE TABLE IF NOT EXISTS files (
@@ -132,6 +135,9 @@ class Store:
         self._generation = 0
 
     def _migrate(self) -> None:
+        fs_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(filespaces)").fetchall()}
+        if "kind" not in fs_cols:
+            self._conn.execute("ALTER TABLE filespaces ADD COLUMN kind TEXT NOT NULL DEFAULT 'lucidlink'")
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(files)").fetchall()}
         for col in ("list_size", "list_mtime"):
             if col not in cols:
@@ -201,6 +207,15 @@ class Store:
         self.ensure_filespace(ws, fs)
         self.execute("UPDATE filespaces SET enabled=?, enabled_override=1 "
                      "WHERE workspace_id=? AND filespace=?", (int(enabled), ws, fs))
+
+    def set_filespace_kind(self, ws: str, fs: str, kind: str) -> None:
+        self.ensure_filespace(ws, fs)
+        self.execute("UPDATE filespaces SET kind=? WHERE workspace_id=? AND filespace=? AND kind != ?",
+                     (kind, ws, fs, kind))
+
+    def kinds(self) -> dict[tuple[str, str], str]:
+        return {(r["workspace_id"], r["filespace"]): r["kind"]
+                for r in self.query("SELECT workspace_id, filespace, kind FROM filespaces")}
 
     def update_filespace(self, ws: str, fs: str, **cols) -> None:
         if not cols:
@@ -304,6 +319,15 @@ class Store:
                               "AND (status = 'deleted' OR change_kind = 'renamed') "
                               "ORDER BY changed_at DESC LIMIT ?", (ws, fs, limit))
         return out
+
+    def live_file_stats(self, ws: str, fs: str) -> list[dict]:
+        """(path, size, mtime) of every live file, for GET /index/profile."""
+        return self.query("SELECT path, size, mtime FROM files WHERE workspace_id=? AND filespace=? "
+                          "AND status != 'deleted'", (ws, fs))
+
+    def skipped_reasons(self, ws: str, fs: str) -> list[dict]:
+        return self.query("SELECT reason, COUNT(*) AS files FROM files WHERE workspace_id=? AND filespace=? "
+                          "AND status='skipped' GROUP BY reason ORDER BY files DESC, reason", (ws, fs))
 
     # ------------------------------------------------------------ chunks
     def file_chunks(self, ws: str, fs: str, file_id: str) -> list[dict]:

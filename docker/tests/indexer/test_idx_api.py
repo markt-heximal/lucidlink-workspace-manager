@@ -108,7 +108,8 @@ def test_search_across_filespaces_and_path_prefix(make_service):
         res = c.post("/index/search", json={"query": "garden roses"}, headers=H).json()["results"]
         assert {r["filespace"] for r in res} == {"fsA", "fsB"}
         r0 = res[0]
-        assert set(r0) == {"workspaceId", "filespace", "path", "chunkIndex", "score", "snippet", "mtime"}
+        assert set(r0) == {"workspaceId", "filespace", "path", "chunkIndex", "score", "snippet", "mtime", "kind"}
+        assert r0["kind"] == "lucidlink"
         assert 0 <= r0["score"] <= 1 and r0["mtime"].endswith("Z")
         assert res == sorted(res, key=lambda r: -r["score"])
 
@@ -154,7 +155,8 @@ def test_ask_answers_with_citations(make_service):
     assert body["answer"] == "Rent is 1200 (see /money/budget.md)."
     assert body["sources"][0] == "/money/budget.md"
     assert body["citations"][0]["path"] == "/money/budget.md"
-    assert set(body["citations"][0]) == {"path", "chunkIndex", "score"}
+    assert set(body["citations"][0]) == {"path", "chunkIndex", "score", "kind"}
+    assert body["citations"][0]["kind"] == "lucidlink"
     sent = calls[-1]          # calls[0] is the post-sync survey
     assert sent["stream"] is True
     assert "PATH: /money/budget.md" in sent["messages"][1]["content"]
