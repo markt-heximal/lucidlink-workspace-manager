@@ -48,6 +48,10 @@ from .store import Store, now_iso
 
 logger = logging.getLogger("indexer.scanner")
 
+# Identifies ids recorded from SDK 1.0 listings (FsEntry.id). SDK 0.14 ids came
+# from get_entry's file_id; see FilespaceIndexer.scan for the one-time re-key.
+ID_SCHEME = "sdk1-entry-id"
+
 # Same list as the web app's walkFilespace (src/features/docs/lib/filespace.ts);
 # any name starting with "." is skipped as well.
 SKIP_DIRS = {"node_modules", ".git", ".cache", ".trash", ".tmp", "$RECYCLE.BIN",
@@ -99,6 +103,7 @@ class ScanResult:
     changed: int = 0
     renamed: int = 0
     deleted: int = 0
+    rekeyed: int = 0
     failed_dirs: list[str] = field(default_factory=list)
     failed_files: list[str] = field(default_factory=list)
     stats: int = 0          # get_entry calls made
@@ -129,6 +134,7 @@ class FilespaceIndexer:
                  embedder: Embedder, config: Config):
         self.store = store
         self.source = source
+        self._rekey = False  # set per scan; see scan()
         self.ws = workspace_id
         self.fs = filespace
         self.embedder = embedder
@@ -213,6 +219,11 @@ class FilespaceIndexer:
         root = normpath(root)
         scan_id = self.store.next_scan_id(self.ws, self.fs)
         res = ScanResult(scan_id=scan_id, root=root)
+        # Re-keying (same path, size and listing mtime under a new id) is only
+        # allowed until one complete scan under the SDK 1.0 id scheme; after
+        # that a new id at an old path really is a new file.
+        fs_row = self.store.filespace_row(self.ws, self.fs) or {}
+        self._rekey = fs_row.get("id_scheme") != ID_SCHEME
         if root != "/" and hidden_path(root + "/x"):
             return res
         queue = deque([root])
@@ -235,7 +246,8 @@ class FilespaceIndexer:
         if prune and res.complete:
             res.deleted = self._prune(root, scan_id)
         if root == "/":
-            self.store.update_filespace(self.ws, self.fs, last_scan_at=now_iso())
+            done = {"id_scheme": ID_SCHEME} if res.complete else {}
+            self.store.update_filespace(self.ws, self.fs, last_scan_at=now_iso(), **done)
         return res
 
     def _listed_file(self, path: str, list_size: int, list_mtime: int, scan_id: int, res: ScanResult,
@@ -243,8 +255,17 @@ class FilespaceIndexer:
         """One file from read_dir: fast path by path; else observe with the
         listed id, or get_entry + observe when the listing had no id."""
         for row in self.store.live_files_at_path(self.ws, self.fs, path):
-            if (row["list_size"] == list_size and row["list_mtime"] == list_mtime
-                    and (not list_id or row["file_id"] == list_id)):
+            same_listing = row["list_size"] == list_size and row["list_mtime"] == list_mtime
+            if (self._rekey and same_listing and list_id and row["file_id"] != list_id
+                    and self.store.get_file(self.ws, self.fs, list_id) is None):
+                # Same path, size and listing mtime under a different id: the
+                # same file seen through a different id scheme (the 0.14 ->
+                # 1.0 SDK upgrade). Re-key it rather than re-read everything.
+                self.store.rekey_file(self.ws, self.fs, row["file_id"], list_id)
+                self.store.mirror_forget_file(self.ws, self.fs, list_id)  # metadata carries fileId
+                res.rekeyed += 1
+                row = dict(row, file_id=list_id)
+            if same_listing and (not list_id or row["file_id"] == list_id):
                 res.seen += 1
                 cols: dict = {"scan_id": scan_id}
                 if row["status"] == "failed" and self._retry_due(row):

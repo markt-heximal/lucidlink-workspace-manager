@@ -251,8 +251,8 @@ class Scheduler:
                     res = idx.scan("/")
                     scan_took = time.monotonic() - scan_started
                     logger.info("[%s/%s] scan %d: seen=%d new=%d changed=%d renamed=%d deleted=%d "
-                                "get_entry=%d%s", ws, fs, res.scan_id, res.seen, res.new, res.changed,
-                                res.renamed, res.deleted, res.stats,
+                                "get_entry=%d rekeyed=%d%s", ws, fs, res.scan_id, res.seen, res.new, res.changed,
+                                res.renamed, res.deleted, res.stats, res.rekeyed,
                                 "" if res.complete else f" INCOMPLETE {(res.failed_dirs + res.failed_files)[:5]}")
                     if not res.complete:
                         failed = res.failed_dirs + res.failed_files

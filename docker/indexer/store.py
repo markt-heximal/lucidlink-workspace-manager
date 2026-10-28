@@ -139,6 +139,10 @@ class Store:
         for col in ("change_kind", "changed_at", "prev_path"):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE files ADD COLUMN {col} TEXT")
+        fs_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(filespaces)").fetchall()}
+        if "id_scheme" not in fs_cols:
+            # NULL: ids were recorded by SDK 0.14 (or the filespace is new).
+            self._conn.execute("ALTER TABLE filespaces ADD COLUMN id_scheme TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -428,6 +432,14 @@ class Store:
 
     def mirror_clear(self, collection: str) -> None:
         self.execute("DELETE FROM mirror_points WHERE collection=?", (collection,))
+
+    def rekey_file(self, ws: str, fs: str, old_id: str, new_id: str) -> None:
+        """Give a file (and its chunks) a new id, keeping its embeddings."""
+        with self.tx() as c:
+            c.execute("UPDATE files SET file_id=? WHERE workspace_id=? AND filespace=? AND file_id=?",
+                      (new_id, ws, fs, old_id))
+            c.execute("UPDATE chunks SET file_id=? WHERE workspace_id=? AND filespace=? AND file_id=?",
+                      (new_id, ws, fs, old_id))
 
     def mirror_forget_file(self, ws: str, fs: str, file_id: str) -> None:
         """Make a file's live points look unmirrored so metadata is re-upserted."""
