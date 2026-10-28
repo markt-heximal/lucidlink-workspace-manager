@@ -212,9 +212,47 @@ filespace collapse into one full scan. A full delta scan runs every
 
 Plain text (`md, markdown, txt, log, csv, tsv, json, xml, yml, yaml, rtf`),
 HTML (tags stripped), DOCX, PPTX and XLSX (stdlib `zipfile` + XML), PDF
-(`pypdf`). Larger than `INDEX_MAX_FILE_BYTES`, binary, or unextractable →
-`skipped` with a reason. Chunking matches the web app's `chunkText`: 1200
-characters, 150 overlap, breaking on newline or sentence end.
+(`pypdf`), and Apple iWork `pages`, `numbers`, `key` (below). Larger than
+`INDEX_MAX_FILE_BYTES`, binary, or unextractable → `skipped` with a reason.
+Chunking matches the web app's `chunkText`: 1200 characters, 150 overlap,
+breaking on newline or sentence end.
+
+**iWork** (`docker/indexer/iwork.py`, pure Python, no extra dependencies).
+A document is either a single-file zip or a *package*: a folder named
+`X.pages` / `X.numbers` / `X.key`. Text is taken, in order of preference, from:
+
+1. `Index/*.iwa` (also inside a nested `Index.zip`): Apple's snappy framing
+   (`[0x00][3-byte LE length][raw snappy block]`, no CRC) decoded by a bounded
+   pure-Python snappy decoder, then each archive's protobuf payloads walked
+   generically. Length-delimited fields are read as nested messages or, when
+   they look like human text, kept as text (`human_text` holds every
+   heuristic: printable, has letters, not a UUID / hex / reverse-DNS id /
+   MIME type / locale / file name / font or style name). `Document.iwa`
+   comes first, then the other archives in natural name order; stylesheet,
+   metadata, view-state, calculation-engine and master-slide archives are
+   skipped. Consecutive repeats collapse; the text is capped like any other.
+2. iWork '09 `index.xml(.gz)` / `index.apxl(.gz)`, tags stripped.
+3. `QuickLook/Preview.pdf` through the PDF extractor.
+
+Otherwise the file is `skipped` with "iWork document with no readable text".
+Expected to be recovered (not yet checked on real files): body text, headers/footers, text boxes and shapes, comments,
+Numbers sheet/table names and text cells, Keynote slide text and presenter
+notes. Not recovered: Numbers numeric, date and formula cells (stored as
+binary cell data), chart data, and text in images. Keynote slides follow
+archive name order, which is not always presentation order.
+
+A package is **one file**: the scan never recurses into it. Its size is the
+sum of the contained file sizes and its mtime the newest contained mtime,
+from a bounded listing-only walk (5000 entries, 8 levels; dot-names
+ignored), and these walk values are what the fast path compares, so an
+unchanged package costs a few listings and no reads. Its id is the folder's
+own `get_entry` id (a path id on block sources); an empty id makes the scan
+incomplete, as for files. A package that fails to list makes the scan
+incomplete, never a deletion. To extract, only `Index/**`, `index.xml*`,
+`index.apxl*`, `Index.zip` and (when it still fits) `QuickLook/Preview.pdf`
+are read, at most `INDEX_MAX_FILE_BYTES` in all, into a deterministic
+in-memory zip that goes through the same extractor; previews and `Data/` are
+never read. Hints for a path inside a package apply to the package.
 
 ## Storage and the vector index
 

@@ -2,7 +2,8 @@
 
 Formats: the text family the web app indexed (md, txt, csv, json, …), HTML with
 tags stripped, DOCX / PPTX / XLSX read straight from their OOXML parts with
-`zipfile` + ElementTree (no python-docx etc. in the image), and PDF via pypdf.
+`zipfile` + ElementTree (no python-docx etc. in the image), PDF via pypdf, and
+Apple iWork (Pages / Numbers / Keynote, see iwork.py) from their zip form.
 
 Anything else, anything binary, or anything that fails to parse comes back as
 a skip with a human-readable reason that ends up in the ledger and in status.
@@ -20,13 +21,16 @@ from html.parser import HTMLParser
 from typing import Optional
 from xml.etree import ElementTree as ET
 
+from . import iwork
+
 logger = logging.getLogger("indexer.extract")
 
 TEXT_EXTS = {"md", "markdown", "txt", "log", "csv", "tsv", "json", "xml", "yml", "yaml", "rtf"}
 HTML_EXTS = {"html", "htm"}
 OFFICE_EXTS = {"docx", "pptx", "xlsx"}
 PDF_EXTS = {"pdf"}
-SUPPORTED_EXTS = TEXT_EXTS | HTML_EXTS | OFFICE_EXTS | PDF_EXTS
+IWORK_EXTS = set(iwork.IWORK_EXTS)
+SUPPORTED_EXTS = TEXT_EXTS | HTML_EXTS | OFFICE_EXTS | PDF_EXTS | IWORK_EXTS
 
 # Extracted text beyond this is truncated (a 25 MB CSV is mostly noise for RAG).
 MAX_TEXT_CHARS = 2_000_000
@@ -67,6 +71,11 @@ def extract(name: str, data: bytes) -> Extracted:
             text = _office(ext, data)
         elif ext in PDF_EXTS:
             text = _pdf(data)
+        elif ext in IWORK_EXTS:
+            try:
+                text = iwork.extract_text(data, _pdf, MAX_TEXT_CHARS)
+            except iwork.NoText as e:
+                return Extracted(skip_reason=str(e))
         else:
             return Extracted(skip_reason=f"unsupported type (.{ext})" if ext else "unsupported type")
     except _Skip as s:
