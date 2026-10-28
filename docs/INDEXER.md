@@ -241,3 +241,56 @@ After a sync that changed something, and at most every 10 minutes, the indexer
 regenerates the root-scope survey for that filespace with the same probes and
 prompt the edge function used, and stores it. Discover opens instantly from
 the stored survey; "Refresh topics" forces a regeneration.
+
+## Connected block storage (In Place, Phase A)
+
+The bridge from the AI Lab's "LucidLink In Place" concept, first phase: a folder
+on block storage (a NAS share, external drive or local disk) is indexed **where
+it lives**, read-only, with 0 bytes moved, and becomes searchable and askable
+next to the filespaces. Check-out to LucidLink and check-in are later phases.
+
+**Mounting.** The share is mounted on the Mini (e.g. `/Volumes/<share>`) and
+bind-mounted into the indexer container **read-only** (`:ro`), so the container
+cannot write to it whatever the code does.
+
+| Variable | Meaning |
+|---|---|
+| `BLOCK_SOURCE_PATH` | Host path of the share, e.g. `/Volumes/Projects`. Mounted at `/block/source1:ro`. Unset: an empty placeholder folder is mounted and nothing is indexed. |
+| `BLOCK_SOURCES` | `name=/container/path` entries separated by `;`, e.g. `NAS=/block/source1`. Empty: no block sources. |
+| `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to (they appear in that workspace's "all filespaces" search). Default: the vault's active workspace. |
+
+**Keys.** A block source is a target `(workspaceId, name)` like a filespace,
+with `kind: "block"`. A name that collides with a filespace in that workspace
+is refused (recorded as `lastError`). Enable/disable, sync, status, search,
+ask, survey and recent work unchanged. Hints never apply (the file service
+never writes there).
+
+**Reading.** `LocalSource` lists with `os.scandir` and reads files directly.
+It never follows symlinks, never leaves its root, and skips system folders and
+files (`.DS_Store`, `._*` AppleDouble files, `.Spotlight-V100`, `.Trashes`,
+`.fseventsd`, `#recycle`, `@eaDir`, `.TemporaryItems`, plus the existing skip
+list). `mtime` is `st_mtime_ns`.
+
+**File ids.** Inode numbers through SMB and OrbStack file sharing are not
+guaranteed stable across restarts, so a block file's id is
+`"p:" + sha1(relative path)`. A rename is then a delete plus a new file; the
+embedding cache (by chunk text hash) means it is re-read but not re-embedded.
+
+**API additions (all sources).**
+
+- `FilespaceStatus` gains `"kind": "lucidlink" | "block"`.
+- Search results, recent files and ask citations gain `"kind"`.
+- `GET /index/profile?workspaceId&filespace` — what the source holds, from the
+  ledger only (no reads):
+  ```json
+  {"workspaceId": "default", "filespace": "NAS", "kind": "block",
+   "totals": {"files": 1234, "bytes": 5678901},
+   "byType": [{"type": "document", "files": 120, "bytes": 3456}],
+   "ages": {"7d": 12, "30d": 40, "90d": 100, "older": 1082},
+   "largestFolders": [{"path": "/Clients/Harbor", "files": 300, "bytes": 123456}],
+   "skipped": [{"reason": "unsupported type (.mov)", "files": 400}],
+   "lastScanAt": "ISO|null"}
+  ```
+  Types follow the AI Lab's classes: document, spreadsheet, presentation, pdf,
+  image, design, audio, video, code, archive, project, other. `largestFolders`
+  is the top 10 folders one level below the root by bytes.
