@@ -94,6 +94,13 @@ def is_package(name: str) -> bool:
     return is_iwork_name(name) and not skip_dir(name)
 
 
+def package_id(path: str, entry_id: str) -> str:
+    """A package's ledger id: the folder's own id, or a path-based one when the
+    source gives folders no id. Without the fallback, an id-less package would
+    mark every scan incomplete and silently stop deletions for the filespace."""
+    return entry_id or "pkg:" + hashlib.sha1(path.encode("utf-8")).hexdigest()
+
+
 def package_root(path: str) -> Optional[str]:
     """The package containing `path` (strictly inside it), or None."""
     parts = [p for p in (path or "").split("/") if p]
@@ -342,7 +349,7 @@ class FilespaceIndexer:
         if package:
             # A package's (size, mtime) only exist as walk values; get_entry
             # supplies its id. Packages use the same walk everywhere, so units agree.
-            self.observe(path, list_size, list_mtime, entry.file_id, scan_id, res,
+            self.observe(path, list_size, list_mtime, package_id(path, entry.file_id), scan_id, res,
                          list_size=list_size, list_mtime=list_mtime)
             return
         self.observe(path, entry.size, entry.mtime, entry.file_id, scan_id, res,
@@ -434,13 +441,15 @@ class FilespaceIndexer:
             except Exception as e:
                 logger.warning("[%s/%s] listing package %s failed: %s", self.ws, self.fs, path, e)
                 return False
-            self.observe(path, size, mtime, entry.file_id, res.scan_id, res, list_size=size, list_mtime=mtime)
+            fid = package_id(path, entry.file_id)
+            self.observe(path, size, mtime, fid, res.scan_id, res, list_size=size, list_mtime=mtime)
         else:
-            self.observe(path, entry.size, entry.mtime, entry.file_id, res.scan_id, res)
-        if entry.file_id:
+            fid = entry.file_id
+            self.observe(path, entry.size, entry.mtime, fid, res.scan_id, res)
+        if fid:
             # A write that replaced the file (new file_id) leaves the old row behind.
             for row in self.store.live_files_at_path(self.ws, self.fs, path):
-                if row["file_id"] != entry.file_id:
+                if row["file_id"] != fid:
                     self._tombstone(row)
         return res.complete
 

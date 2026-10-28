@@ -155,7 +155,7 @@ def test_deleted_package_is_tombstoned(make_service):
     assert files(svc) == {}
 
 
-def test_blank_package_id_makes_the_scan_incomplete(make_service):
+def test_blank_package_id_falls_back_to_a_path_id(make_service):
     svc = make_service()
     s = src(svc)
     s.write("/keep.md", para("keep"))
@@ -172,7 +172,12 @@ def test_blank_package_id_makes_the_scan_incomplete(make_service):
 
     s.stat = stat
     run(svc)
-    assert set(files(svc)) == {"/keep.md"}                     # no row without an id, nothing deleted
+    # A source that gives folders no id must not stall deletions: the package
+    # gets a path-based id, it is indexed, and the deleted file is pruned.
+    rows = files(svc)
+    assert set(rows) == {PKG}
+    assert rows[PKG]["file_id"].startswith("pkg:") and rows[PKG]["status"] == "indexed"
+    assert svc.store.filespace_row("ws1", "fsA")["last_error"] is None
 
 
 def test_hints_inside_a_package_resolve_to_the_package(make_service):
