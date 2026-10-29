@@ -118,6 +118,21 @@ CREATE TABLE IF NOT EXISTS block_folders (
     folder     TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+-- Drive prompts: top-level folders of a root seen so far (baseline = there at
+-- the first look, so never "new"), and block sources whose folder is missing.
+CREATE TABLE IF NOT EXISTS drives_seen (
+    root          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    baseline      INTEGER NOT NULL DEFAULT 0,
+    dismissed     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (root, name)
+);
+CREATE TABLE IF NOT EXISTS source_missing (
+    name      TEXT PRIMARY KEY,
+    since     TEXT NOT NULL,
+    dismissed INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS block_removed (
     name       TEXT PRIMARY KEY,
     removed_at TEXT NOT NULL
@@ -248,6 +263,31 @@ class Store:
 
     def add_block_removed(self, name: str, now: str) -> None:
         self.execute("INSERT OR REPLACE INTO block_removed (name, removed_at) VALUES (?, ?)", (name, now))
+
+    def drives_seen(self, root: str) -> dict[str, dict]:
+        return {r["name"]: r for r in self.query("SELECT * FROM drives_seen WHERE root=?", (root,))}
+
+    def add_drives_seen(self, root: str, names: list[str], now: str, baseline: bool) -> None:
+        with self.tx() as c:
+            c.executemany("INSERT OR IGNORE INTO drives_seen (root, name, first_seen_at, baseline) VALUES (?, ?, ?, ?)",
+                          [(root, n, now, int(baseline)) for n in names])
+
+    def dismiss_drive(self, root: str, name: str) -> bool:
+        return self.execute("UPDATE drives_seen SET dismissed=1 WHERE root=? AND name=? AND baseline=0",
+                            (root, name)) > 0
+
+    def missing_row(self, name: str) -> Optional[dict]:
+        return self.one("SELECT * FROM source_missing WHERE name=?", (name,))
+
+    def mark_missing(self, name: str, now: str) -> dict:
+        self.execute("INSERT OR IGNORE INTO source_missing (name, since) VALUES (?, ?)", (name, now))
+        return self.missing_row(name)
+
+    def clear_missing(self, name: str) -> None:
+        self.execute("DELETE FROM source_missing WHERE name=?", (name,))
+
+    def dismiss_missing(self, name: str) -> bool:
+        return self.execute("UPDATE source_missing SET dismissed=1 WHERE name=?", (name,)) > 0
 
     def purge_source(self, ws: str, fs: str) -> tuple[int, int]:
         """Forget everything indexed for one source: (files, chunks) deleted."""

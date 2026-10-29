@@ -489,6 +489,33 @@ under /Volumes too).
 "/Volumes/Projects"|null, "root": "volumes"|null, "folder": "/Projects"|null}`
 (`root`/`folder` only for `app` sources).
 
+### Drive prompts
+
+The app nudges, it never decides: a new drive is offered, a missing one is
+offered for removal, and nothing is connected or removed without a tap.
+
+- **New drive.** A folder at the top of the `volumes` root (a share or drive
+  mounted on the Mini) that appeared after the indexer first looked, that no
+  source is, is inside or contains, and that was not dismissed. The first look
+  (per database) records what is already there as known, so only later arrivals
+  count. A drive that is unmounted and comes back is not new again.
+- **Missing source.** A connected block source whose folder is missing, empty
+  or the placeholder, continuously for at least `FOLDER_MISSING_GRACE_SEC`
+  (default 900 s, so a NAS waking from sleep is not reported). It is never
+  removed automatically; while it is missing the indexer neither indexes nor
+  deletes anything for it. "Keep it" hides the prompt until the folder comes back
+  and goes missing again.
+
+Both are computed when the app asks (no background polling of drives).
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/index/folders/prompts` | — | `{"newDrives": [{"root": "volumes", "path": "/Archive-3", "name": "Archive-3", "hostPath": "/Volumes/Archive-3", "suggestedName": "Archive-3", "firstSeenAt": "ISO"}], "missing": [{"name", "origin", "hostPath", "root", "missingSince": "ISO"}]}` |
+| POST | `/index/folders/prompts/dismiss` | `{"kind": "new", "path": "/Archive-3"}` or `{"kind": "missing", "name"}` | `{"dismissed": true}`; 404 when there is no such prompt |
+
+Connecting a new drive is the normal `POST /index/folders`; forgetting a missing
+source is `POST /index/folders/remove`.
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is

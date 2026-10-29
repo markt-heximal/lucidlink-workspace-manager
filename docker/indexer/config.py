@@ -73,6 +73,8 @@ class Config:
     # directory, their folders on the Mini, and the Mini folders behind the
     # BLOCK_SOURCES slots (/block/sourceN), all as plain strings.
     block_root_base: str = "/host"
+    # Drive prompts: a connected folder counts as missing after this long.
+    folder_missing_grace_sec: float = 900.0
     block_root_hosts: dict = field(default_factory=dict)
     block_slot_hosts: dict = field(default_factory=dict)
 
@@ -108,6 +110,7 @@ class Config:
             job_budget_sec=_float("INDEX_JOB_BUDGET_SEC", 120.0),
             block_sources=os.environ.get("BLOCK_SOURCES", "").strip(),
             block_source_workspace=os.environ.get("BLOCK_SOURCE_WORKSPACE", "").strip(),
+            folder_missing_grace_sec=_float("FOLDER_MISSING_GRACE_SEC", 900.0),
             block_root_base=os.environ.get("BLOCK_ROOT_BASE", "/host").rstrip("/") or "/host",
             block_root_hosts={rid: os.environ.get(var, "").strip()
                               for rid, var in (("volumes", "BLOCK_ROOT_VOLUMES"), ("icloud", "BLOCK_ROOT_ICLOUD"),

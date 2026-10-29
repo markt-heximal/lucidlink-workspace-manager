@@ -105,6 +105,12 @@ class FolderBody(BaseModel):
     name: Optional[str] = Field(default=None, max_length=200)
 
 
+class PromptDismissBody(BaseModel):
+    kind: Literal["new", "missing"]
+    path: Optional[str] = None
+    name: Optional[str] = None
+
+
 class FolderRemoveBody(BaseModel):
     name: str = Field(min_length=1)
 
@@ -233,6 +239,17 @@ def add_folder(body: FolderBody, svc: IndexerService = Depends(_service)):
 @router.post("/folders/remove")
 def remove_folder(body: FolderRemoveBody, svc: IndexerService = Depends(_service)):
     return svc.remove_folder(body.name)
+
+
+@router.get("/folders/prompts")
+def folder_prompts(svc: IndexerService = Depends(_service)):
+    """New drives to offer and connected folders that have gone missing."""
+    return svc.folder_prompts()
+
+
+@router.post("/folders/prompts/dismiss")
+def dismiss_prompt(body: PromptDismissBody, svc: IndexerService = Depends(_service)):
+    return svc.dismiss_prompt(body.kind, body.path, body.name)
 
 
 @router.post("/folders/restart", status_code=202)
