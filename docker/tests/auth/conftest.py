@@ -35,6 +35,7 @@ def env(monkeypatch, tmp_path):
 @pytest.fixture
 def seeded_vault(env):
     import vault
+    # An older app build still sends MinIO fields; the vault drops them.
     vault.save({
         "workspaces": [
             {"id": "default", "label": "Default", "url": "https://a", "token": SA_TOKEN,
@@ -49,3 +50,31 @@ def seeded_vault(env):
         "activeMinioProfileId": "ugreen",
     })
     return vault
+
+
+LEGACY_FAVORITE = {"id": "f1", "workspaceId": "default", "filespace": "fs1", "kind": "lucidlink",
+                   "path": "/Clients", "addedAt": "2026-10-01T10:00:00Z"}
+
+
+@pytest.fixture
+def legacy_vault(env):
+    """A row written before Simplification phase 4: MinIO profiles stored encrypted."""
+    import json
+    import vault
+    payload = {
+        "workspaces": [{"id": "default", "label": "Default", "url": "https://a", "token": SA_TOKEN,
+                        "filespace": "fs1", "filespaces": ["fs1"]}],
+        "activeWorkspaceId": "default",
+        "minioProfiles": [
+            {"id": "ugreen", "accessKeyId": "AKIA123", "secretAccessKey": "minio-secret"},
+            {"id": "other", "accessKeyId": "AKIA456", "secretAccessKey": "minio-secret-2"},
+        ],
+        "activeMinioProfileId": "ugreen",
+        "favorites": [LEGACY_FAVORITE],
+    }
+    blob = vault._fernet().encrypt(json.dumps(payload).encode())
+    with vault._connect() as conn:
+        conn.execute("INSERT INTO vault (id, ciphertext, updated_at) VALUES (1, ?, ?)",
+                     (blob, "2026-01-01T00:00:00Z"))
+    vault._migrated.discard(vault._path())
+    return payload

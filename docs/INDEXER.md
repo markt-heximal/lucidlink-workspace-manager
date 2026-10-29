@@ -77,10 +77,7 @@ Payload shape (a subset of the web app's `ApiSettings`):
 {
   "workspaces": [{"id": "default", "label": "Default", "url": "https://…", "token": "sa_live:…",
                   "filespace": "my-app-bucket", "filespaces": ["my-app-bucket"]}],
-  "activeWorkspaceId": "default",
-  "minioProfiles": [{"id": "ugreen", "label": "…", "endpoint": "…", "region": "…",
-                     "accessKeyId": "…", "secretAccessKey": "…", "forcePathStyle": true}],
-  "activeMinioProfileId": "ugreen"
+  "activeWorkspaceId": "default"
 }
 ```
 
@@ -91,8 +88,16 @@ Masking: LucidLink `token` values are returned as `"<prefix>••••<last4>"
 (e.g. `sa_live:••••3f2a`), or `""` when empty. On `save`, a token that is
 omitted, empty-string-but-previously-set-and-flagged, or contains `••••` keeps
 the stored value; any other string replaces it. To clear a token the client
-sends `"token": null`. MinIO credentials are returned unmasked to the owner,
-because the in-browser S3 console needs them.
+sends `"token": null`.
+
+MinIO profiles are retired (Simplification phase 4): the payload no longer has
+`minioProfiles` or `activeMinioProfileId`. A PUT that still sends them (older
+app builds) is accepted and they are dropped unread, never a 400. Any stored
+copy is purged from the encrypted row on the next write, and proactively by
+`purge_retired()`, which the file service runs once at startup and before its
+first `/vault/settings` or `/vault/favorites` read (`ensure_migrated()`). The
+purge re-encrypts the row without them, keeps workspaces, tokens, favorites and
+`updatedAt` as stored, and logs only the number of profiles removed.
 
 HTTP (file service, owner only):
 
@@ -660,6 +665,15 @@ and, for the location being looked at, `GET /index/profile` (`byType`,
 
 **First run.** No new route: the app uses `/index/folders/prompts` (new cloud
 accounts and drives) and `/index/folders` (roots and connected sources) to offer "Choose what to search".
+
+### Simplification phase 4: MinIO profiles retired
+
+The in-app MinIO/S3 object-storage console is gone, so the vault no longer
+stores MinIO profiles (with their S3 secret keys). `GET /vault/settings` stops
+returning `minioProfiles`/`activeMinioProfileId`; `PUT` ignores them if an older
+app sends them; stored copies are purged once at startup / first read and on
+any write (see "Vault"). Favorites and workspaces are unaffected. LucidLink
+Connect S3 data stores (`connect_api.py`) are a separate feature and stay.
 
 ## Indexing controls
 
