@@ -120,6 +120,7 @@ active workspace.
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
+| POST | `/index/assist` | `{"action": "summarize"\|"rewrite"\|"shorten"\|"lengthen"\|"continue"\|"generate"\|"custom", "text"?, "instruction"?}` | `{"html", "action"}`: the document editor's AI menu, on this engine's LLM; 400 when there is nothing to work on, 503 when no LLM |
 
 `FilespaceStatus`:
 
@@ -156,6 +157,12 @@ the passage that brought it into the survey (absent for paths the model
 invented, and in surveys stored before this field existed).
 
 Score is a similarity in `[0, 1]`, higher is better, whatever the backend.
+
+`/index/assist` replaced the web app's `docs-ai` edge function, which sent
+document text to a hosted AI gateway. The text now goes only to `LLM_BASE_URL`.
+Plain-text model output is escaped and wrapped in `<p>`; HTML output is passed
+through for the editor, whose schema drops anything it doesn't know. Text is
+capped at 200,000 characters and instructions at 4,000.
 
 The file service also forwards hints: after a successful `/files/write`,
 `/files/upload`, `/files/mkdir`, `DELETE /files`, `DELETE /files/dir` or

@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, R
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from .assist import Action, assist
 from .config import Config
 from .embedder import EmbedError
 from .llm import LLMError, LLMUnavailable
@@ -86,6 +87,12 @@ class SurveyBody(BaseModel):
     workspaceId: Optional[str] = None
     filespace: str
     scope: str = "/"
+
+
+class AssistBody(BaseModel):
+    action: Action
+    text: str = Field(default="", max_length=200_000)
+    instruction: str = Field(default="", max_length=4_000)
 
 
 class RetryBody(BaseModel):
@@ -180,6 +187,17 @@ def profile(filespace: str, workspaceId: Optional[str] = None, svc: IndexerServi
 @router.post("/ask")
 def ask(body: AskBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
     return svc.ask(_ws(body.workspaceId, x_ws), body.filespace, body.question, body.k)
+
+
+@router.post("/assist")
+def assist_route(body: AssistBody, svc: IndexerService = Depends(_service)):
+    """Writing assist for the document editor (replaces the docs-ai edge function)."""
+    if body.action in ("generate", "custom"):
+        if not (body.instruction.strip() or body.text.strip()):
+            raise HTTPException(status_code=400, detail="Nothing to do: add an instruction")
+    elif not body.text.strip():
+        raise HTTPException(status_code=400, detail="Document is empty")
+    return assist(svc.llm, body.action, body.text, body.instruction)
 
 
 @router.get("/survey")
