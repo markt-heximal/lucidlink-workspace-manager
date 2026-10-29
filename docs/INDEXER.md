@@ -151,6 +151,9 @@ crawl, and rows written before this field existed, have `change: null`.
 
 `Topic` matches the web app's `DiscoveredTopic`:
 `{"name","description","dateRange","documents":[{"path","title","date"}]}`.
+Each document may also carry `"excerpt"`: up to 220 characters, on one line, of
+the passage that brought it into the survey (absent for paths the model
+invented, and in surveys stored before this field existed).
 
 Score is a similarity in `[0, 1]`, higher is better, whatever the backend.
 
