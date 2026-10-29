@@ -13,6 +13,7 @@ when to reload.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -69,6 +70,9 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS files_path ON files (workspace_id, filespace, path);
 CREATE INDEX IF NOT EXISTS files_status ON files (workspace_id, filespace, status, mtime);
+-- GET /index/files: indexed newest-indexedAt first, and byReason (covering).
+CREATE INDEX IF NOT EXISTS files_status_indexed ON files (workspace_id, filespace, status, indexed_at);
+CREATE INDEX IF NOT EXISTS files_status_reason ON files (workspace_id, filespace, status, reason);
 CREATE TABLE IF NOT EXISTS chunks (
     point_id     INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused: Ruvector ids
     workspace_id TEXT NOT NULL,
@@ -98,6 +102,14 @@ CREATE TABLE IF NOT EXISTS surveys (
 );
 -- Point ids known to be in a Ruvector collection. Rows whose chunk is gone are
 -- the "dead" points the stock server cannot delete.
+-- Indexing controls (GET/PUT /index/control): one row, id 1. `priority` is a
+-- JSON list of {"workspaceId", "filespace"}.
+CREATE TABLE IF NOT EXISTS control (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    paused    INTEGER NOT NULL DEFAULT 0,
+    paused_at TEXT,
+    priority  TEXT NOT NULL DEFAULT '[]'
+);
 CREATE TABLE IF NOT EXISTS mirror_points (
     collection TEXT NOT NULL,
     point_id   INTEGER NOT NULL,
@@ -106,6 +118,19 @@ CREATE TABLE IF NOT EXISTS mirror_points (
 """
 
 LIVE_STATUSES = ("pending", "indexed", "skipped", "failed")
+
+# GET /index/files order per status. `pending` matches pending_files (the queue).
+FILE_ORDER = {
+    "pending": "mtime DESC, path",
+    "failed": "mtime DESC, path",
+    "skipped": "mtime DESC, path",
+    "indexed": "indexed_at DESC, path",
+}
+BY_REASON_MAX = 20
+
+
+def like_escape(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def now_iso() -> str:
@@ -324,6 +349,62 @@ class Store:
     def skipped_reasons(self, ws: str, fs: str) -> list[dict]:
         return self.query("SELECT reason, COUNT(*) AS files FROM files WHERE workspace_id=? AND filespace=? "
                           "AND status='skipped' GROUP BY reason ORDER BY files DESC, reason", (ws, fs))
+
+    def list_files(self, ws: str, fs: str, status: str, limit: int, offset: int = 0,
+                   q: Optional[str] = None) -> tuple[list[dict], int]:
+        """One page of a status for GET /index/files, and the (filtered) total.
+        `q` is a case-insensitive substring of the path (LIKE: ASCII folding)."""
+        where = "workspace_id=? AND filespace=? AND status=?"
+        args: list = [ws, fs, status]
+        if q:
+            where += " AND path LIKE ? ESCAPE '\\'"
+            args.append(f"%{like_escape(q)}%")
+        total = self.scalar(f"SELECT COUNT(*) FROM files WHERE {where}", args) or 0
+        rows = self.query(f"SELECT path, size, mtime, status, reason, indexed_at, changed_at FROM files "
+                          f"WHERE {where} ORDER BY {FILE_ORDER[status]} LIMIT ? OFFSET ?",
+                          (*args, int(limit), int(offset)))
+        return rows, total
+
+    def reasons(self, ws: str, fs: str, status: str, limit: int = BY_REASON_MAX) -> list[dict]:
+        """Files per reason over the whole status, largest first."""
+        return self.query("SELECT reason, COUNT(*) AS files FROM files WHERE workspace_id=? AND filespace=? "
+                          "AND status=? GROUP BY reason ORDER BY files DESC, reason LIMIT ?",
+                          (ws, fs, status, int(limit)))
+
+    def requeue_failed(self, ws: str, fs: str, paths: Optional[list[str]] = None) -> int:
+        """failed -> pending for the given paths (None = every failed file).
+
+        Clears the retry back-off (`indexed_at` holds the failure time) and the
+        failure `reason`/`content_hash`, so the file is read and extracted afresh
+        rather than being taken for a touch of its last good content."""
+        sql = ("UPDATE files SET status='pending', reason=NULL, content_hash=NULL, indexed_at=NULL "
+               "WHERE workspace_id=? AND filespace=? AND status='failed'")
+        if paths is None:
+            return self.execute(sql, (ws, fs))
+        n = 0
+        uniq = list(dict.fromkeys(paths))
+        with self.tx() as c:
+            for i in range(0, len(uniq), 500):
+                part = uniq[i:i + 500]
+                n += c.execute(sql + f" AND path IN ({','.join('?' * len(part))})", (ws, fs, *part)).rowcount
+        return n
+
+    # ------------------------------------------------------------ control
+    def control(self) -> dict:
+        """{"paused": bool, "paused_at": ISO|None, "priority": [{"workspaceId", "filespace"}]}"""
+        r = self.one("SELECT paused, paused_at, priority FROM control WHERE id=1")
+        if r is None:
+            return {"paused": False, "paused_at": None, "priority": []}
+        try:
+            prio = json.loads(r["priority"] or "[]")
+        except ValueError:
+            prio = []
+        return {"paused": bool(r["paused"]), "paused_at": r["paused_at"],
+                "priority": [p for p in prio if isinstance(p, dict)]}
+
+    def set_control(self, paused: bool, paused_at: Optional[str], priority: list[dict]) -> None:
+        self.execute("INSERT OR REPLACE INTO control (id, paused, paused_at, priority) VALUES (1, ?, ?, ?)",
+                     (int(paused), paused_at, json.dumps(priority)))
 
     # ------------------------------------------------------------ chunks
     def file_chunks(self, ws: str, fs: str, file_id: str) -> list[dict]:
