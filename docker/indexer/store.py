@@ -304,7 +304,8 @@ class Store:
 
         Files, chunks and surveys keep their point ids and embeddings, so nothing is
         re-read; the Ruvector mirror forgets those points so they are re-sent with the
-        new workspace in their payload.
+        new workspace in their payload. When `target` already has a copy, the one
+        with more files (then the more recently scanned) is kept and the other purged.
         """
         moved: list[str] = []
         rows = self.query("SELECT workspace_id, filespace FROM filespaces WHERE kind='block' AND workspace_id != ?",
@@ -313,9 +314,20 @@ class Store:
             ws, fs = r["workspace_id"], r["filespace"]
             if fs not in names:
                 continue
+            # Both copies exist (an older engine filed block sources under "local" as a fallback):
+            # keep the one with more files, else the more recently scanned, and forget the other.
+            there = self.one("SELECT last_scan_at FROM filespaces WHERE workspace_id=? AND filespace=?", (target, fs))
+            if there is not None:
+                n_here = self.scalar("SELECT count(*) FROM files WHERE workspace_id=? AND filespace=?", (ws, fs)) or 0
+                n_there = self.scalar("SELECT count(*) FROM files WHERE workspace_id=? AND filespace=?", (target, fs)) or 0
+                here_scan = self.scalar("SELECT last_scan_at FROM filespaces WHERE workspace_id=? AND filespace=?",
+                                        (ws, fs)) or ""
+                if (n_there, there["last_scan_at"] or "") >= (n_here, here_scan):
+                    self.purge_source(ws, fs)       # the target's copy wins; drop this one
+                    moved.append(fs)
+                    continue
+                self.purge_source(target, fs)       # this copy wins; make room for it
             with self.tx() as c:
-                if c.execute("SELECT 1 FROM filespaces WHERE workspace_id=? AND filespace=?", (target, fs)).fetchone():
-                    continue   # already there (a source of that name exists in the target): leave the old one
                 for table in ("files", "chunks", "surveys"):
                     c.execute(f"UPDATE {table} SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
                 c.execute("UPDATE filespaces SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
