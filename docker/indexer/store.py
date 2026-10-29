@@ -507,6 +507,33 @@ class Store:
                               "ORDER BY mtime DESC LIMIT ?", (ws, fs, *pats, limit))
         return out
 
+    def live_totals(self, ws: Optional[str] = None, fs: Optional[str] = None) -> dict[tuple[str, str], dict]:
+        """{(ws, fs): {"files", "bytes"}} of live files: one GROUP BY over the
+        ledger for every source, or just (ws, fs) when given."""
+        where, args = "status != 'deleted'", ()
+        if ws is not None:
+            where, args = "workspace_id=? AND filespace=? AND status != 'deleted'", (ws, fs)
+        return {(r["workspace_id"], r["filespace"]): {"files": r["files"], "bytes": r["bytes"]}
+                for r in self.query("SELECT workspace_id, filespace, COUNT(*) AS files, "
+                                    f"COALESCE(SUM(size), 0) AS bytes FROM files WHERE {where} "
+                                    "GROUP BY workspace_id, filespace", args)}
+
+    def files_with_extensions(self, scopes: Iterable[tuple[str, str]], exts: Iterable[str]) -> list[dict]:
+        """Live files whose name ends in one of `exts` (".pdf"…; LIKE folds ASCII
+        case), per scope. Candidates for GET /index/bykind: the caller classifies
+        each name exactly and orders them (mtime units vary)."""
+        exts = sorted(set(exts))
+        if not exts:
+            return []
+        like = " OR ".join("path LIKE ? ESCAPE '\\'" for _ in exts)
+        pats = ["%" + like_escape(e) for e in exts]
+        out: list[dict] = []
+        for ws, fs in scopes:
+            out += self.query("SELECT workspace_id, filespace, path, size, mtime, status FROM files "
+                              f"WHERE workspace_id=? AND filespace=? AND status != 'deleted' AND ({like})",
+                              (ws, fs, *pats))
+        return out
+
     def live_file_stats(self, ws: str, fs: str) -> list[dict]:
         """(path, size, mtime) of every live file, for GET /index/profile."""
         return self.query("SELECT path, size, mtime FROM files WHERE workspace_id=? AND filespace=? "
@@ -673,6 +700,10 @@ class Store:
     def put_survey(self, ws: str, fs: str, scope: str, payload: str, generated_at: str) -> None:
         self.execute("INSERT OR REPLACE INTO surveys (workspace_id, filespace, scope, payload, generated_at, stale) "
                      "VALUES (?, ?, ?, ?, ?, 0)", (ws, fs, scope, payload, generated_at))
+
+    def root_surveys(self) -> list[dict]:
+        """Every stored root-scope ("/") survey, for GET /index/surveys."""
+        return self.query("SELECT * FROM surveys WHERE scope='/'")
 
     def mark_surveys_stale(self, ws: str, fs: str) -> None:
         self.execute("UPDATE surveys SET stale=1 WHERE workspace_id=? AND filespace=?", (ws, fs))

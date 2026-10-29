@@ -33,6 +33,12 @@ import owner_auth
 
 MASK = "••••"
 _TOP_KEYS = ("workspaces", "activeWorkspaceId", "minioProfiles", "activeMinioProfileId")
+# Stored alongside the settings in the same encrypted row, but served by its own
+# routes (`/vault/favorites`), never in the settings payload.
+_FAVORITES_KEY = "favorites"
+MAX_FAVORITES = 200
+_FAVORITE_FIELDS = ("id", "workspaceId", "filespace", "kind", "path", "label", "addedAt")
+_FAVORITE_KINDS = ("lucidlink", "block")
 # `sa_live:` style prefixes are shown so the owner can tell token kinds apart.
 _PREFIX = re.compile(r"^([A-Za-z0-9_-]{1,24}:)")
 
@@ -104,6 +110,9 @@ def _decrypt(f: Fernet, blob: bytes) -> dict:
         raise VaultError("Vault payload is corrupt")
     out = _empty()
     out.update({k: data.get(k, out[k]) for k in _TOP_KEYS})
+    favs = data.get(_FAVORITES_KEY)
+    if isinstance(favs, list):
+        out[_FAVORITES_KEY] = favs
     return out
 
 
@@ -235,15 +244,18 @@ def merge(stored: dict, incoming: dict) -> dict:
     return out
 
 
-def save(payload: dict) -> dict:
-    """Merge `payload` into the vault and return the masked result + `updatedAt`."""
+def _update(fn) -> tuple[dict, str]:
+    """Read-modify-write the stored payload in one `BEGIN IMMEDIATE`.
+
+    `fn(stored) -> new` must be pure. Returns (new payload, updatedAt).
+    """
     f = _fernet()
     with _connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute("SELECT ciphertext FROM vault WHERE id = 1").fetchone()
             stored = _decrypt(f, row[0]) if row else _empty()
-            new = merge(stored, payload)
+            new = fn(stored)
             updated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             blob = f.encrypt(json.dumps(new, separators=(",", ":")).encode("utf-8"))
             conn.execute(
@@ -256,7 +268,63 @@ def save(payload: dict) -> dict:
         except BaseException:
             conn.execute("ROLLBACK")
             raise
+    return new, updated_at
+
+
+def save(payload: dict) -> dict:
+    """Merge `payload` into the vault and return the masked result + `updatedAt`.
+
+    Favorites stored in the same row are carried over untouched.
+    """
+    new, updated_at = _update(lambda stored: merge(stored, payload))
     return {**masked(new), "updatedAt": updated_at}
+
+
+# ---------------------------------------------------------------- favorites
+def validate_favorites(body: Any) -> list[dict]:
+    """`{"favorites": [Favorite]}` -> the clean list to store. ValueError when malformed.
+
+    Unknown fields are dropped; `label` is optional; `path` must start with `/`.
+    Favorites hold no secrets, so they are stored and returned as they are.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("favorites"), list):
+        raise ValueError("Body must be {\"favorites\": [...]}")
+    items = body["favorites"]
+    if len(items) > MAX_FAVORITES:
+        raise ValueError(f"At most {MAX_FAVORITES} favorites")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"Favorite {i} must be an object")
+        for key in ("id", "workspaceId", "filespace", "path", "addedAt"):
+            if not isinstance(item.get(key), str) or not item[key]:
+                raise ValueError(f"Favorite {i} needs a non-empty string '{key}'")
+        if item.get("kind") not in _FAVORITE_KINDS:
+            raise ValueError(f"Favorite {i} 'kind' must be 'lucidlink' or 'block'")
+        if not item["path"].startswith("/"):
+            raise ValueError(f"Favorite {i} 'path' must start with '/'")
+        label = item.get("label")
+        if label is not None and not isinstance(label, str):
+            raise ValueError(f"Favorite {i} 'label' must be a string")
+        if item["id"] in seen:
+            raise ValueError(f"Duplicate favorite id '{item['id']}'")
+        seen.add(item["id"])
+        out.append({k: item[k] for k in _FAVORITE_FIELDS if k in item and item[k] is not None})
+    return out
+
+
+def load_favorites() -> list[dict]:
+    """The stored Favorites; an empty list for vaults saved before favorites existed."""
+    favs = load().get(_FAVORITES_KEY)
+    return copy.deepcopy(favs) if isinstance(favs, list) else []
+
+
+def save_favorites(body: Any) -> list[dict]:
+    """Validate and replace the stored Favorites; returns the stored list."""
+    favs = validate_favorites(body)
+    _update(lambda stored: {**stored, _FAVORITES_KEY: favs})
+    return copy.deepcopy(favs)
 
 
 # ---------------------------------------------------------------- lookups
@@ -331,6 +399,25 @@ def put_settings(body: Any = Body(...),
                  _owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
     try:
         return save(body)
+    except VaultError as e:
+        raise _vault_http_error(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/favorites")
+def get_favorites(_owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
+    try:
+        return {"favorites": load_favorites()}
+    except VaultError as e:
+        raise _vault_http_error(e)
+
+
+@router.put("/favorites")
+def put_favorites(body: Any = Body(...),
+                  _owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
+    try:
+        return {"favorites": save_favorites(body)}
     except VaultError as e:
         raise _vault_http_error(e)
     except ValueError as e:

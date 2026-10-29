@@ -187,6 +187,24 @@ def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
     return {"files": svc.recent(_ws(workspaceId, x_ws), filespace or None, limit)}
 
 
+@router.get("/bykind")
+def by_kind(kind: str = Query(default=""), workspaceId: Optional[str] = None, filespace: Optional[str] = None,
+            limit: int = Query(default=100, ge=1), offset: int = Query(default=0, ge=0),
+            svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    """Live files of one kind across locations, newest first; `limit` is capped at 500."""
+    try:
+        return svc.by_kind(_ws(workspaceId, x_ws), filespace or None, kind, limit, offset)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/surveys")
+def surveys(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
+            svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    """Stored root surveys of every location in scope, newest first (never generates)."""
+    return {"surveys": svc.surveys(_ws(workspaceId, x_ws), filespace or None)}
+
+
 @router.get("/files")
 def list_files(filespace: str, status: Literal["failed", "skipped", "pending", "indexed"],
                workspaceId: Optional[str] = None, limit: int = Query(default=50, ge=1),

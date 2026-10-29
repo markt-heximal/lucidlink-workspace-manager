@@ -101,6 +101,11 @@ HTTP (file service, owner only):
 | GET | `/vault/status` | no auth: `{"configured": bool, "ownerConfigured": bool, "hasSettings": bool}` |
 | GET | `/vault/settings` | masked payload + `"updatedAt"` (ISO) |
 | PUT | `/vault/settings` | payload → saved masked payload + `"updatedAt"` |
+| GET/PUT | `/vault/favorites` | see "Favorites, synced" (Simplification phase 2) |
+
+Favorites live in the same encrypted row under `"favorites"` (Python:
+`load_favorites()`, `save_favorites(body)`); a settings save carries them over
+and the settings payload never includes them.
 
 ## Indexer HTTP API
 
@@ -604,7 +609,8 @@ map onto the profile's type classes:
 
 Result: `{"files": [{"workspaceId", "filespace", "location", "path", "name",
 "size", "mtime", "status", "type"}], "total": n, "kind"}`; `limit` max 500;
-400 for an unknown kind. It is what the Files "Kind" filter shows when no single
+400 for an unknown kind. A name's class is the profile's (`block.type_of`), so a
+`.psd` counts as design and an `.srt` as a document. It is what the Files "Kind" filter shows when no single
 folder is being browsed.
 
 **Topics everywhere.** `GET /index/surveys?workspaceId=*` returns the stored
@@ -624,6 +630,9 @@ so they follow the owner across devices. Owner-only, like `/vault/settings`:
 `Favorite`: `{"id", "workspaceId", "filespace", "kind": "lucidlink"|"block",
 "path", "label", "addedAt": "ISO"}` (`label` optional; unknown fields dropped;
 `path` must start with `/`). Older vaults without favorites return an empty list.
+`id`, `workspaceId`, `filespace`, `path` and `addedAt` must be non-empty strings,
+`kind` one of the two values and ids unique; anything else is a 400 and the
+stored list is unchanged.
 
 ## Indexing controls
 
