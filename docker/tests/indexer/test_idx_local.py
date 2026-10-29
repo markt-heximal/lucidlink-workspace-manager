@@ -81,3 +81,41 @@ def test_engine_name_labels_its_drives(make_service, tmp_path):
         assert c.get("/index/status", headers=H).json()["engine"]["name"] == "AI-Factory-Mini"
     unnamed = make_service(block_sources=f"NAS={share}", block_source_workspace="")
     assert unnamed.engine_info() == {"name": None, "workspaceId": "local"}
+
+
+def test_duplicate_copies_keep_the_fuller_one(make_service, tmp_path):
+    share = tmp_path / "share"
+    share.mkdir()
+    for i in range(3):
+        (share / f"f{i}.md").write_text(para(f"topic {i}"))
+    db = str(tmp_path / "dup.db")
+    # The real data under the vault workspace, and a stale, emptier copy under "local".
+    a = make_service(db_path=db, block_sources=f"NAS={share}", block_source_workspace="ws1")
+    run(a, "NAS", "ws1")
+    a.store.ensure_filespace("local", "NAS")
+    a.store.set_filespace_kind("local", "NAS", "block")
+    a.store.insert_file("local", "NAS", "p:stale", "/stale.md", 1, 1, 1, status="indexed")
+    full = a.store.chunk_count("ws1", "NAS")
+
+    b = make_service(db_path=db, block_sources=f"NAS={share}", block_source_workspace="")
+    assert ("local", "NAS") in b.scheduler.targets()
+    paths = {r["path"] for r in b.store.query("SELECT path FROM files WHERE workspace_id='local' AND filespace='NAS'")}
+    assert paths == {"/f0.md", "/f1.md", "/f2.md"}
+    assert b.store.chunk_count("local", "NAS") == full
+    assert b.store.query("SELECT * FROM filespaces WHERE workspace_id='ws1' AND filespace='NAS'") == []
+    assert b.store.query("SELECT * FROM files WHERE workspace_id='ws1' AND filespace='NAS'") == []
+
+
+def test_duplicate_copies_keep_the_target_when_it_is_fuller(make_service, tmp_path):
+    share = tmp_path / "share"
+    share.mkdir()
+    (share / "a.md").write_text(para("alpha"))
+    db = str(tmp_path / "dup2.db")
+    a = make_service(db_path=db, block_sources=f"NAS={share}", block_source_workspace="local")
+    run(a, "NAS", "local")
+    a.store.ensure_filespace("ws1", "NAS")
+    a.store.set_filespace_kind("ws1", "NAS", "block")
+    b = make_service(db_path=db, block_sources=f"NAS={share}", block_source_workspace="")
+    b.scheduler.targets()
+    assert b.store.query("SELECT path FROM files WHERE workspace_id='local' AND filespace='NAS'") == [{"path": "/a.md"}]
+    assert b.store.query("SELECT * FROM filespaces WHERE workspace_id='ws1' AND filespace='NAS'") == []
