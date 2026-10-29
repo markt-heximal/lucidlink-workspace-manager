@@ -73,19 +73,19 @@ def test_block_source_is_a_target_of_kind_block(block, share):
     kinds = {f["filespace"]: f["kind"] for f in st["filespaces"]}
     assert kinds == {"fsA": "lucidlink", "fsB": "lucidlink", "NAS": "block"}
     assert st["blockSources"] == [{"name": "NAS", "workspaceId": "ws1", "path": str(share), "kind": "block",
-                                   "accepted": True, "error": None, "origin": "mini",
+                                   "accepted": True, "error": None, "origin": "engine",
                                    "hostPath": None, "root": None, "folder": None}]
 
 
-def test_block_workspace_from_config_or_the_mini(block, make_service, share):
+def test_block_workspace_from_config_or_local(block, make_service, share):
     svc = block(block_source_workspace="studio")
     assert ("studio", "NAS") in svc.scheduler.targets()
-    # Unset: the Mini's own workspace, whatever the vault's active workspace is.
+    # Unset: the engine computer's own workspace, whatever the vault's active workspace is.
     svc = block(block_source_workspace="")
-    assert ("mini", "NAS") in svc.scheduler.targets()
+    assert ("local", "NAS") in svc.scheduler.targets()
     svc.settings.payload["activeWorkspaceId"] = None
     svc.scheduler.refresh_targets(force=True)
-    assert ("mini", "NAS") in svc.scheduler.targets()
+    assert ("local", "NAS") in svc.scheduler.targets()
 
 
 def test_index_tree_then_unchanged_rescan_reads_nothing(block, share, reads):

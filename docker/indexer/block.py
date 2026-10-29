@@ -174,8 +174,8 @@ class BlockSpec:
     name: str
     path: str
     error: Optional[str] = None
-    # "mini": from BLOCK_SOURCES in .env; "app": connected from the web app (folders.py).
-    origin: str = "mini"
+    # "engine": from BLOCK_SOURCES in the engine's .env; "app": connected from the web app (folders.py).
+    origin: str = "engine"
     host_path: Optional[str] = None      # the folder on the Mini, when known
     root: Optional[str] = None           # app sources: root id ("volumes", "icloud", "desktop")
     folder: Optional[str] = None         # app sources: path inside the root, "/Projects"

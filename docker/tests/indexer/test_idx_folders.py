@@ -61,7 +61,7 @@ def test_roots_and_browse(svc):
             {"id": "documents", "label": "Documents", "hostPath": None, "available": False},
         ]
         assert [s["name"] for s in body["sources"]] == ["Archive-old"]
-        assert body["sources"][0]["origin"] == "mini" and body["sources"][0]["hostPath"] == "/Volumes/Archive"
+        assert body["sources"][0]["origin"] == "engine" and body["sources"][0]["hostPath"] == "/Volumes/Archive"
 
         top = c.get("/index/folders/browse", params={"root": "volumes"}, headers=H).json()
         # No symlink to "/", no dot-names, no system folders; the .env slot's host folder shows as connected.

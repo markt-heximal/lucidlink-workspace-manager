@@ -100,6 +100,8 @@ services:
       # Folders from the app (docs/INDEXER.md): the Mini folders behind the
       # roots and the slots, as plain strings, so the indexer can show them and
       # spot the same folder reached two ways.
+      # The engine computer's name: the label of its drives in the app (start.sh fills it).
+      - ENGINE_NAME=${ENGINE_NAME:-}
       - BLOCK_ROOT_VOLUMES=${BLOCK_ROOT_VOLUMES:-/Volumes}
       - BLOCK_ROOT_ICLOUD=${BLOCK_ROOT_ICLOUD:-}
       - BLOCK_ROOT_DESKTOP=${BLOCK_ROOT_DESKTOP:-}

@@ -312,7 +312,8 @@ cannot write to it whatever the code does.
 |---|---|
 | `BLOCK_SOURCE_PATH`, `BLOCK_SOURCE_PATH_2` … `_6` | Host folders (a NAS share, drive, iCloud Drive, Desktop), each mounted read-only in its own slot, `/block/source1` … `/block/source6`, so the container sees only those folders. Unset slots get an empty placeholder. |
 | `BLOCK_SOURCES` | `name=/container/path` entries separated by `;`, e.g. `NAS=/block/source1`. Empty: no block sources. |
-| `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to. Default: `mini` (This Mini; see below). |
+| `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to. Default: `local` (the engine computer; see below). |
+| `ENGINE_NAME` | The engine computer's name, the label of its drives in the app. `start.sh` sets it once from the computer's name. |
 
 **The helper.** `docker/add-folder.sh` does the steps above in one command on
 the Mini: `./add-folder.sh smb://nas.local/Projects` (mounts the share first;
@@ -392,9 +393,9 @@ or empty is `available: false`. Browsing lists folders only, never follows a
 symlink (so `/Volumes/Macintosh HD`, a symlink to `/`, is not offered) and
 skips dot-names and system folders.
 
-Sources from `.env` (`BLOCK_SOURCES`, origin `mini`) and from the app (origin
-`app`) are listed together; either can be removed from the app. Removing a
-`mini` source records that in the database (`.env` is not edited, and the slot
+Sources from `.env` (`BLOCK_SOURCES`, origin `engine`) and from the app (origin
+`app`) are listed together; either can be removed from the app. Removing an
+`engine` source records that in the database (`.env` is not edited, and the slot
 stays mounted until `add-folder.sh --remove` or a manual edit). Removing any
 source deletes its ledger rows, chunks and surveys, so its results leave search
 at once. Names are unique across all block sources, may not contain `/`, `;` or
@@ -417,7 +418,7 @@ app groups them as **Local storage** (`icloud`, `desktop`, `documents`) and
 **NAS** (`volumes`; external drives also appear there, since macOS mounts them
 under /Volumes too).
 `BlockSource` (also in `/index/status` → `blockSources`): `{"name", "workspaceId",
-"path", "kind": "block", "accepted", "error", "origin": "app"|"mini", "hostPath":
+"path", "kind": "block", "accepted", "error", "origin": "app"|"engine", "hostPath":
 "/Volumes/Projects"|null, "root": "volumes"|null, "folder": "/Projects"|null}`
 (`root`/`folder` only for `app` sources).
 
@@ -464,15 +465,19 @@ The file service's `/index/{path}` proxy streams responses and passes `Range`,
 `Content-Range`, `Accept-Ranges`, `Content-Length` and `Content-Disposition`
 through, so large files are not held in memory.
 
-### This Mini and All drives
+### The engine computer and All drives
 
-Drives the Mini reaches itself (block sources: NAS shares, USB disks, local
-folders) belong to the workspace id **`mini`** ("This Mini" in the app), not to
-whichever LucidLink workspace is active. `BLOCK_SOURCE_WORKSPACE` still
-overrides it. On the first scheduling pass after upgrading, block sources
-indexed under another workspace are moved to `mini` in place (files, chunks,
-surveys and the indexing priority list keep their ids and embeddings, so
-nothing is re-read; their Ruvector points are re-sent with the new workspace).
+Drives the engine computer reaches itself (block sources: NAS shares, USB disks,
+local folders) belong to the workspace id **`local`**, not to whichever
+LucidLink workspace is active. `BLOCK_SOURCE_WORKSPACE` still overrides it. The
+app labels them with the engine computer's name (`ENGINE_NAME`, e.g.
+"AI-Factory-Mini · NAS"; "the engine computer" in generic copy), returned as
+`"engine": {"name", "workspaceId"}` by `GET /index/folders` and `/index/status`
+(`name` is null when unset). On the first scheduling pass after upgrading,
+block sources indexed under another workspace are moved to `local` in place
+(files, chunks, surveys and the indexing priority list keep their ids and
+embeddings, so nothing is re-read; their Ruvector points are re-sent with the
+new workspace).
 
 `workspaceId: "*"` (body, query or `X-Workspace-Id`) means **every workspace**,
 the Mini's included, for search, ask and recent: the app's "All drives". With a
