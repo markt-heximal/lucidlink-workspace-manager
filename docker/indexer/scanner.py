@@ -53,7 +53,7 @@ from .config import Config
 from .embedder import Embedder, text_hash
 from .extract import ext_of, extract, is_supported
 from .iwork import is_iwork_name, package_member_wanted
-from .source import FilespaceSource
+from .source import FilespaceSource, NotDownloaded
 from .store import Store, now_iso
 
 logger = logging.getLogger("indexer.scanner")
@@ -545,7 +545,7 @@ class FilespaceIndexer:
             if not package and row["size"] > limit:
                 return self._skip(row, f"too large ({row['size']} bytes > {limit})")
             data = self._read_package(path, limit) if package else self.source.read_file(path)
-        except PackageTooLarge as e:
+        except (PackageTooLarge, NotDownloaded) as e:
             return self._skip(row, str(e))
         except Exception as e:
             self._set(row, status="failed", reason=f"read failed: {type(e).__name__}: {e}"[:300],

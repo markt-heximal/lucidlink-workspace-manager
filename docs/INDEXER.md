@@ -552,6 +552,46 @@ the Mini's included, for search, ask and recent: the app's "All drives". With a
 `filespace` it is that name in whichever workspace has it. Status, survey and
 the folder endpoints are unchanged.
 
+### Cloud storage through the engine computer's sync apps
+
+Google Drive, Dropbox, OneDrive, Box and ShareFile on a Mac keep their folders
+under `~/Library/CloudStorage` (Finder lists them under Locations). The engine
+shares that folder read-only as a fifth root, so a cloud service is connected
+like any other folder: no service sign-in in this app, nothing new stored in the
+vault, and the content is what the sync app already has.
+
+| Root id | Label | Host folder (`.env`) | In the container |
+|---|---|---|---|
+| `cloud` | Cloud storage | `BLOCK_ROOT_CLOUD` (`start.sh` fills `~/Library/CloudStorage` on macOS) | `/host/cloud` |
+
+**Which service.** The top folder names the service and account:
+`GoogleDrive-<account>`, `Dropbox`/`Dropbox-<team>`/`Dropbox (<name>)`,
+`OneDrive-<account>`, `Box-Box`, `ShareFile-<account>`. Browse entries and
+`BlockSource` carry `"provider": {"id": "google-drive"|"dropbox"|"onedrive"|"box"|"sharefile"|"other", "label": "Google Drive", "account": "mark@heximal.com"|null}`
+for anything in the `cloud` root (null elsewhere).
+
+**Online-only files.** Sync apps keep many files in the cloud until opened; on
+the engine computer they are placeholders that download when read. A source in
+the `cloud` root therefore reads only files already downloaded there and records
+the rest as skipped with reason `online only (not downloaded on the engine
+computer)`; its names, sizes and dates are still in the ledger, so they show in
+browsing, recent and the storage profile. A placeholder is a file with a size
+but no allocated blocks (`st_blocks == 0`). Setting `downloadOnlineOnly` lets
+the indexer read (and so download) them, using disk on the engine computer;
+turning it on re-queues the skipped files. Google Docs, Sheets and Slides are
+links (`.gdoc`, `.gsheet`, `.gslides`), not documents, and are skipped as
+unsupported.
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| POST | `/index/folders/options` | `{"name", "downloadOnlineOnly": bool}` | `BlockSource`; 404 unknown source, 400 for a source not connected from the app |
+
+`BlockSource` gains `"downloadOnlineOnly": bool` (false unless set; only
+meaningful in the `cloud` root). New-drive prompts cover the `cloud` root too:
+a new service or account under `~/Library/CloudStorage` is offered like a new
+share, with `"root": "cloud"`; dismissing takes `{"kind": "new", "root":
+"cloud", "path"}` (`root` defaults to `volumes`).
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is

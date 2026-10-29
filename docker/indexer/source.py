@@ -55,6 +55,10 @@ class Entry:
     file_id: str       # FsEntry.id; "" when the listing has none
 
 
+class NotDownloaded(Exception):
+    """An online-only file (a sync app's placeholder) that the source won't download."""
+
+
 class SourceError(Exception):
     """The filespace could not be reached at all (no token, link failed)."""
 

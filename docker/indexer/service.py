@@ -20,7 +20,7 @@ import httpx
 from . import ask as ask_mod
 from . import folders as folders_mod
 from . import survey as survey_mod
-from .block import KIND_LUCIDLINK, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
+from .block import KIND_LUCIDLINK, ONLINE_ONLY, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
 from .block import NotMounted as NotMountedError
 from .config import Config
 from .embedder import Embedder
@@ -80,6 +80,8 @@ class NotFound(Exception):
 
 
 LIST_MAX = 2000
+# Roots whose new top folders are offered: mounted shares and drives, and cloud sync apps.
+PROMPT_ROOTS = ("volumes", "cloud")
 ALL_WORKSPACES = "*"
 
 
@@ -118,7 +120,8 @@ class IndexerService:
         # Block keys get a LocalSource; everything else the filespace provider
         # (looked up per lease, so `self.sources` can be swapped in tests).
         self.router = RoutingSourceProvider(lambda ws, fs: self.scheduler.block_root(ws, fs),
-                                            lambda: self.sources)
+                                            lambda: self.sources,
+                                            lambda ws, fs: self.scheduler.skip_online_only(ws, fs))
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -283,30 +286,32 @@ class IndexerService:
         return False
 
     def folder_prompts(self) -> dict:
-        """New drives under /Volumes and connected folders that have gone missing (docs: Drive prompts)."""
+        """New drives and cloud accounts, and connected folders that have gone missing (docs: Drive prompts)."""
         now = now_iso()
         new: list[dict] = []
-        root = "volumes"
-        if folders_mod.root_available(self.config, root):
+        for root in PROMPT_ROOTS:
+            if not folders_mod.root_available(self.config, root):
+                continue
             listing = folders_mod.browse(self.config, root, "/", lambda *_: None)
             names = [e["name"] for e in listing["entries"]]
             seen = self.store.drives_seen(root)
             if not seen:
-                # The first look: what is already mounted is known, not new ("" marks the look itself).
+                # The first look: what is already there is known, not new ("" marks the look itself).
                 self.store.add_drives_seen(root, names + [""], now, baseline=True)
-            else:
-                self.store.add_drives_seen(root, [n for n in names if n not in seen], now, baseline=False)
-                seen = self.store.drives_seen(root)
-                base = folders_mod.root_path(self.config, root)
-                for e in listing["entries"]:
-                    row = seen.get(e["name"])
-                    if not row or row["baseline"] or row["dismissed"]:
-                        continue
-                    if self._overlaps_a_source(root, e["path"], base + e["path"], e["hostPath"]):
-                        continue
-                    new.append({"root": root, "path": e["path"], "name": e["name"], "hostPath": e["hostPath"],
-                                "suggestedName": folders_mod.default_name(root, e["path"]),
-                                "firstSeenAt": row["first_seen_at"]})
+                continue
+            self.store.add_drives_seen(root, [n for n in names if n not in seen], now, baseline=False)
+            seen = self.store.drives_seen(root)
+            base = folders_mod.root_path(self.config, root)
+            for e in listing["entries"]:
+                row = seen.get(e["name"])
+                if not row or row["baseline"] or row["dismissed"]:
+                    continue
+                if self._overlaps_a_source(root, e["path"], base + e["path"], e["hostPath"]):
+                    continue
+                new.append({"root": root, "path": e["path"], "name": e["name"], "hostPath": e["hostPath"],
+                            "provider": e.get("provider"),
+                            "suggestedName": folders_mod.default_name(root, e["path"]),
+                            "firstSeenAt": row["first_seen_at"]})
         missing: list[dict] = []
         grace = self.config.folder_missing_grace_sec
         for b in self.scheduler._block_specs:
@@ -322,10 +327,10 @@ class IndexerService:
                             "missingSince": row["since"]})
         return {"newDrives": new, "missing": missing}
 
-    def dismiss_prompt(self, kind: str, path: Optional[str], name: Optional[str]) -> dict:
+    def dismiss_prompt(self, kind: str, path: Optional[str], name: Optional[str], root: str = "volumes") -> dict:
         if kind == "new":
             drive = (path or "").strip("/")
-            if not drive or "/" in drive or not self.store.dismiss_drive("volumes", drive):
+            if root not in PROMPT_ROOTS or not drive or "/" in drive or not self.store.dismiss_drive(root, drive):
                 raise NotFound(f"no new drive at {path!r}")
         else:
             if not name or not self.store.dismiss_missing(name):
@@ -391,6 +396,19 @@ class IndexerService:
         if not stat_mod.S_ISREG(st.st_mode):
             raise NotFound(f"{folder} isn't a file")
         return full
+
+    def folder_options(self, name: str, download_online_only: bool) -> dict:
+        spec = next((b for b in self.scheduler._block_specs if b.name == name), None)
+        if spec is None:
+            raise NotFound(f"no connected folder called {name!r}")
+        if spec.origin != "app":
+            raise folders_mod.FolderError(400, f"{name} was set up on the engine computer; its options can't be changed here.")
+        self.store.set_block_download(name, download_online_only)
+        ws = self.scheduler._block_workspace()
+        self.scheduler.refresh_targets(force=True)
+        if download_online_only and self.store.requeue_reason(ws, name, ONLINE_ONLY):
+            self.scheduler.request_sync([(ws, name)])
+        return next(e for e in self.scheduler.block_sources if e["name"] == name)
 
     def remove_folder(self, name: str) -> dict:
         spec = next((b for b in self.scheduler._block_specs if b.name == name), None)
