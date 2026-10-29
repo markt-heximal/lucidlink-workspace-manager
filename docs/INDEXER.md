@@ -122,7 +122,7 @@ active workspace.
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}]}` |
-| GET | `/index/recent` | `?workspaceId&filespace&limit=20` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace) | `{"files": [RecentFile]}`, newest first |
+| GET | `/index/recent` | `?workspaceId&filespace&limit=20&kind=&change=&since=&before=` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace; `kind` as `/index/bykind`, `change` a comma list of new\|modified\|renamed\|deleted, `since` ≤ `when` < `before` (ISO); unknown kind/change or a bad time → 400; see What's new) | `{"files": [RecentFile], "next": ISO\|null}`, newest `when` first; pass `next` as `before` for the next page (ties on `when` stay on one page) |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
@@ -145,7 +145,8 @@ active workspace.
 {"workspaceId": "default", "filespace": "my-app-bucket", "path": "/Board/minutes.docx",
  "size": 48211, "mtime": "ISO|null", "status": "indexed|pending|skipped|failed|deleted",
  "indexedAt": "ISO|null", "change": "new|modified|renamed|deleted|null",
- "changedAt": "ISO|null", "previousPath": "/old/path|null"}
+ "changedAt": "ISO|null", "previousPath": "/old/path|null",
+ "when": "ISO", "type": "document|pdf|image|…"}
 ```
 
 Live files are ordered by their own `mtime`; deletions and renames by `changedAt`
@@ -701,6 +702,32 @@ so they follow the owner across devices. Owner-only, like `/vault/settings`:
 `id`, `workspaceId`, `filespace`, `path` and `addedAt` must be non-empty strings,
 `kind` one of the two values and ids unique; anything else is a 400 and the
 stored list is unchanged.
+
+### Simplification phase 3: What's new, storage at a glance, first run
+
+**What's new.** `GET /index/recent` gains filters and paging so the app can show
+every change across every location, grouped by day:
+
+- `kind=documents|presentations|images|video` — the same mapping as `/index/bykind`
+  (deletions are classed by their last name); unknown kind → 400.
+- `change=new|modified|renamed|deleted` (comma-separated for several); unknown → 400.
+- `since=ISO` and `before=ISO` — only changes with `when` ≥ `since` / strictly < `before`.
+- `limit` stays capped at 200.
+
+Each `RecentFile` gains `"when": "ISO"` (the timestamp it is ordered by: the file's
+`mtime` for live files, `changedAt` for deletions and renames) and `"type"` (the
+profile's type class). The response gains `"next": "ISO"|null`: pass it as
+`before` to read the following page (null when there is nothing older). Ties on
+`when` are not split across pages (a page may run a little over `limit`).
+Future-dated files stay excluded as before.
+
+**Storage at a glance.** No new route: the app reads `totals` from `/index/status`
+and, for the location being looked at, `GET /index/profile` (`byType`,
+`largestFolders`, `ages`, `skipped`). `largestFolders` items gain `"files"` and
+`"bytes"` already; nothing else changes.
+
+**First run.** No new route: the app uses `/index/folders/prompts` (new cloud
+accounts and drives) and `/index/folders` (roots and connected sources) to offer "Choose what to search".
 
 ## Indexing controls
 
