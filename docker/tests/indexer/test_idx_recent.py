@@ -115,3 +115,18 @@ def test_change_of_rules():
     assert Store.change_of(row, {"mtime": 6, "path": "/b"}) == ("modified", "/a")
     assert Store.change_of(row, {"mtime": 5, "scan_id": 2}) == (None, None)
     assert Store.change_of(row, {"status": "indexed"}) == (None, None)
+
+
+def test_recent_leaves_out_future_dated_files(make_service):
+    import time as _t
+    svc = make_service()
+    src(svc).write("/old.md", para("old"))
+    run(svc)
+    now = int(_t.time())
+    ws, fs = "ws1", "fsA"
+    fid = svc.store.one("SELECT file_id FROM files WHERE path='/old.md'")["file_id"]
+    svc.store.execute("UPDATE files SET mtime=? WHERE file_id=?", ((now - 3600) * 10**9, fid))
+    for i, mtime in enumerate([(now + 10 * 365 * 86400) * 10**9, now + 10 * 365 * 86400, (now + 400 * 86400) * 1000]):
+        svc.store.insert_file(ws, fs, f"future{i}", f"/future{i}.jpg", 10, mtime, 1, status="skipped")
+    paths = [f["path"] for f in svc.recent("ws1", "fsA", 5)]
+    assert paths == ["/old.md"]
