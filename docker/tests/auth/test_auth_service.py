@@ -199,6 +199,23 @@ def test_index_proxy_forwards(client, env, supabase, monkeypatch):
     assert r.status_code == 404 and rec.requests[-1].url.params["filespace"] == "fs1"
 
 
+def test_index_proxy_streams_files_with_ranges(client, env, supabase, monkeypatch):
+    rec = Recorder(lambda req: httpx.Response(
+        206, content=b"llo", headers={"content-type": "application/pdf", "content-range": "bytes 2-4/11",
+                                      "accept-ranges": "bytes", "content-length": "3",
+                                      "content-disposition": "inline; filename=\"a.pdf\"",
+                                      "x-internal": "not passed"}))
+    _indexer(monkeypatch, rec)
+    r = client.get("/index/folders/file", params={"name": "NAS", "path": "/a.pdf"},
+                   headers=owner_headers(Range="bytes=2-4"))
+    assert r.status_code == 206 and r.content == b"llo"
+    assert r.headers["content-type"] == "application/pdf"
+    assert r.headers["content-range"] == "bytes 2-4/11" and r.headers["accept-ranges"] == "bytes"
+    assert r.headers["content-disposition"] == 'inline; filename="a.pdf"'
+    assert "x-internal" not in r.headers
+    assert rec.requests[-1].headers["range"] == "bytes=2-4"
+
+
 @pytest.mark.parametrize("exc,status", [
     (lambda req: httpx.ConnectError("refused", request=req), 502),
     (lambda req: httpx.ReadTimeout("slow", request=req), 504),

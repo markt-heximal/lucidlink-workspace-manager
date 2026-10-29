@@ -14,7 +14,8 @@ from fastapi import (FastAPI, HTTPException, Depends, Request, UploadFile, File,
                      BackgroundTasks)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 import os
 import time
@@ -427,6 +428,7 @@ async def proxy_management_api(request: Request, path: str):
 # so the indexer itself never sees a browser credential.
 _INDEX_TIMEOUT = httpx.Timeout(120.0, connect=5.0)  # ask/survey can run an LLM
 _index_transport: Optional[httpx.AsyncBaseTransport] = None
+_INDEX_PASS_HEADERS = ("content-length", "content-range", "accept-ranges", "content-disposition")
 
 
 @app.api_route("/index/{path:path}", methods=["GET", "POST", "PUT"])
@@ -446,15 +448,30 @@ async def proxy_indexer(request: Request, path: str,
         headers["Content-Type"] = request.headers["content-type"]
     if "x-workspace-id" in request.headers:
         headers["X-Workspace-Id"] = request.headers["x-workspace-id"]
+    if "range" in request.headers:
+        headers["Range"] = request.headers["range"]
     body = await request.body() if request.method in ("POST", "PUT") else None
+    # Streamed, so a large file from a connected drive is never held in memory.
+    client = httpx.AsyncClient(timeout=_INDEX_TIMEOUT, transport=_index_transport)
     try:
-        async with httpx.AsyncClient(timeout=_INDEX_TIMEOUT, transport=_index_transport) as client:
-            resp = await client.request(request.method, url, headers=headers, content=body)
+        resp = await client.send(client.build_request(request.method, url, headers=headers, content=body),
+                                 stream=True)
     except httpx.TimeoutException:
+        await client.aclose()
         return JSONResponse(status_code=504, content={"detail": "Indexer timeout"})
     except httpx.HTTPError as e:
+        await client.aclose()
         # ConnectError and friends: the container is down or restarting.
         logger.warning("indexer proxy %s /index/%s failed: %s", request.method, path, type(e).__name__)
         return JSONResponse(status_code=502, content={"detail": "Indexer unreachable"})
-    return Response(content=resp.content, status_code=resp.status_code,
-                    media_type=resp.headers.get("content-type"))
+
+    async def close() -> None:
+        await resp.aclose()
+        await client.aclose()
+
+    # aiter_bytes decodes any content-encoding, so a re-encoded length must not be passed on.
+    passed = {k: resp.headers[k] for k in _INDEX_PASS_HEADERS if k in resp.headers}
+    if "content-encoding" in resp.headers:
+        passed.pop("content-length", None)
+    return StreamingResponse(resp.aiter_bytes(), status_code=resp.status_code, headers=passed,
+                             media_type=resp.headers.get("content-type"), background=BackgroundTask(close))
