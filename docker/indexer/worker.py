@@ -18,6 +18,11 @@ is due or requested (or a hint could not be applied with certainty), drain the
 pending queue, backfill vectors for a changed model, sync the Ruvector mirror,
 and regenerate the stored survey when it is stale and allowed.
 
+Indexing controls (GET/PUT /index/control, persisted in the store): while
+paused, nothing new is dispatched — a running job finishes its current time
+slice — but hints and sync requests keep queuing. Sources in the priority list
+are offered a slot first, in list order, before the round-robin.
+
 Targets are the vault's filespaces plus the connected block sources from
 BLOCK_SOURCES (kind "block", see block.py). A block source whose name collides
 with a vault filespace of its workspace is refused and not indexed; block
@@ -264,14 +269,35 @@ class Scheduler:
                 if not self._stopping.is_set():
                     self._cv.wait(self.cfg.tick_sec)
 
+    def wake(self) -> None:
+        """Re-run dispatch now (e.g. after a resume or a priority change)."""
+        with self._cv:
+            self._cv.notify_all()
+
+    def paused(self) -> bool:
+        return self.svc.store.control()["paused"]
+
+    def priority(self) -> dict[Key, int]:
+        """Priority list position of each listed source."""
+        out: dict[Key, int] = {}
+        for p in self.svc.store.control()["priority"]:
+            out.setdefault((p.get("workspaceId"), p.get("filespace")), len(out))
+        return out
+
     def _dispatch(self) -> None:
         keys = self.refresh_targets()
+        ctl = self.svc.store.control()
+        if ctl["paused"]:
+            return   # running jobs finish their slice; requests keep queuing
+        prio = self.priority()
         now = time.time()
         with self._cv:
             running = sum(1 for rt in self._runtime.values() if rt.running)
-            # Round-robin: whichever filespace ran least recently is offered a
-            # slot first, so time-sliced big jobs take turns with small ones.
-            keys = sorted(keys, key=lambda k: self._runtime[k].last_run_end if k in self._runtime else 0.0)
+            # Priority sources first, in list order; then round-robin: whichever
+            # filespace ran least recently is offered a slot first, so
+            # time-sliced big jobs take turns with small ones.
+            keys = sorted(keys, key=lambda k: (prio.get(k, len(prio)),
+                                               self._runtime[k].last_run_end if k in self._runtime else 0.0))
             for key in keys:
                 if running >= self.cfg.concurrency or self._stopping.is_set():
                     break
@@ -396,7 +422,7 @@ class Scheduler:
             logger.warning("[%s/%s] survey failed: %s", ws, fs, rt.survey_error)
 
     # ------------------------------------------------------------ status
-    def state(self, ws: str, fs: str) -> str:
+    def state(self, ws: str, fs: str, paused: Optional[bool] = None) -> str:
         row = self.svc.store.filespace_row(ws, fs)
         if row is not None and not row["enabled"]:
             return "disabled"
@@ -405,4 +431,6 @@ class Scheduler:
             return rt.phase
         if rt.running:
             return "scanning"
+        if self.paused() if paused is None else paused:
+            return "paused"
         return "error" if row is not None and row["last_error"] else "idle"

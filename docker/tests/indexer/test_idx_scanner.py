@@ -341,3 +341,20 @@ def test_job_exception_is_recorded_and_loop_survives(make_service):
     time.sleep(0.3)
     assert svc.scheduler._thread.is_alive()
     svc.scheduler.stop()
+
+
+def test_automatic_retry_reindexes_unchanged_content(make_service):
+    """A file that failed after a touch, with content it already had, comes back
+    as indexed on its automatic retry, not as skipped with the old error."""
+    svc = make_service(failed_retry_sec=0)
+    s = src(svc)
+    s.write("/a.md", para("alpha"))
+    run(svc)
+    s.touch("/a.md")
+    s.fail_reads = {"/a.md"}
+    run(svc)
+    assert files(svc)["/a.md"]["status"] == "failed"
+    s.fail_reads = set()
+    run(svc)                                   # back-off over: retried automatically
+    row = files(svc)["/a.md"]
+    assert row["status"] == "indexed" and row["reason"] is None

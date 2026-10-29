@@ -22,7 +22,7 @@ from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
 from .source import SdkSourceProvider, SettingsProvider, SourceProvider, VaultSettings
-from .store import Store
+from .store import FILE_ORDER, Store, now_iso
 from .vectors import LocalIndex, RuvectorMirror, Scope, VectorService
 from .worker import Scheduler, iso
 
@@ -32,6 +32,7 @@ SNIPPET_CHARS = 300
 
 
 RECENT_MAX = 200
+FILES_MAX = 200
 
 DAY = 86400.0
 # GET /index/profile age buckets: (key, max age in days), exclusive, oldest last.
@@ -145,16 +146,20 @@ class IndexerService:
         return self.store.kinds()
 
     # ------------------------------------------------------------ status
-    def filespace_status(self, ws: str, fs: str) -> dict:
+    def filespace_status(self, ws: str, fs: str, ctl: Optional[dict] = None) -> dict:
         row = self.store.filespace_row(ws, fs) or {}
         rt = self.scheduler.runtime(ws, fs)
         enabled = bool(row.get("enabled", 1))
+        ctl = ctl if ctl is not None else self.store.control()
+        priority = next((i for i, p in enumerate(ctl["priority"])
+                         if (p.get("workspaceId"), p.get("filespace")) == (ws, fs)), None)
         return {
             "workspaceId": ws,
             "filespace": fs,
             "kind": row.get("kind") or KIND_LUCIDLINK,
             "enabled": enabled,
-            "state": self.scheduler.state(ws, fs),
+            "state": self.scheduler.state(ws, fs, ctl["paused"]),
+            "priority": priority,
             "lastScanAt": row.get("last_scan_at"),
             "lastSyncAt": row.get("last_sync_at"),
             "nextScanAt": (iso(rt.next_scan_at) or (iso(datetime.now(timezone.utc).timestamp())))
@@ -169,8 +174,10 @@ class IndexerService:
         }
 
     def status(self) -> dict:
+        ctl = self.store.control()
         return {
-            "filespaces": [self.filespace_status(ws, fs) for ws, fs in self.scheduler.targets()],
+            "paused": ctl["paused"],
+            "filespaces": [self.filespace_status(ws, fs, ctl) for ws, fs in self.scheduler.targets()],
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
             "blockSources": list(self.scheduler.block_sources),
@@ -200,7 +207,78 @@ class IndexerService:
             return False
         return self.scheduler.add_hint(ws, filespace, {"op": op, "path": path, "src": src})  # drops non-targets
 
+    def retry(self, workspace_id: Optional[str], filespace: str, paths: Optional[list[str]] = None,
+              all_failed: bool = False) -> int:
+        """Move named (or, with `all_failed`, every) failed file back to pending,
+        clearing the retry back-off, and ask for a sync of that source. Paths
+        that are not failed are ignored; skipped files are never retried."""
+        ws = self.resolve_workspace(workspace_id)
+        if ws is None:
+            return 0
+        if all_failed:
+            n = self.store.requeue_failed(ws, filespace)
+        elif paths:
+            n = self.store.requeue_failed(ws, filespace, paths)
+        else:
+            n = 0
+        if n:
+            self.scheduler.request_sync([(ws, filespace)])
+        return n
+
+    def control(self) -> dict:
+        ctl = self.store.control()
+        return {"paused": ctl["paused"], "pausedAt": ctl["paused_at"],
+                "priority": [{"workspaceId": p.get("workspaceId"), "filespace": p.get("filespace")}
+                             for p in ctl["priority"]]}
+
+    def set_control(self, paused: Optional[bool] = None, priority: Optional[list[dict]] = None) -> dict:
+        """Pause/resume and set the priority list. Sources that are not indexing
+        targets, and repeats, are dropped from `priority`."""
+        ctl = self.store.control()
+        new_paused, paused_at = ctl["paused"], ctl["paused_at"]
+        if paused is not None:
+            if paused and not ctl["paused"]:
+                paused_at = now_iso()
+            elif not paused:
+                paused_at = None
+            new_paused = bool(paused)
+        prio = ctl["priority"]
+        if priority is not None:
+            targets = set(self.scheduler.targets())
+            prio, seen = [], set()
+            for p in priority:
+                key = (p.get("workspaceId"), p.get("filespace"))
+                if key in targets and key not in seen:
+                    seen.add(key)
+                    prio.append({"workspaceId": key[0], "filespace": key[1]})
+        self.store.set_control(new_paused, paused_at, prio)
+        self.scheduler.wake()
+        return self.control()
+
     # ------------------------------------------------------------ query
+    def files(self, workspace_id: Optional[str], filespace: str, status: str, limit: int = 50,
+              offset: int = 0, q: Optional[str] = None) -> dict:
+        """One page of a source's files in one status, from the ledger."""
+        if status not in FILE_ORDER:
+            raise ValueError(f"unknown status {status!r}")
+        limit = max(1, min(int(limit), FILES_MAX))
+        ws = self.resolve_workspace(workspace_id)
+        if ws is None:
+            return {"files": [], "total": 0, "byReason": []}
+        row = self.store.filespace_row(ws, filespace) or {}
+        kind = row.get("kind") or KIND_LUCIDLINK
+        rows, total = self.store.list_files(ws, filespace, status, limit, max(0, int(offset)), q or None)
+        by_reason = ([{"reason": r["reason"], "files": r["files"]}
+                      for r in self.store.reasons(ws, filespace, status)]
+                     if status in ("failed", "skipped") else [])
+        return {
+            "files": [{"path": r["path"], "size": r["size"], "mtime": mtime_iso(r["mtime"]),
+                       "status": r["status"], "reason": r["reason"], "indexedAt": r["indexed_at"],
+                       "changedAt": r["changed_at"], "kind": kind} for r in rows],
+            "total": total,
+            "byReason": by_reason,
+        }
+
     def search(self, workspace_id: Optional[str], filespace: Optional[str], query: str, k: int = 20,
                path_prefix: Optional[str] = None) -> list[dict]:
         scopes = self.scopes(workspace_id, filespace)

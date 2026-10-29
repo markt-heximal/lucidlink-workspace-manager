@@ -76,7 +76,8 @@ def make_service(tmp_path) -> Callable[..., IndexerService]:
     def build(llm_answer: Optional[str] = None, llm_calls: Optional[list] = None,
               ruvector: Optional[httpx.MockTransport] = None, internal_key: str = KEY,
               **cfg) -> IndexerService:
-        config = Config(db_path=str(tmp_path / f"index{len(made)}.db"), internal_key=internal_key,
+        db_path = cfg.pop("db_path", None) or str(tmp_path / f"index{len(made)}.db")
+        config = Config(db_path=db_path, internal_key=internal_key,
                         embed_base_url="http://embed.test/v1", embed_model="fake-embed",
                         ruvector_url="http://ruvector.test" if ruvector else "",
                         llm_base_url="http://llm.test/v1" if llm_answer is not None else "",

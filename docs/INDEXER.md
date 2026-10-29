@@ -417,3 +417,47 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
   are exclusive (8–30 days counts under `30d`, not `7d`). `largestFolders`
   is the top 10 folders one level below the root by bytes (files directly in
   the root are in no folder).
+
+## Indexing controls
+
+The owner manages indexing from Engine › Indexer: what failed and why, what is
+queued, retry, pause everything, and which source goes first. All routes are
+under `/index/*` (internal key at the indexer, owner session at the proxy).
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/index/files` | `?workspaceId&filespace&status=failed\|skipped\|pending\|indexed&limit=50&offset=0&q=` | `{"files": [File], "total": n, "byReason": [{"reason", "files"}]}` |
+| POST | `/index/retry` | `{"workspaceId"?, "filespace", "paths"?: [path], "all"?: bool}` | `{"requeued": n}` |
+| GET | `/index/control` | — | `Control` |
+| PUT | `/index/control` | `{"paused"?: bool, "priority"?: [{"workspaceId", "filespace"}]}` | `Control` |
+
+`File`: `{"path", "size", "mtime" (ISO), "status", "reason", "indexedAt", "changedAt", "kind"}`.
+
+- `/index/files`: `limit` is capped at 200. `pending` is in queue order (the
+  order the indexer will work: newest `mtime` first); `failed` and `skipped`
+  are newest `mtime` first; `indexed` newest `indexedAt` first (ties by
+  path). `q` filters by a case-insensitive (ASCII case folding) substring of
+  the path; `%` and `_` match literally. `total` counts the status after `q`.
+  `byReason` groups the whole status (not just the page, and ignoring `q`) for
+  `failed` and `skipped`, largest first, top 20, and is `[]` for the others.
+  `filespace` and `status` are required (422 otherwise); an unknown source
+  gives an empty result, not 404.
+- `/index/retry`: moves the named `failed` files (or every failed file of the
+  source with `"all": true`) back to `pending`, clearing the retry back-off,
+  and asks for a sync of that source when at least one file was requeued.
+  Requeueing also clears the failure `reason` and stored content hash, so the
+  file is read and extracted afresh. Paths that are not failed are ignored.
+  Skipped files are not retried (their reasons are about type or size; changing
+  the file or the limits re-queues them on the next scan).
+- `Control`: `{"paused": bool, "pausedAt": ISO|null, "priority": [{"workspaceId",
+  "filespace"}]}`, persisted in the index database (table `control`). Fields
+  omitted from a PUT are unchanged; `pausedAt` is set when pausing (kept by a
+  repeated pause) and cleared on resume. While paused, no new job
+  starts (a running one finishes its current time slice), hints are kept
+  queued, and search, ask, survey and status keep working. `priority` lists
+  sources that are offered a job slot before the round-robin order; unknown
+  sources in it (not an indexing target) and repeats are dropped on PUT.
+  `/index/status` gains top-level `"paused"` and each filespace entry gains
+  `"priority": int|null` (its 0-based position in that list) and
+  `"state": "paused"` while paused and no job is running for it (this takes
+  precedence over `idle` and `error`; `disabled` still wins).
