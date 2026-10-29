@@ -285,6 +285,43 @@ class Store:
     def dismiss_missing(self, name: str) -> bool:
         return self.execute("UPDATE source_missing SET dismissed=1 WHERE name=?", (name,)) > 0
 
+    def rekey_block_sources(self, names: set[str], target: str) -> list[str]:
+        """Move block sources (kind "block") indexed under another workspace to `target`.
+
+        Files, chunks and surveys keep their point ids and embeddings, so nothing is
+        re-read; the Ruvector mirror forgets those points so they are re-sent with the
+        new workspace in their payload.
+        """
+        moved: list[str] = []
+        rows = self.query("SELECT workspace_id, filespace FROM filespaces WHERE kind='block' AND workspace_id != ?",
+                          (target,))
+        for r in rows:
+            ws, fs = r["workspace_id"], r["filespace"]
+            if fs not in names:
+                continue
+            with self.tx() as c:
+                if c.execute("SELECT 1 FROM filespaces WHERE workspace_id=? AND filespace=?", (target, fs)).fetchone():
+                    continue   # already there (a source of that name exists in the target): leave the old one
+                for table in ("files", "chunks", "surveys"):
+                    c.execute(f"UPDATE {table} SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
+                c.execute("UPDATE filespaces SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
+                c.execute("DELETE FROM mirror_points WHERE point_id IN "
+                          "(SELECT point_id FROM chunks WHERE workspace_id=? AND filespace=?)", (target, fs))
+                ctl = c.execute("SELECT priority FROM control WHERE id=1").fetchone()
+                if ctl:
+                    prio = json.loads(ctl[0] or "[]")
+                    changed = False
+                    for item in prio:
+                        if item.get("workspaceId") == ws and item.get("filespace") == fs:
+                            item["workspaceId"] = target
+                            changed = True
+                    if changed:
+                        c.execute("UPDATE control SET priority=? WHERE id=1", (json.dumps(prio),))
+            moved.append(fs)
+        if moved:
+            self.bump()
+        return moved
+
     def purge_source(self, ws: str, fs: str) -> tuple[int, int]:
         """Forget everything indexed for one source: (files, chunks) deleted."""
         with self.tx() as c:

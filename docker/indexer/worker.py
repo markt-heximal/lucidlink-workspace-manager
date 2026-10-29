@@ -40,6 +40,9 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from . import folders
+
+# The workspace id of drives the Mini reaches itself (NAS, local folders).
+MINI_WORKSPACE = "mini"
 from .block import KIND_BLOCK, KIND_LUCIDLINK, BlockSpec, NotMounted, parse_block_sources
 from .embedder import EmbedError
 from .scanner import FilespaceIndexer
@@ -90,9 +93,9 @@ class Scheduler:
         self._env_specs: list[BlockSpec] = [dataclasses.replace(b, host_path=self.cfg.block_slot_hosts.get(b.path) or None)
                                             for b in parse_block_sources(self.cfg.block_sources)]
         self._specs: Optional[list[BlockSpec]] = None    # env + app folders, minus removed
+        self._rekeyed = False
         self._block_roots: dict[Key, str] = {}        # accepted block targets -> container path
         self._block_conflicts: dict[Key, str] = {}    # refused block names -> why
-        self._block_ws: Optional[str] = None          # last resolved block workspace
         self.block_sources: list[dict] = []           # for /index/status
         self.settings_error: Optional[str] = None
         self._stopping = threading.Event()
@@ -143,6 +146,8 @@ class Scheduler:
         if workspaces is None and not self._block_specs:
             self._targets_at = now
             return list(self._targets)
+        if self._block_specs:
+            self._rekey_block_sources()
         block_ws = self._block_workspace() if self._block_specs else None
         block_names = {(block_ws, b.name) for b in self._block_specs if b.error is None}
         keys: list[Key] = []
@@ -178,16 +183,20 @@ class Scheduler:
         return list(keys)
 
     def _block_workspace(self) -> str:
-        """BLOCK_SOURCE_WORKSPACE, else the vault's active workspace, else "local"."""
-        if self.cfg.block_source_workspace:
-            return self.cfg.block_source_workspace
-        try:
-            active = self.svc.settings.active_workspace_id()
-        except Exception:
-            active = None   # vault unreadable: keep the last answer so keys do not flap
-        if active:
-            self._block_ws = active
-        return self._block_ws or "local"
+        """BLOCK_SOURCE_WORKSPACE, else "mini": drives the Mini reaches belong to the Mini,
+        not to whichever LucidLink workspace is active (docs: This Mini)."""
+        return self.cfg.block_source_workspace or MINI_WORKSPACE
+
+    def _rekey_block_sources(self) -> None:
+        """Once: move block sources indexed under another workspace to the block workspace."""
+        if self._rekeyed:
+            return
+        self._rekeyed = True
+        target = self._block_workspace()
+        names = {b.name for b in self._block_specs}
+        moved = self.svc.store.rekey_block_sources(names, target)
+        if moved:
+            logger.info("moved block sources to workspace %r: %s", target, ", ".join(sorted(moved)))
 
     def _block_targets(self, block_ws: Optional[str], filespaces: list[Key]
                        ) -> tuple[dict[Key, str], dict[Key, str], list[dict]]:

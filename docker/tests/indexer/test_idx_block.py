@@ -77,13 +77,15 @@ def test_block_source_is_a_target_of_kind_block(block, share):
                                    "hostPath": None, "root": None, "folder": None}]
 
 
-def test_block_workspace_from_config_or_local(block, make_service, share):
+def test_block_workspace_from_config_or_the_mini(block, make_service, share):
     svc = block(block_source_workspace="studio")
     assert ("studio", "NAS") in svc.scheduler.targets()
-    svc = block()
+    # Unset: the Mini's own workspace, whatever the vault's active workspace is.
+    svc = block(block_source_workspace="")
+    assert ("mini", "NAS") in svc.scheduler.targets()
     svc.settings.payload["activeWorkspaceId"] = None
     svc.scheduler.refresh_targets(force=True)
-    assert ("local", "NAS") in svc.scheduler.targets()
+    assert ("mini", "NAS") in svc.scheduler.targets()
 
 
 def test_index_tree_then_unchanged_rescan_reads_nothing(block, share, reads):

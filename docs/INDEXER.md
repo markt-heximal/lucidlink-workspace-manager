@@ -312,7 +312,7 @@ cannot write to it whatever the code does.
 |---|---|
 | `BLOCK_SOURCE_PATH`, `BLOCK_SOURCE_PATH_2` … `_6` | Host folders (a NAS share, drive, iCloud Drive, Desktop), each mounted read-only in its own slot, `/block/source1` … `/block/source6`, so the container sees only those folders. Unset slots get an empty placeholder. |
 | `BLOCK_SOURCES` | `name=/container/path` entries separated by `;`, e.g. `NAS=/block/source1`. Empty: no block sources. |
-| `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to (they appear in that workspace's "all filespaces" search). Default: the vault's active workspace. |
+| `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to. Default: `mini` (This Mini; see below). |
 
 **The helper.** `docker/add-folder.sh` does the steps above in one command on
 the Mini: `./add-folder.sh smb://nas.local/Projects` (mounts the share first;
@@ -463,6 +463,21 @@ as indexing: no symlinks, never outside the folder, system files hidden.
 The file service's `/index/{path}` proxy streams responses and passes `Range`,
 `Content-Range`, `Accept-Ranges`, `Content-Length` and `Content-Disposition`
 through, so large files are not held in memory.
+
+### This Mini and All drives
+
+Drives the Mini reaches itself (block sources: NAS shares, USB disks, local
+folders) belong to the workspace id **`mini`** ("This Mini" in the app), not to
+whichever LucidLink workspace is active. `BLOCK_SOURCE_WORKSPACE` still
+overrides it. On the first scheduling pass after upgrading, block sources
+indexed under another workspace are moved to `mini` in place (files, chunks,
+surveys and the indexing priority list keep their ids and embeddings, so
+nothing is re-read; their Ruvector points are re-sent with the new workspace).
+
+`workspaceId: "*"` (body, query or `X-Workspace-Id`) means **every workspace**,
+the Mini's included, for search, ask and recent: the app's "All drives". With a
+`filespace` it is that name in whichever workspace has it. Status, survey and
+the folder endpoints are unchanged.
 
 ## Indexing controls
 
