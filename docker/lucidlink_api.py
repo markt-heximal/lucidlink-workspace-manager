@@ -41,6 +41,7 @@ from ll_core import (
 )
 from connect_api import router as connect_router
 from insights_api import router as insights_router
+import vault
 from vault import router as vault_router
 from updates import router as updates_router, start_scheduler, stop_scheduler
 import owner_auth
@@ -52,6 +53,11 @@ BOOT_MONO = time.monotonic()
 
 @asynccontextmanager
 async def _lifespan(_app):
+    # One-time purge of retired MinIO profiles from the vault (phase 4).
+    try:
+        vault.ensure_migrated()
+    except Exception as e:  # never block startup on the vault
+        logger.warning("vault migration skipped: %s", type(e).__name__)
     start_scheduler()
     yield
     stop_scheduler()

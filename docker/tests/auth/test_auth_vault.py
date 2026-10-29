@@ -11,7 +11,7 @@ from auth_helpers import SA_TOKEN, SA_TOKEN_2, OTHER_JWT, owner_headers
 def test_round_trip_and_ciphertext_on_disk(seeded_vault, env):
     data = vault.load()
     assert data["workspaces"][0]["token"] == SA_TOKEN
-    assert data["minioProfiles"][0]["secretAccessKey"] == "minio-secret"
+    assert "minioProfiles" not in data and "activeMinioProfileId" not in data
     raw = b""
     for name in ("vault.db", "vault.db-wal"):
         p = env / name
@@ -43,7 +43,7 @@ def test_masking():
     })
     assert m["workspaces"][0] == {"id": "a", "token": "sa_live:••••3f2a", "tokenSet": True}
     assert m["workspaces"][1] == {"id": "b", "token": "", "tokenSet": False}
-    assert m["minioProfiles"][0]["secretAccessKey"] == "s3cret"
+    assert "minioProfiles" not in m and "s3cret" not in str(m)
 
 
 def test_merge_rules(seeded_vault):
@@ -66,7 +66,7 @@ def test_merge_rules(seeded_vault):
     assert "tokenSet" not in by_id["default"]
     # Omitted top-level keys keep their stored values.
     assert stored["activeWorkspaceId"] == "default"
-    assert stored["minioProfiles"][0]["id"] == "ugreen"
+    assert "minioProfiles" not in stored
     assert out["workspaces"][2]["token"] == "sa_live:••••1234"
     assert out["updatedAt"]
 
@@ -128,7 +128,8 @@ def test_settings_require_owner(client, seeded_vault, supabase):
     body = r.json()
     assert body["workspaces"][0]["token"] == "sa_live:••••3f2a"
     assert SA_TOKEN not in r.text and SA_TOKEN_2 not in r.text
-    assert body["minioProfiles"][0]["secretAccessKey"] == "minio-secret"
+    assert "minioProfiles" not in body and "activeMinioProfileId" not in body
+    assert "minio-secret" not in r.text
     assert body["updatedAt"]
 
     r = client.put("/vault/settings", headers=owner_headers(), json={**body, "activeWorkspaceId": "ws2"})
@@ -208,3 +209,93 @@ def test_favorites_routes_owner_only(client, seeded_vault, supabase):
 def test_favorites_503_when_vault_not_configured(client, env, supabase, monkeypatch):
     monkeypatch.delenv("VAULT_KEY")
     assert client.get("/vault/favorites", headers=owner_headers()).status_code == 503
+
+
+# ---------------------------------------------------------------- MinIO retired (phase 4)
+def _raw_payload():
+    import json
+    with vault._connect() as conn:
+        row = conn.execute("SELECT ciphertext, updated_at FROM vault WHERE id = 1").fetchone()
+    return json.loads(vault._fernet().decrypt(bytes(row[0]))), row[1]
+
+
+def test_purge_retired_migration(legacy_vault, caplog):
+    import logging
+    with caplog.at_level(logging.INFO, logger="vault"):
+        assert vault.purge_retired() == 2
+    raw, updated_at = _raw_payload()
+    assert "minioProfiles" not in raw and "activeMinioProfileId" not in raw
+    assert raw["workspaces"] == legacy_vault["workspaces"]
+    assert raw["activeWorkspaceId"] == "default"
+    assert raw["favorites"] == legacy_vault["favorites"]
+    assert updated_at == "2026-01-01T00:00:00Z"            # settings unchanged
+    assert "purged 2 retired MinIO profile(s)" in caplog.text
+    for secret in ("minio-secret", "AKIA123", "ugreen", SA_TOKEN):
+        assert secret not in caplog.text                   # count only, never values
+    assert vault.purge_retired() == 0                      # idempotent
+    assert vault.token_for(None) == SA_TOKEN
+
+
+def test_purge_on_write(legacy_vault):
+    vault.save({"activeWorkspaceId": "default"})
+    raw, _ = _raw_payload()
+    assert "minioProfiles" not in raw and "activeMinioProfileId" not in raw
+    assert raw["favorites"] == legacy_vault["favorites"]
+    assert raw["workspaces"][0]["token"] == SA_TOKEN
+
+
+def test_purge_on_favorites_write(legacy_vault):
+    vault.save_favorites({"favorites": legacy_vault["favorites"]})
+    raw, _ = _raw_payload()
+    assert "minioProfiles" not in raw
+    assert raw["workspaces"] == legacy_vault["workspaces"]
+
+
+def test_first_read_migrates(client, legacy_vault, supabase):
+    r = client.get("/vault/settings", headers=owner_headers())
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"workspaces", "activeWorkspaceId", "updatedAt"}
+    assert body["workspaces"][0]["token"] == "sa_live:••••3f2a"
+    assert "minio" not in r.text.lower()
+    raw, _ = _raw_payload()
+    assert "minioProfiles" not in raw and raw["favorites"] == legacy_vault["favorites"]
+    assert client.get("/vault/favorites", headers=owner_headers()).json() == {
+        "favorites": legacy_vault["favorites"]}
+
+
+def test_startup_migrates(legacy_vault):
+    import lucidlink_api
+    with TestClient(lucidlink_api.app):
+        pass
+    raw, _ = _raw_payload()
+    assert "minioProfiles" not in raw and "activeMinioProfileId" not in raw
+    assert raw["favorites"] == legacy_vault["favorites"]
+
+
+def test_ensure_migrated_without_key_is_quiet(monkeypatch, tmp_path):
+    monkeypatch.delenv("VAULT_KEY", raising=False)
+    monkeypatch.setenv("VAULT_PATH", str(tmp_path / "v.db"))
+    vault.ensure_migrated()                                # no raise
+
+
+def test_older_app_put_with_minio_fields_is_accepted_and_dropped(client, seeded_vault, supabase):
+    vault.save_favorites({"favorites": [FAV]})
+    r = client.put("/vault/settings", headers=owner_headers(), json={
+        "workspaces": [{"id": "default", "token": "sa_live:••••3f2a", "tokenSet": True},
+                       {"id": "ws2"}],
+        "activeWorkspaceId": "ws2",
+        "minioProfiles": [{"id": "x", "secretAccessKey": "new-minio-secret"}],
+        "activeMinioProfileId": "x",
+    })
+    assert r.status_code == 200
+    assert "minio" not in r.text.lower()
+    # Even malformed retired fields are ignored, not rejected.
+    r = client.put("/vault/settings", headers=owner_headers(),
+                   json={"minioProfiles": "nope", "activeMinioProfileId": 5})
+    assert r.status_code == 200
+    raw, _ = _raw_payload()
+    assert "minioProfiles" not in raw and "activeMinioProfileId" not in raw
+    assert raw["activeWorkspaceId"] == "ws2"
+    assert [w["token"] for w in raw["workspaces"]] == [SA_TOKEN, SA_TOKEN_2]
+    assert raw["favorites"] == [FAV]

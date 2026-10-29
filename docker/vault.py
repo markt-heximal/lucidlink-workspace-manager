@@ -1,8 +1,14 @@
 """Encrypted settings vault (docs/INDEXER.md, "Vault").
 
-Holds the owner's LucidLink service-account tokens (one per workspace) and MinIO
-profiles server-side, so a signed-in browser never needs to keep a LucidLink
-token, and the indexer can crawl without a browser open.
+Holds the owner's LucidLink service-account tokens (one per workspace) and the
+synced Favorites server-side, so a signed-in browser never needs to keep a
+LucidLink token, and the indexer can crawl without a browser open.
+
+MinIO profiles are retired (Simplification phase 4): the settings payload no
+longer carries `minioProfiles`/`activeMinioProfileId`, a PUT that still sends
+them has them silently dropped, and any stored copy is purged from the
+encrypted row on the next write or by `purge_retired()`, which the file service
+runs once at startup and before its first vault read.
 
 Storage is one row in SQLite at `VAULT_PATH` (default `/data/vault.db`): the
 whole payload as Fernet(`VAULT_KEY`)-encrypted JSON. The file service is the
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -31,8 +38,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 
 import owner_auth
 
+logger = logging.getLogger("vault")
+
 MASK = "••••"
-_TOP_KEYS = ("workspaces", "activeWorkspaceId", "minioProfiles", "activeMinioProfileId")
+_TOP_KEYS = ("workspaces", "activeWorkspaceId")
+# Retired in Simplification phase 4 (in-app MinIO console removed). Never
+# returned; dropped from incoming PUTs; purged from the stored row.
+_RETIRED_KEYS = ("minioProfiles", "activeMinioProfileId")
 # Stored alongside the settings in the same encrypted row, but served by its own
 # routes (`/vault/favorites`), never in the settings payload.
 _FAVORITES_KEY = "favorites"
@@ -52,8 +64,7 @@ class VaultNotConfigured(VaultError):
 
 
 def _empty() -> dict:
-    return {"workspaces": [], "activeWorkspaceId": None,
-            "minioProfiles": [], "activeMinioProfileId": None}
+    return {"workspaces": [], "activeWorkspaceId": None}
 
 
 def _path() -> str:
@@ -101,13 +112,23 @@ def _connect() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def _decrypt(f: Fernet, blob: bytes) -> dict:
+def _decrypt_raw(f: Fernet, blob: bytes) -> dict:
+    """The stored JSON exactly as written, retired keys included."""
     try:
         data = json.loads(f.decrypt(bytes(blob)))
     except InvalidToken:
         raise VaultError("Vault cannot be decrypted with the configured VAULT_KEY")
     if not isinstance(data, dict):
         raise VaultError("Vault payload is corrupt")
+    return data
+
+
+def _decrypt(f: Fernet, blob: bytes) -> dict:
+    """The stored payload normalised to the current shape (retired keys dropped)."""
+    return _normalise(_decrypt_raw(f, blob))
+
+
+def _normalise(data: dict) -> dict:
     out = _empty()
     out.update({k: data.get(k, out[k]) for k in _TOP_KEYS})
     favs = data.get(_FAVORITES_KEY)
@@ -156,8 +177,8 @@ def masked(payload: dict) -> dict:
     """Copy of `payload` safe to return to the owner.
 
     Each workspace token becomes `<prefix>••••<last4>` and gains a `tokenSet`
-    flag. MinIO credentials stay as they are: the in-browser S3 console needs
-    them, and only the owner can read this.
+    flag. Only the current settings keys are copied, so retired keys (MinIO
+    profiles) and favorites never reach the response.
     """
     out = copy.deepcopy({k: payload.get(k, v) for k, v in _empty().items()})
     for ws in out.get("workspaces") or []:
@@ -172,27 +193,25 @@ def masked(payload: dict) -> dict:
 def _validate(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise ValueError("Settings must be a JSON object")
-    for key in ("workspaces", "minioProfiles"):
-        items = payload.get(key)
-        if items is None:
-            continue
+    # Retired keys (minioProfiles, activeMinioProfileId) are not validated:
+    # older app builds may still send them, and they are dropped unread.
+    items = payload.get("workspaces")
+    if items is not None:
         if not isinstance(items, list):
-            raise ValueError(f"'{key}' must be a list")
+            raise ValueError("'workspaces' must be a list")
         seen: set[str] = set()
         for item in items:
             if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
-                raise ValueError(f"Every entry in '{key}' needs a non-empty string 'id'")
+                raise ValueError("Every entry in 'workspaces' needs a non-empty string 'id'")
             if item["id"] in seen:
-                raise ValueError(f"Duplicate id '{item['id']}' in '{key}'")
+                raise ValueError(f"Duplicate id '{item['id']}' in 'workspaces'")
             seen.add(item["id"])
-        if key == "workspaces":
-            for item in items:
-                tok = item.get("token", "")
-                if tok is not None and not isinstance(tok, str):
-                    raise ValueError("Workspace 'token' must be a string or null")
-    for key in ("activeWorkspaceId", "activeMinioProfileId"):
-        if payload.get(key) is not None and not isinstance(payload.get(key), str):
-            raise ValueError(f"'{key}' must be a string or null")
+            tok = item.get("token", "")
+            if tok is not None and not isinstance(tok, str):
+                raise ValueError("Workspace 'token' must be a string or null")
+    active = payload.get("activeWorkspaceId")
+    if active is not None and not isinstance(active, str):
+        raise ValueError("'activeWorkspaceId' must be a string or null")
 
 
 def _merge_token(incoming: dict, stored: Optional[dict]) -> Optional[str]:
@@ -222,10 +241,13 @@ def merge(stored: dict, incoming: dict) -> dict:
 
     The incoming `workspaces` list is the new list (order and membership), with
     tokens merged by workspace id. A top-level key the client omits keeps its
-    stored value. MinIO profiles are taken as sent.
+    stored value. Retired keys (MinIO profiles) in `incoming` are ignored, and
+    any left in `stored` are dropped from the result.
     """
     _validate(incoming)
     out = copy.deepcopy(stored)
+    for key in _RETIRED_KEYS:
+        out.pop(key, None)
     if "workspaces" in incoming and incoming["workspaces"] is not None:
         by_id = {w.get("id"): w for w in stored.get("workspaces") or [] if isinstance(w, dict)}
         merged = []
@@ -236,11 +258,8 @@ def merge(stored: dict, incoming: dict) -> dict:
         out["workspaces"] = merged
     elif "workspaces" in incoming:
         out["workspaces"] = []
-    if "minioProfiles" in incoming:
-        out["minioProfiles"] = copy.deepcopy(incoming["minioProfiles"] or [])
-    for key in ("activeWorkspaceId", "activeMinioProfileId"):
-        if key in incoming:
-            out[key] = incoming[key]
+    if "activeWorkspaceId" in incoming:
+        out["activeWorkspaceId"] = incoming["activeWorkspaceId"]
     return out
 
 
@@ -278,6 +297,56 @@ def save(payload: dict) -> dict:
     """
     new, updated_at = _update(lambda stored: merge(stored, payload))
     return {**masked(new), "updatedAt": updated_at}
+
+
+# ---------------------------------------------------------------- migration
+_migrated: set[str] = set()
+
+
+def purge_retired() -> int:
+    """Re-encrypt the stored row without retired keys (MinIO profiles).
+
+    One-time migration for vaults written before Simplification phase 4.
+    Workspaces, tokens, favorites and `updatedAt` are kept exactly as stored.
+    Returns how many MinIO profiles were removed (0 when there was nothing to
+    purge, or no row). Logs that count only, never any value.
+    """
+    f = _fernet()
+    if not os.path.exists(_path()):
+        return 0
+    with _connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT ciphertext FROM vault WHERE id = 1").fetchone()
+            raw = _decrypt_raw(f, row[0]) if row else {}
+            if not any(k in raw for k in _RETIRED_KEYS):
+                conn.execute("ROLLBACK")
+                return 0
+            profiles = raw.get("minioProfiles")
+            count = len(profiles) if isinstance(profiles, list) else 0
+            kept = {k: v for k, v in raw.items() if k not in _RETIRED_KEYS}
+            blob = f.encrypt(json.dumps(kept, separators=(",", ":")).encode("utf-8"))
+            conn.execute("UPDATE vault SET ciphertext = ? WHERE id = 1", (blob,))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    logger.info("vault: purged %d retired MinIO profile(s) from stored settings", count)
+    return count
+
+
+def ensure_migrated() -> None:
+    """Run `purge_retired()` once per vault path per process (file service only:
+    it is the vault's writer). Quietly does nothing when the vault is not
+    configured; a decrypt failure surfaces on the read that follows."""
+    path = _path()
+    if path in _migrated:
+        return
+    try:
+        purge_retired()
+    except VaultError:
+        return
+    _migrated.add(path)
 
 
 # ---------------------------------------------------------------- favorites
@@ -388,6 +457,7 @@ def vault_status():
 @router.get("/settings")
 def get_settings(_owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
     try:
+        ensure_migrated()
         payload, updated_at = load_record()
     except VaultError as e:
         raise _vault_http_error(e)
@@ -408,6 +478,7 @@ def put_settings(body: Any = Body(...),
 @router.get("/favorites")
 def get_favorites(_owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
     try:
+        ensure_migrated()
         return {"favorites": load_favorites()}
     except VaultError as e:
         raise _vault_http_error(e)
