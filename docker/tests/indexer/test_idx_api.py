@@ -174,7 +174,11 @@ def test_survey_lifecycle(make_service):
         assert c.get("/index/survey", params={"filespace": "fsA"}, headers=H).status_code == 404
         run(svc)    # a changed sync generates the root survey
         got = c.get("/index/survey", params={"filespace": "fsA", "scope": "/"}, headers=H).json()
-        assert got["topics"] == topics["topics"] and got["stale"] is False
+        doc = got["topics"][0]["documents"][0]
+        assert doc["excerpt"].startswith("budget invoices pricing")      # the passage that matched
+        assert len(doc["excerpt"]) <= 221 and "\n" not in doc["excerpt"]
+        assert {k: v for k, v in doc.items() if k != "excerpt"} == topics["topics"][0]["documents"][0]
+        assert got["stale"] is False
         assert got["sources"] == ["/budget.md"] and got["generatedAt"] and got["raw"].startswith("```")
         assert "document librarian" in calls[0]["messages"][0]["content"]
 
@@ -191,3 +195,16 @@ def test_survey_without_llm(make_service):
     svc = make_service()
     with client(svc) as c:
         assert c.post("/index/survey", json={"filespace": "fsA"}, headers=H).status_code == 503
+
+
+def test_survey_excerpts_skip_invented_paths():
+    from indexer.survey import attach_excerpts, card_excerpt
+    topics = [{"name": "T", "description": "", "dateRange": "",
+               "documents": [{"path": "/real.md", "title": "", "date": ""},
+                             {"path": "/invented.md", "title": "", "date": ""}]}]
+    picked = [{"path": "/real.md", "text": "First   line\n\nsecond " + "word " * 80},
+              {"path": "/real.md", "text": "a later chunk"}]
+    docs = attach_excerpts(topics, picked)[0]["documents"]
+    assert docs[0]["excerpt"].startswith("First line second") and docs[0]["excerpt"].endswith("…")
+    assert "excerpt" not in docs[1]
+    assert card_excerpt("short text") == "short text"

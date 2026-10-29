@@ -74,6 +74,33 @@ def parse_topics(answer: str) -> list[dict]:
     return out
 
 
+EXCERPT_CARD_CHARS = 220
+
+
+def card_excerpt(text: str, limit: int = EXCERPT_CARD_CHARS) -> str:
+    """A short, single-paragraph passage for a topic card: whitespace collapsed,
+    cut at a word boundary."""
+    flat = " ".join((text or "").split())
+    if len(flat) <= limit:
+        return flat
+    cut = flat[:limit].rsplit(" ", 1)[0].rstrip(",;:-")
+    return cut + "…"
+
+
+def attach_excerpts(topics: list[dict], picked: list[dict]) -> list[dict]:
+    """Give each topic document the passage that brought it into the survey:
+    the first excerpt seen for its path (probe hits arrive most relevant first).
+    A path the model invented has no excerpt and gets none."""
+    first: dict[str, str] = {}
+    for e in picked:
+        first.setdefault(e["path"], e["text"])
+    for t in topics:
+        for d in t["documents"]:
+            if d["path"] in first:
+                d["excerpt"] = card_excerpt(first[d["path"]])
+    return topics
+
+
 def _normalise_scope(scope: str) -> str:
     scope = "/" + "/".join(p for p in (scope or "/").split("/") if p)
     return scope
@@ -100,7 +127,7 @@ def generate(svc: "IndexerService", ws: str, fs: str, scope: str = "/") -> dict:
                 "stale": False, "empty": True}
     body = "\n---\n".join(f"PATH: {e['path']}\nEXCERPT: {e['text'][:EXCERPT_CHARS]}" for e in picked)
     answer = svc.llm.chat(SURVEY_SYSTEM, f"Filespace: {fs}\nScope: {scope}\n\n{body}")
-    payload = {"topics": parse_topics(answer), "raw": answer,
+    payload = {"topics": attach_excerpts(parse_topics(answer), picked), "raw": answer,
                "sources": list(dict.fromkeys(e["path"] for e in picked))}
     svc.store.put_survey(ws, fs, scope, json.dumps(payload), generated_at)
     return {**payload, "generatedAt": generated_at, "stale": False}
