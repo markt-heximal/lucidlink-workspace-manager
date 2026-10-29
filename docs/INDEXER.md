@@ -634,6 +634,32 @@ so they follow the owner across devices. Owner-only, like `/vault/settings`:
 `kind` one of the two values and ids unique; anything else is a 400 and the
 stored list is unchanged.
 
+### Simplification phase 3: What's new, storage at a glance, first run
+
+**What's new.** `GET /index/recent` gains filters and paging so the app can show
+every change across every location, grouped by day:
+
+- `kind=documents|presentations|images|video` — the same mapping as `/index/bykind`
+  (deletions are classed by their last name); unknown kind → 400.
+- `change=new|modified|renamed|deleted` (comma-separated for several); unknown → 400.
+- `since=ISO` and `before=ISO` — only changes with `when` ≥ `since` / strictly < `before`.
+- `limit` stays capped at 200.
+
+Each `RecentFile` gains `"when": "ISO"` (the timestamp it is ordered by: the file's
+`mtime` for live files, `changedAt` for deletions and renames) and `"type"` (the
+profile's type class). The response gains `"next": "ISO"|null`: pass it as
+`before` to read the following page (null when there is nothing older). Ties on
+`when` are not split across pages (a page may run a little over `limit`).
+Future-dated files stay excluded as before.
+
+**Storage at a glance.** No new route: the app reads `totals` from `/index/status`
+and, for the location being looked at, `GET /index/profile` (`byType`,
+`largestFolders`, `ages`, `skipped`). `largestFolders` items gain `"files"` and
+`"bytes"` already; nothing else changes.
+
+**First run.** No new route: the app uses `/index/folders/prompts` (new cloud
+accounts and drives) and `/index/folders` (roots and connected sources) to offer "Choose what to search".
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is
