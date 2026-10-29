@@ -362,17 +362,18 @@ class IndexerService:
         ordered = (dirs + files)[:LIST_MAX]
         ws = self.scheduler._block_workspace()
         ids = [e.file_id for e in ordered if e.type == "file"]
-        status: dict[str, str] = {}
+        status: dict[str, tuple[str, Optional[str]]] = {}
         for i in range(0, len(ids), 500):
             part = ids[i:i + 500]
             for r in self.store.query(
-                    f"SELECT file_id, status FROM files WHERE workspace_id=? AND filespace=? "
+                    f"SELECT file_id, status, reason FROM files WHERE workspace_id=? AND filespace=? "
                     f"AND file_id IN ({','.join('?' * len(part))})", [ws, name, *part]):
-                status[r["file_id"]] = r["status"]
+                status[r["file_id"]] = (r["status"], r["reason"])
         base = "" if folder == "/" else folder
         out = [{"name": e.name, "path": f"{base}/{e.name}", "isDir": e.type == "dir",
                 "size": e.size if e.type == "file" else None, "mtime": mtime_iso(e.mtime),
-                "status": (status.get(e.file_id) if e.type == "file" else None)} for e in ordered]
+                "status": (status.get(e.file_id, (None, None))[0] if e.type == "file" else None),
+                "reason": (status.get(e.file_id, (None, None))[1] if e.type == "file" else None)} for e in ordered]
         parent = None if folder == "/" else (folder.rsplit("/", 1)[0] or "/")
         return {"name": name, "path": folder, "parent": parent, "entries": out,
                 "truncated": len(dirs) + len(files) > LIST_MAX}
