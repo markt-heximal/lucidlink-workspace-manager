@@ -58,6 +58,7 @@ def test_roots_and_browse(svc):
             {"id": "volumes", "label": "Drives and network shares", "hostPath": "/Volumes", "available": True},
             {"id": "icloud", "label": "iCloud Drive", "hostPath": "/Users/m/iCloud", "available": True},
             {"id": "desktop", "label": "Desktop", "hostPath": None, "available": False},
+            {"id": "documents", "label": "Documents", "hostPath": None, "available": False},
         ]
         assert [s["name"] for s in body["sources"]] == ["Archive-old"]
         assert body["sources"][0]["origin"] == "mini" and body["sources"][0]["hostPath"] == "/Volumes/Archive"

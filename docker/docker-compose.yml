@@ -108,6 +108,7 @@ services:
       - BLOCK_ROOT_VOLUMES=${BLOCK_ROOT_VOLUMES:-/Volumes}
       - BLOCK_ROOT_ICLOUD=${BLOCK_ROOT_ICLOUD:-}
       - BLOCK_ROOT_DESKTOP=${BLOCK_ROOT_DESKTOP:-}
+      - BLOCK_ROOT_DOCUMENTS=${BLOCK_ROOT_DOCUMENTS:-}
       - BLOCK_SOURCE_PATH=${BLOCK_SOURCE_PATH:-}
       - BLOCK_SOURCE_PATH_2=${BLOCK_SOURCE_PATH_2:-}
       - BLOCK_SOURCE_PATH_3=${BLOCK_SOURCE_PATH_3:-}
@@ -127,11 +128,12 @@ services:
       - ${BLOCK_SOURCE_PATH_5:-./block-empty}:/block/source5:ro
       - ${BLOCK_SOURCE_PATH_6:-./block-empty}:/block/source6:ro
       # Places the owner browses from the app to connect folders without a
-      # restart: every drive and share mounted on the Mini, iCloud Drive and
-      # Desktop. Read-only; the indexer reads only the folders chosen in the app.
+      # restart: every drive and share mounted on the Mini, iCloud Drive,
+      # Desktop and Documents. Read-only; the indexer reads only the folders chosen in the app.
       - ${BLOCK_ROOT_VOLUMES:-/Volumes}:/host/volumes:ro
       - ${BLOCK_ROOT_ICLOUD:-./block-empty}:/host/icloud:ro
       - ${BLOCK_ROOT_DESKTOP:-./block-empty}:/host/desktop:ro
+      - ${BLOCK_ROOT_DOCUMENTS:-./block-empty}:/host/documents:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
       interval: 30s

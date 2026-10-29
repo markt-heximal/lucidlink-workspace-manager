@@ -20,6 +20,7 @@ ROOTS: tuple[tuple[str, str], ...] = (
     ("volumes", "Drives and network shares"),
     ("icloud", "iCloud Drive"),
     ("desktop", "Desktop"),
+    ("documents", "Documents"),
 )
 ROOT_LABELS = dict(ROOTS)
 BROWSE_MAX = 500

@@ -111,7 +111,8 @@ class Config:
             block_root_base=os.environ.get("BLOCK_ROOT_BASE", "/host").rstrip("/") or "/host",
             block_root_hosts={rid: os.environ.get(var, "").strip()
                               for rid, var in (("volumes", "BLOCK_ROOT_VOLUMES"), ("icloud", "BLOCK_ROOT_ICLOUD"),
-                                               ("desktop", "BLOCK_ROOT_DESKTOP"))},
+                                               ("desktop", "BLOCK_ROOT_DESKTOP"),
+                                               ("documents", "BLOCK_ROOT_DOCUMENTS"))},
             block_slot_hosts={f"/block/source{n}": os.environ.get(
                 "BLOCK_SOURCE_PATH" if n == 1 else f"BLOCK_SOURCE_PATH_{n}", "").strip() for n in range(1, 7)},
         )
