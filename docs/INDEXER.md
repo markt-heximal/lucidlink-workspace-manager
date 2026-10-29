@@ -349,3 +349,38 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
   are exclusive (8–30 days counts under `30d`, not `7d`). `largestFolders`
   is the top 10 folders one level below the root by bytes (files directly in
   the root are in no folder).
+
+## Indexing controls
+
+The owner manages indexing from Engine › Indexer: what failed and why, what is
+queued, retry, pause everything, and which source goes first. All routes are
+under `/index/*` (internal key at the indexer, owner session at the proxy).
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/index/files` | `?workspaceId&filespace&status=failed\|skipped\|pending\|indexed&limit=50&offset=0&q=` | `{"files": [File], "total": n, "byReason": [{"reason", "files"}]}` |
+| POST | `/index/retry` | `{"workspaceId"?, "filespace", "paths"?: [path], "all"?: bool}` | `{"requeued": n}` |
+| GET | `/index/control` | — | `Control` |
+| PUT | `/index/control` | `{"paused"?: bool, "priority"?: [{"workspaceId", "filespace"}]}` | `Control` |
+
+`File`: `{"path", "size", "mtime" (ISO), "status", "reason", "indexedAt", "changedAt", "kind"}`.
+
+- `/index/files`: `limit` is capped at 200. `pending` is in queue order (the
+  order the indexer will work: newest `mtime` first); `failed` and `skipped`
+  are newest first; `indexed` newest `indexedAt` first. `q` filters by a
+  case-insensitive substring of the path. `byReason` groups the whole status
+  (not just the page) for `failed` and `skipped`, largest first, top 20, and is
+  `[]` for the others.
+- `/index/retry`: moves the named `failed` files (or every failed file of the
+  source with `"all": true`) back to `pending`, clearing the retry back-off,
+  and asks for a sync of that source. Paths that are not failed are ignored.
+  Skipped files are not retried (their reasons are about type or size; changing
+  the file or the limits re-queues them on the next scan).
+- `Control`: `{"paused": bool, "pausedAt": ISO|null, "priority": [{"workspaceId",
+  "filespace"}]}`, persisted in the index database. While paused, no new job
+  starts (a running one finishes its current time slice), hints are kept
+  queued, and search, ask, survey and status keep working. `priority` lists
+  sources that are offered a job slot before the round-robin order; unknown
+  sources in it are dropped on PUT. `/index/status` gains top-level
+  `"paused"` and each filespace entry gains `"priority": int|null` (its
+  position in that list) and `"state": "paused"` while paused and idle.
