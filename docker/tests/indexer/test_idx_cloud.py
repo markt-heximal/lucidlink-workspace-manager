@@ -85,7 +85,9 @@ def test_cloud_folder_skips_online_only_until_allowed(make_service, cloud, place
         assert files["/My Drive/online.md"]["reason"] == block.ONLINE_ONLY
         assert files["/My Drive/Plan.gdoc"]["reason"].startswith("unsupported type")
         listing = c.get("/index/folders/list", params={"name": name, "path": "/My Drive"}, headers=H).json()
-        assert {e["name"]: e["status"] for e in listing["entries"]}["online.md"] == "skipped"
+        by = {e["name"]: e for e in listing["entries"]}
+        assert by["online.md"]["status"] == "skipped" and by["online.md"]["reason"] == block.ONLINE_ONLY
+        assert by["local.md"]["reason"] is None
 
         # Allow downloading: the skipped files go back to the queue and are read.
         r = c.post("/index/folders/options", json={"name": name, "downloadOnlineOnly": True}, headers=H).json()

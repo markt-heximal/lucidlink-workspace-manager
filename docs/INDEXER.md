@@ -526,7 +526,7 @@ as indexing: no symlinks, never outside the folder, system files hidden.
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/index/folders/list` | `?name=<source>&path=/` | `{"name", "path", "parent": "/…"\|null, "entries": [{"name", "path", "isDir", "size", "mtime": "ISO"\|null, "status": "indexed"\|"pending"\|"skipped"\|"failed"\|null}], "truncated": bool}`: folders first, then files, by name; at most 2000; `status` from the ledger for files; 404 unknown source, 400 bad path, 503 not mounted |
+| GET | `/index/folders/list` | `?name=<source>&path=/` | `{"name", "path", "parent": "/…"\|null, "entries": [{"name", "path", "isDir", "size", "mtime": "ISO"\|null, "status": "indexed"\|"pending"\|"skipped"\|"failed"\|null, "reason": "…"\|null}], "truncated": bool}`: folders first, then files, by name; at most 2000; `status` and `reason` (why it was skipped or failed, e.g. online only) from the ledger for files; 404 unknown source, 400 bad path, 503 not mounted |
 | GET | `/index/folders/file` | `?name=<source>&path=/a/b.pdf` | the file's bytes, `Content-Type` from the extension, `Content-Disposition: inline; filename*=…`, `Accept-Ranges: bytes` (a `Range` header gives 206); 404 unknown source or file, 400 bad path or a folder, 503 not mounted |
 
 The file service's `/index/{path}` proxy streams responses and passes `Range`,
