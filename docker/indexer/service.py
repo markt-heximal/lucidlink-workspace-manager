@@ -557,7 +557,8 @@ class IndexerService:
         kinds = self.kinds()
         seen: set[tuple[str, str, str]] = set()
         items: list[tuple[float, dict]] = []
-        for r in self.store.recent_files(scopes, limit):
+        # A day of slack for clock skew; anything later is a wrong timestamp, not a recent change.
+        for r in self.store.recent_files(scopes, limit, latest=time.time() + 86400):
             key = (r["workspace_id"], r["filespace"], r["file_id"])
             if key in seen:
                 continue

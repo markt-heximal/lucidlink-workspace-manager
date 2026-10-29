@@ -460,14 +460,25 @@ class Store:
             return self.query(sql + " LIMIT ?", (ws, fs, int(limit)))
         return self.query(sql, (ws, fs))
 
-    def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int) -> list[dict]:
+    def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int,
+                     latest: Optional[float] = None) -> list[dict]:
         """Candidate rows for GET /index/recent: per scope, the newest live files by
         mtime and the latest deletions/renames by changed_at. The caller merges
-        and orders them (mtime units vary, see service.mtime_seconds)."""
+        and orders them (mtime units vary, see service.mtime_seconds).
+
+        `latest` (Unix seconds) leaves out files dated after it, in whichever unit
+        their mtime is stored: a file stamped in the future by a wrong clock is not
+        a recent change, and would otherwise crowd out every real one."""
         out: list[dict] = []
+        future = ""
+        args: tuple = ()
+        if latest is not None:
+            future = ("AND NOT ((mtime <= 1e11 AND mtime > ?) OR (mtime > 1e11 AND mtime <= 1e14 AND mtime > ?) "
+                      "OR (mtime > 1e14 AND mtime <= 1e17 AND mtime > ?) OR (mtime > 1e17 AND mtime > ?)) ")
+            args = (latest, latest * 1e3, latest * 1e6, latest * 1e9)
         for ws, fs in scopes:
             out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status != 'deleted' "
-                              "ORDER BY mtime DESC, path LIMIT ?", (ws, fs, limit))
+                              f"{future}ORDER BY mtime DESC, path LIMIT ?", (ws, fs, *args, limit))
             out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND changed_at IS NOT NULL "
                               "AND (status = 'deleted' OR change_kind = 'renamed') "
                               "ORDER BY changed_at DESC LIMIT ?", (ws, fs, limit))
