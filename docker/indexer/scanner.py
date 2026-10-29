@@ -253,7 +253,9 @@ class FilespaceIndexer:
             cols.update(status="pending", size=size, mtime=mtime)
             res.changed += 1
         elif row["status"] == "failed" and self._retry_due(row):
-            cols.update(status="pending")
+            # Clear the old failure and fingerprint: with them kept, unchanged
+            # content would be taken for "already handled" and re-skipped.
+            cols.update(status="pending", reason=None, content_hash=None)
         self.store.update_file(self.ws, self.fs, file_id, **cols)
 
     # ------------------------------------------------------------ scan
@@ -333,7 +335,7 @@ class FilespaceIndexer:
                 res.seen += 1
                 cols: dict = {"scan_id": scan_id}
                 if row["status"] == "failed" and self._retry_due(row):
-                    cols["status"] = "pending"
+                    cols.update(status="pending", reason=None, content_hash=None)
                 self.store.update_file(self.ws, self.fs, row["file_id"], **cols)
                 return
         res.stats += 1
