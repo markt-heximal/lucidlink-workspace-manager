@@ -21,7 +21,26 @@ ROOTS: tuple[tuple[str, str], ...] = (
     ("icloud", "iCloud Drive"),
     ("desktop", "Desktop"),
     ("documents", "Documents"),
+    ("cloud", "Cloud storage"),
 )
+# Top folders of ~/Library/CloudStorage, by sync app.
+_PROVIDERS = (("GoogleDrive", "google-drive", "Google Drive"), ("Dropbox", "dropbox", "Dropbox"),
+              ("OneDrive", "onedrive", "OneDrive"), ("Box", "box", "Box"), ("ShareFile", "sharefile", "ShareFile"))
+
+
+def provider_of(root: str, folder: str) -> Optional[dict]:
+    """The cloud service and account a folder in the `cloud` root belongs to."""
+    if root != "cloud" or folder in ("", "/"):
+        return None
+    top = folder.strip("/").split("/", 1)[0]
+    for prefix, pid, label in _PROVIDERS:
+        if top == prefix or top.startswith(prefix + "-") or top.startswith(prefix + " "):
+            rest = top[len(prefix):].lstrip("- ").strip()
+            if rest.startswith("(") and rest.endswith(")"):
+                rest = rest[1:-1]
+            account = None if not rest or rest == prefix else rest
+            return {"id": pid, "label": label, "account": account}
+    return {"id": "other", "label": top, "account": None}
 ROOT_LABELS = dict(ROOTS)
 BROWSE_MAX = 500
 NAME_MAX = 64
@@ -114,7 +133,7 @@ def browse(cfg: Config, root: str, folder: str, connected: Callable[[str, str, s
     for n in names[:BROWSE_MAX]:
         p = ("" if folder == "/" else folder) + "/" + n
         host = host_path(cfg, root, p)
-        entries.append({"name": n, "path": p, "hostPath": host,
+        entries.append({"name": n, "path": p, "hostPath": host, "provider": provider_of(root, p),
                         "connected": connected(root, p, os.path.join(full, n), host)})
     parent = None if folder == "/" else (posixpath.dirname(folder) or "/")
     return {"root": root, "path": folder, "parent": parent, "entries": entries,
@@ -125,6 +144,9 @@ def default_name(root: str, folder: str) -> str:
     base = posixpath.basename(folder) or ROOT_LABELS.get(root, root)
     if root == "icloud" and folder == "/":
         base = "iCloud"
+    prov = provider_of(root, folder)
+    if prov and folder.strip("/").count("/") == 0 and prov["id"] != "other":
+        base = prov["label"] + (f" {prov['account'].split('@')[0]}" if prov["account"] else "")
     out = "".join(c if c.isalnum() or c in "._-" else "-" for c in base)
     while "--" in out:
         out = out.replace("--", "-")
@@ -149,7 +171,9 @@ def app_specs(cfg: Config, rows: list[dict]) -> list[BlockSpec]:
         root, folder = r["root"], r["folder"]
         path = root_path(cfg, root) + ("" if folder == "/" else folder)
         out.append(BlockSpec(r["name"], path, None if root in ROOT_LABELS else f"unknown place {root!r}",
-                             origin="app", host_path=host_path(cfg, root, folder), root=root, folder=folder))
+                             origin="app", host_path=host_path(cfg, root, folder), root=root, folder=folder,
+                             provider=provider_of(root, folder),
+                             download_online_only=bool(r.get("download_online_only"))))
     return out
 
 

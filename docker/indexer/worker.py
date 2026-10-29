@@ -214,7 +214,8 @@ class Scheduler:
                 roots[key] = b.path
             listing.append({"name": b.name, "workspaceId": key[0], "path": b.path, "kind": KIND_BLOCK,
                             "accepted": error is None, "error": error, "origin": b.origin,
-                            "hostPath": b.host_path, "root": b.root, "folder": b.folder})
+                            "hostPath": b.host_path, "root": b.root, "folder": b.folder,
+                            "provider": b.provider, "downloadOnlineOnly": b.download_online_only})
         if conflicts:
             logger.warning("block sources refused: %s", "; ".join(conflicts.values()))
         return roots, conflicts, listing
@@ -226,6 +227,13 @@ class Scheduler:
         self.targets()
         with self._cv:
             return self._block_roots.get((ws, fs))
+
+    def skip_online_only(self, ws: str, fs: str) -> bool:
+        """Cloud sync folders read only what is downloaded, unless the owner allows downloading."""
+        for b in self._block_specs:
+            if b.name == fs and ws == self._block_workspace():
+                return b.root == "cloud" and not b.download_online_only
+        return False
 
     def is_block(self, ws: str, fs: str) -> bool:
         return self.block_root(ws, fs) is not None

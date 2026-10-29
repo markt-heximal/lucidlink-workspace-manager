@@ -37,7 +37,7 @@ from pathlib import PurePosixPath
 from typing import Callable, Iterator, Optional
 
 from .scanner import skip_dir, skip_file
-from .source import Entry, FilespaceSource, SourceError, SourceProvider
+from .source import Entry, FilespaceSource, NotDownloaded, SourceError, SourceProvider
 
 logger = logging.getLogger("indexer.block")
 
@@ -45,6 +45,12 @@ KIND_LUCIDLINK = "lucidlink"
 KIND_BLOCK = "block"
 
 NOT_MOUNTED = "block source path not mounted"
+ONLINE_ONLY = "online only (not downloaded on the engine computer)"
+
+
+def online_only(st: os.stat_result) -> bool:
+    """A sync app's placeholder: it has a size but no blocks on disk yet."""
+    return st.st_size > 0 and getattr(st, "st_blocks", 1) == 0
 
 # System folders and files on NAS shares and macOS volumes, on top of the
 # scanner's own skip list (which already drops every dot-name).
@@ -95,8 +101,11 @@ def _utf8(name: str) -> bool:
 class LocalSource(FilespaceSource):
     """A read-only directory tree as a FilespaceSource. Paths are posix, "/" = root."""
 
-    def __init__(self, root: str):
+    def __init__(self, root: str, skip_online_only: bool = False):
         self.root = os.path.realpath(root)
+        # Cloud sync apps (Google Drive, Dropbox…) keep online-only files as
+        # placeholders that download when read; with this set they are refused.
+        self.skip_online_only = skip_online_only
 
     def _resolve(self, path: str) -> tuple[str, str]:
         """(relative posix path, absolute path) for `path`, or PathRefused."""
@@ -147,8 +156,11 @@ class LocalSource(FilespaceSource):
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(full, flags)   # FileNotFoundError for a vanished file, like the SDK
         try:
-            if not stat_mod.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            if not stat_mod.S_ISREG(st.st_mode):
                 raise IsADirectoryError(f"not a regular file: {path}")
+            if self.skip_online_only and online_only(st):
+                raise NotDownloaded(ONLINE_ONLY)
             with os.fdopen(fd, "rb", closefd=False) as f:
                 return f.read()
         finally:
@@ -179,6 +191,8 @@ class BlockSpec:
     host_path: Optional[str] = None      # the folder on the Mini, when known
     root: Optional[str] = None           # app sources: root id ("volumes", "icloud", "desktop")
     folder: Optional[str] = None         # app sources: path inside the root, "/Projects"
+    provider: Optional[dict] = None      # cloud root: {"id", "label", "account"}
+    download_online_only: bool = False   # cloud root: read (and so download) online-only files
 
 
 def parse_block_sources(value: str) -> list[BlockSpec]:
@@ -247,9 +261,11 @@ class RoutingSourceProvider(SourceProvider):
     """
 
     def __init__(self, block_root: Callable[[str, str], Optional[str]],
-                 filespaces: Callable[[], SourceProvider]):
+                 filespaces: Callable[[], SourceProvider],
+                 skip_online_only: Callable[[str, str], bool] = lambda ws, fs: False):
         self._block_root = block_root
         self._filespaces = filespaces
+        self._skip_online_only = skip_online_only
 
     @contextmanager
     def lease(self, workspace_id: str, filespace: str) -> Iterator[FilespaceSource]:
@@ -260,4 +276,4 @@ class RoutingSourceProvider(SourceProvider):
             return
         if not mounted(root):
             raise NotMounted()
-        yield LocalSource(root)
+        yield LocalSource(root, skip_online_only=self._skip_online_only(workspace_id, filespace))

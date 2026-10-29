@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS block_folders (
     name       TEXT PRIMARY KEY,
     root       TEXT NOT NULL,
     folder     TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    download_online_only INTEGER NOT NULL DEFAULT 0
 );
 -- Drive prompts: top-level folders of a root seen so far (baseline = there at
 -- the first look, so never "new"), and block sources whose folder is missing.
@@ -187,6 +188,9 @@ class Store:
         self._generation = 0
 
     def _migrate(self) -> None:
+        bf_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(block_folders)").fetchall()}
+        if "download_online_only" not in bf_cols:
+            self._conn.execute("ALTER TABLE block_folders ADD COLUMN download_online_only INTEGER NOT NULL DEFAULT 0")
         fs_cols = {r[1] for r in self._conn.execute("PRAGMA table_info(filespaces)").fetchall()}
         if "kind" not in fs_cols:
             self._conn.execute("ALTER TABLE filespaces ADD COLUMN kind TEXT NOT NULL DEFAULT 'lucidlink'")
@@ -243,7 +247,17 @@ class Store:
 
     # ------------------------------------------------------------ block folders
     def block_folders(self) -> list[dict]:
-        return self.query("SELECT name, root, folder, created_at FROM block_folders ORDER BY created_at, name")
+        return self.query("SELECT name, root, folder, created_at, download_online_only FROM block_folders "
+                          "ORDER BY created_at, name")
+
+    def set_block_download(self, name: str, on: bool) -> bool:
+        return self.execute("UPDATE block_folders SET download_online_only=? WHERE name=?", (int(on), name)) > 0
+
+    def requeue_reason(self, ws: str, fs: str, reason: str) -> int:
+        """Files skipped for `reason` go back to pending (their content is read again)."""
+        n = self.execute("UPDATE files SET status='pending', reason=NULL, content_hash=NULL "
+                         "WHERE workspace_id=? AND filespace=? AND status='skipped' AND reason=?", (ws, fs, reason))
+        return n
 
     def add_block_folder(self, name: str, root: str, folder: str, now: str) -> None:
         with self.tx() as c:

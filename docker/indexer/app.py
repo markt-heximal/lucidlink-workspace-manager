@@ -110,6 +110,12 @@ class PromptDismissBody(BaseModel):
     kind: Literal["new", "missing"]
     path: Optional[str] = None
     name: Optional[str] = None
+    root: str = "volumes"
+
+
+class FolderOptionsBody(BaseModel):
+    name: str = Field(min_length=1)
+    downloadOnlineOnly: bool
 
 
 class FolderRemoveBody(BaseModel):
@@ -265,7 +271,13 @@ def folder_prompts(svc: IndexerService = Depends(_service)):
 
 @router.post("/folders/prompts/dismiss")
 def dismiss_prompt(body: PromptDismissBody, svc: IndexerService = Depends(_service)):
-    return svc.dismiss_prompt(body.kind, body.path, body.name)
+    return svc.dismiss_prompt(body.kind, body.path, body.name, body.root)
+
+
+@router.post("/folders/options")
+def folder_options(body: FolderOptionsBody, svc: IndexerService = Depends(_service)):
+    """Per-source options; today whether a cloud folder may download online-only files to read them."""
+    return svc.folder_options(body.name, body.downloadOnlineOnly)
 
 
 @router.post("/folders/restart", status_code=202)
