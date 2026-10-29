@@ -41,8 +41,8 @@ from typing import TYPE_CHECKING, Optional
 
 from . import folders
 
-# The workspace id of drives the Mini reaches itself (NAS, local folders).
-MINI_WORKSPACE = "mini"
+# The workspace id of drives the engine computer reaches itself (NAS, USB, local folders).
+LOCAL_WORKSPACE = "local"
 from .block import KIND_BLOCK, KIND_LUCIDLINK, BlockSpec, NotMounted, parse_block_sources
 from .embedder import EmbedError
 from .scanner import FilespaceIndexer
@@ -183,9 +183,9 @@ class Scheduler:
         return list(keys)
 
     def _block_workspace(self) -> str:
-        """BLOCK_SOURCE_WORKSPACE, else "mini": drives the Mini reaches belong to the Mini,
-        not to whichever LucidLink workspace is active (docs: This Mini)."""
-        return self.cfg.block_source_workspace or MINI_WORKSPACE
+        """BLOCK_SOURCE_WORKSPACE, else "local": drives the engine computer reaches belong to it,
+        not to whichever LucidLink workspace is active (docs: The engine computer and All drives)."""
+        return self.cfg.block_source_workspace or LOCAL_WORKSPACE
 
     def _rekey_block_sources(self) -> None:
         """Once: move block sources indexed under another workspace to the block workspace."""

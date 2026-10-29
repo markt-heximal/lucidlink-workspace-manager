@@ -17,6 +17,14 @@ if [ "$(uname)" = Darwin ] && [ -f .env ]; then
   done
 fi
 
+# The engine computer's name labels its drives in the app ("AI-Factory-Mini · NAS").
+# Set once from the computer's name; edit ENGINE_NAME in .env to rename.
+if [ -f .env ] && ! grep -q '^ENGINE_NAME=' .env; then
+  if [ "$(uname)" = Darwin ]; then name="$(scutil --get ComputerName 2>/dev/null || hostname -s)"; else name="$(hostname -s)"; fi
+  printf 'ENGINE_NAME=%s\n' "$name" >> .env
+  echo "Named this engine computer \"$name\" (ENGINE_NAME in .env)."
+fi
+
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 export GIT_SHA
 

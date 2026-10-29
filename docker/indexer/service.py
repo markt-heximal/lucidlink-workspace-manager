@@ -203,13 +203,19 @@ class IndexerService:
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
             "blockSources": list(self.scheduler.block_sources),
+            "engine": self.engine_info(),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
         }
 
     # ------------------------------------------------------------ folders from the app
     def folders(self) -> dict:
         self.scheduler.refresh_targets(force=True)
-        return {"roots": folders_mod.roots(self.config), "sources": list(self.scheduler.block_sources)}
+        return {"engine": self.engine_info(), "roots": folders_mod.roots(self.config),
+                "sources": list(self.scheduler.block_sources)}
+
+    def engine_info(self) -> dict:
+        """The engine computer: its name (the label of its drives) and their workspace id."""
+        return {"name": self.config.engine_name or None, "workspaceId": self.scheduler._block_workspace()}
 
     def _connected(self):
         """(root, folder, container path, host path) -> name of the source that is that folder."""

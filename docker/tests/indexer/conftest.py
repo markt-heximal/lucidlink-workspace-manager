@@ -78,7 +78,7 @@ def make_service(tmp_path) -> Callable[..., IndexerService]:
               **cfg) -> IndexerService:
         db_path = cfg.pop("db_path", None) or str(tmp_path / f"index{len(made)}.db")
         # Most block tests keep drives in the vault's workspace (BLOCK_SOURCE_WORKSPACE);
-        # test_idx_mini.py covers the default, the Mini's own workspace.
+        # test_idx_local.py covers the default, the engine computer's own workspace.
         cfg.setdefault("block_source_workspace", "ws1")
         config = Config(db_path=db_path, internal_key=internal_key,
                         embed_base_url="http://embed.test/v1", embed_model="fake-embed",
