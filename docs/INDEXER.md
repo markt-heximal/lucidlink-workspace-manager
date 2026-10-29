@@ -616,7 +616,7 @@ bearer token or key is masked.
 ### Plain answers for the app (simplification, phase 1)
 
 **Find by name.** `GET /index/find?q=&workspaceId=&filespace=&limit=20` matches
-file and folder **names** in the ledger (no AI, instant), across the same
+file **names and folder paths** in the ledger (no AI, instant), across the same
 scopes as search (`workspaceId: "*"` = every location). Case-insensitive; a
 name that starts with the query ranks above one that contains it, then newer
 first. Every word of a multi-word query must appear in the path. Files the
@@ -634,15 +634,17 @@ slots and LucidLink).
 
 **Why something is wrong.** `FilespaceStatus` gains `"problem"`: null, or
 `{"kind": "sign_in"|"offline"|"unreachable"|"too_big"|"engine"|"other", "detail"}`,
-classified from `lastError` (`detail` is the raw text, for Engine only):
+classified from `lastError` (`detail` is the raw text, for Engine only). The
+first matching row wins, so the SDK's "Authentication failed: … Host not found"
+is `unreachable`, not `sign_in`:
 
 | kind | from | the app says |
 |---|---|---|
-| `sign_in` | authentication failed, lease expired, token, 401/403 | "Sign in to LucidLink again" |
-| `unreachable` | host not found, connection refused/timed out, network | "Can't reach LucidLink right now" |
 | `offline` | block source path not mounted | "<name> is offline" |
 | `too_big` | 413 / payload too large | "Some files are too large to read" |
 | `engine` | embedder/LLM/vector errors | "Search is temporarily unavailable" |
+| `unreachable` | host not found, connection refused/reset, timed out | "Can't reach LucidLink right now" |
+| `sign_in` | authentication failed, lease expired, invalid/expired token, 401/403 | "Sign in to LucidLink again" |
 | `other` | anything else | "Something went wrong reading <name>" |
 
 **Suggested names.** Browse entries carry `"suggestedName"`: the folder name,
