@@ -153,3 +153,69 @@ def test_restart_endpoint(svc):
         r = c.post("/index/folders/restart", headers=H)
         assert r.status_code == 202 and r.json() == {"restarting": True}
     assert restarts == [1]
+
+
+def test_new_drive_prompts(svc, roots):
+    with client(svc) as c:
+        # First look: what is mounted now is known, not new.
+        assert c.get("/index/folders/prompts", headers=H).json()["newDrives"] == []
+        (roots["vols"] / "Archive 3").mkdir()
+        (roots["vols"] / "Archive 3" / "x.md").write_text("x")
+        (roots["vols"] / "Camera").mkdir()
+        new = c.get("/index/folders/prompts", headers=H).json()["newDrives"]
+        assert [(d["name"], d["path"], d["hostPath"], d["suggestedName"]) for d in new] == [
+            ("Archive 3", "/Archive 3", "/Volumes/Archive 3", "Archive-3"), ("Camera", "/Camera", "/Volumes/Camera", "Camera")]
+        assert all(d["root"] == "volumes" and d["firstSeenAt"] for d in new)
+
+        assert c.post("/index/folders/prompts/dismiss", json={"kind": "new", "path": "/Camera"}, headers=H).json() == {
+            "dismissed": True}
+        # Connecting a folder inside a new drive answers its prompt too.
+        assert c.post("/index/folders", json={"root": "volumes", "path": "/Archive 3"}, headers=H).status_code == 201
+        assert c.get("/index/folders/prompts", headers=H).json()["newDrives"] == []
+        # Unmounted and back again: still not new.
+        os.rename(roots["vols"] / "Camera", roots["base"] / "Camera-away")
+        c.get("/index/folders/prompts", headers=H)
+        os.rename(roots["base"] / "Camera-away", roots["vols"] / "Camera")
+        assert c.get("/index/folders/prompts", headers=H).json()["newDrives"] == []
+        # Drives that were there at the first look can't be dismissed (there is no prompt).
+        assert c.post("/index/folders/prompts/dismiss", json={"kind": "new", "path": "/Projects"},
+                      headers=H).status_code == 404
+
+
+def test_missing_source_prompts(make_service, roots):
+    svc = make_service(block_root_base=str(roots["base"]),
+                       block_root_hosts={"volumes": "/Volumes", "icloud": "", "desktop": ""},
+                       block_sources=f"Archive-old={roots['slot']}", block_slot_hosts={},
+                       folder_missing_grace_sec=0.0)
+    with client(svc) as c:
+        assert c.post("/index/folders", json={"root": "volumes", "path": "/Projects"}, headers=H).status_code == 201
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
+        os.rename(roots["vols"] / "Projects", roots["base"] / "Projects-away")
+        missing = c.get("/index/folders/prompts", headers=H).json()["missing"]
+        assert [(m["name"], m["origin"], m["hostPath"], m["root"]) for m in missing] == [
+            ("Projects", "app", "/Volumes/Projects", "volumes")]
+        since = missing[0]["missingSince"]
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"][0]["missingSince"] == since
+        # Keep it: hidden while it stays missing...
+        assert c.post("/index/folders/prompts/dismiss", json={"kind": "missing", "name": "Projects"},
+                      headers=H).status_code == 200
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
+        # ...and asked again after it comes back and goes missing again.
+        os.rename(roots["base"] / "Projects-away", roots["vols"] / "Projects")
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
+        os.rename(roots["vols"] / "Projects", roots["base"] / "Projects-away")
+        assert [m["name"] for m in c.get("/index/folders/prompts", headers=H).json()["missing"]] == ["Projects"]
+        # Forget it = the normal remove.
+        assert c.post("/index/folders/remove", json={"name": "Projects"}, headers=H).status_code == 200
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
+        assert c.post("/index/folders/prompts/dismiss", json={"kind": "missing", "name": "Nope"},
+                      headers=H).status_code == 404
+
+
+def test_missing_waits_for_the_grace_period(svc, roots):
+    # Default grace (15 min): a share that just dropped is not reported yet.
+    import shutil
+    with client(svc) as c:
+        shutil.rmtree(roots["slot"])
+        assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
+        assert svc.store.missing_row("Archive-old") is not None

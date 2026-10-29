@@ -19,7 +19,7 @@ import httpx
 from . import ask as ask_mod
 from . import folders as folders_mod
 from . import survey as survey_mod
-from .block import KIND_LUCIDLINK, TYPES, RoutingSourceProvider, type_of
+from .block import KIND_LUCIDLINK, TYPES, RoutingSourceProvider, mounted, type_of
 from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
@@ -75,6 +75,13 @@ def _iso_seconds(v: Optional[str]) -> Optional[float]:
 
 class NotFound(Exception):
     pass
+
+
+def _age_sec(iso_ts: str) -> float:
+    try:
+        return time.time() - datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 class IndexerService:
@@ -244,6 +251,67 @@ class IndexerService:
             if entry["name"] == name:
                 return entry
         raise folders_mod.FolderError(500, "The folder was saved but isn't listed; check the indexer log.")
+
+    def _overlaps_a_source(self, root: str, folder: str, full: str, host: Optional[str]) -> bool:
+        for b in self.scheduler._block_specs:
+            if host and b.host_path and folders_mod.overlap(host, b.host_path):
+                return True
+            try:
+                if folders_mod.overlap(os.path.realpath(full), os.path.realpath(b.path)):
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def folder_prompts(self) -> dict:
+        """New drives under /Volumes and connected folders that have gone missing (docs: Drive prompts)."""
+        now = now_iso()
+        new: list[dict] = []
+        root = "volumes"
+        if folders_mod.root_available(self.config, root):
+            listing = folders_mod.browse(self.config, root, "/", lambda *_: None)
+            names = [e["name"] for e in listing["entries"]]
+            seen = self.store.drives_seen(root)
+            if not seen:
+                # The first look: what is already mounted is known, not new ("" marks the look itself).
+                self.store.add_drives_seen(root, names + [""], now, baseline=True)
+            else:
+                self.store.add_drives_seen(root, [n for n in names if n not in seen], now, baseline=False)
+                seen = self.store.drives_seen(root)
+                base = folders_mod.root_path(self.config, root)
+                for e in listing["entries"]:
+                    row = seen.get(e["name"])
+                    if not row or row["baseline"] or row["dismissed"]:
+                        continue
+                    if self._overlaps_a_source(root, e["path"], base + e["path"], e["hostPath"]):
+                        continue
+                    new.append({"root": root, "path": e["path"], "name": e["name"], "hostPath": e["hostPath"],
+                                "suggestedName": folders_mod.default_name(root, e["path"]),
+                                "firstSeenAt": row["first_seen_at"]})
+        missing: list[dict] = []
+        grace = self.config.folder_missing_grace_sec
+        for b in self.scheduler._block_specs:
+            if b.error is not None:
+                continue
+            if mounted(b.path):
+                self.store.clear_missing(b.name)
+                continue
+            row = self.store.mark_missing(b.name, now)
+            if row["dismissed"] or _age_sec(row["since"]) < grace:
+                continue
+            missing.append({"name": b.name, "origin": b.origin, "hostPath": b.host_path, "root": b.root,
+                            "missingSince": row["since"]})
+        return {"newDrives": new, "missing": missing}
+
+    def dismiss_prompt(self, kind: str, path: Optional[str], name: Optional[str]) -> dict:
+        if kind == "new":
+            drive = (path or "").strip("/")
+            if not drive or "/" in drive or not self.store.dismiss_drive("volumes", drive):
+                raise NotFound(f"no new drive at {path!r}")
+        else:
+            if not name or not self.store.dismiss_missing(name):
+                raise NotFound(f"no missing folder called {name!r}")
+        return {"dismissed": True}
 
     def remove_folder(self, name: str) -> dict:
         spec = next((b for b in self.scheduler._block_specs if b.name == name), None)
