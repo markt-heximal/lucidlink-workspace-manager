@@ -42,6 +42,6 @@ def answer(svc: "IndexerService", scopes: "set[Scope]", question: str, k: int = 
     return {
         "answer": text,
         "sources": list(dict.fromkeys(r["path"] for r, _ in used))[:MAX_SOURCES],
-        "citations": [{"kind": kinds.get((r["workspace_id"], r["filespace"]), "lucidlink"), "path": r["path"], "chunkIndex": r["chunk_index"], "score": round(s, 4)}
+        "citations": [{"kind": kinds.get((r["workspace_id"], r["filespace"]), "lucidlink"), "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"], "chunkIndex": r["chunk_index"], "score": round(s, 4)}
                       for r, s in used],
     }
