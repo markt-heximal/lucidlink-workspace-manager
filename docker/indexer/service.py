@@ -7,6 +7,7 @@ run the whole thing against an in-memory filespace, a fake embedder and
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import stat as stat_mod
@@ -20,7 +21,7 @@ import httpx
 from . import ask as ask_mod
 from . import folders as folders_mod
 from . import survey as survey_mod
-from .block import KIND_LUCIDLINK, ONLINE_ONLY, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
+from .block import KIND_LUCIDLINK, ONLINE_ONLY, TYPE_EXT, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
 from .block import NotMounted as NotMountedError
 from .config import Config
 from .embedder import Embedder
@@ -36,6 +37,14 @@ SNIPPET_CHARS = 300
 
 
 RECENT_MAX = 200
+BYKIND_MAX = 500
+# GET /index/bykind: the app's Kind filter onto the profile's type classes.
+KIND_CLASSES = {
+    "documents": ("document", "pdf", "spreadsheet"),
+    "presentations": ("presentation",),
+    "images": ("image", "design"),
+    "video": ("video", "audio"),
+}
 FILES_MAX = 200
 
 DAY = 86400.0
@@ -236,8 +245,12 @@ class IndexerService:
         return self.store.kinds()
 
     # ------------------------------------------------------------ status
-    def filespace_status(self, ws: str, fs: str, ctl: Optional[dict] = None) -> dict:
+    def filespace_status(self, ws: str, fs: str, ctl: Optional[dict] = None,
+                         totals: Optional[dict] = None) -> dict:
+        """`totals` is store.live_totals() for every source, when the caller has it."""
         row = self.store.filespace_row(ws, fs) or {}
+        if totals is None:
+            totals = self.store.live_totals(ws, fs)
         rt = self.scheduler.runtime(ws, fs)
         enabled = bool(row.get("enabled", 1))
         ctl = ctl if ctl is not None else self.store.control()
@@ -256,6 +269,7 @@ class IndexerService:
             if enabled else None,
             "files": self.store.file_counts(ws, fs),
             "chunks": self.store.chunk_count(ws, fs),
+            "totals": dict(totals.get((ws, fs)) or {"files": 0, "bytes": 0}),
             # A refused block source with this name shows here too (the
             # filespace itself keeps working).
             "lastError": row.get("last_error") or self.scheduler.block_conflict(ws, fs),
@@ -267,9 +281,10 @@ class IndexerService:
 
     def status(self) -> dict:
         ctl = self.store.control()
+        totals = self.store.live_totals()   # one GROUP BY for every source
         return {
             "paused": ctl["paused"],
-            "filespaces": [self.filespace_status(ws, fs, ctl) for ws, fs in self.scheduler.targets()],
+            "filespaces": [self.filespace_status(ws, fs, ctl, totals) for ws, fs in self.scheduler.targets()],
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
             "blockSources": list(self.scheduler.block_sources),
@@ -646,6 +661,59 @@ class IndexerService:
             }))
         items.sort(key=lambda it: (-it[0], it[1]["path"]))
         return [it[1] for it in items[:limit]]
+
+    def by_kind(self, workspace_id: Optional[str], filespace: Optional[str], kind: str,
+                limit: int = 100, offset: int = 0) -> dict:
+        """Live files of one kind across locations, newest first (docs: By kind).
+
+        SQL narrows by the classes' extensions; type_of() then classifies each
+        name exactly (an extension listed under two classes belongs to the first).
+        Files dated more than a day ahead go last, as in recent().
+        """
+        classes = KIND_CLASSES.get(kind)
+        if classes is None:
+            raise ValueError(f"unknown kind {kind!r}; expected one of {', '.join(KIND_CLASSES)}")
+        limit = max(1, min(int(limit), BYKIND_MAX))
+        offset = max(0, int(offset))
+        exts = set().union(*(TYPE_EXT[c] for c in classes))
+        scopes = sorted(self.scopes(workspace_id, filespace))
+        locs = self.locations()
+        latest = time.time() + 86400
+        items: list[tuple[tuple, dict]] = []
+        for r in self.store.files_with_extensions(scopes, exts):
+            name = r["path"].rsplit("/", 1)[-1]
+            t = type_of(name)
+            if t not in classes:
+                continue
+            secs = mtime_seconds(r["mtime"]) or 0.0
+            key = (r["workspace_id"], r["filespace"])
+            items.append(((secs > latest, -secs, r["path"], key), {
+                "workspaceId": key[0], "filespace": key[1],
+                "location": locs.get(key, {"kind": KIND_LUCIDLINK, "root": None, "provider": None}),
+                "path": r["path"], "name": name, "size": r["size"], "mtime": mtime_iso(r["mtime"]),
+                "status": r["status"], "type": t,
+            }))
+        items.sort(key=lambda it: it[0])
+        return {"files": [it[1] for it in items[offset:offset + limit]], "total": len(items), "kind": kind}
+
+    def surveys(self, workspace_id: Optional[str], filespace: Optional[str] = None) -> list[dict]:
+        """Stored root surveys of every location in scope, newest first; none generated."""
+        scopes = self.scopes(workspace_id, filespace)
+        locs = self.locations()
+        out = []
+        for row in self.store.root_surveys():
+            key = (row["workspace_id"], row["filespace"])
+            if key not in scopes:
+                continue
+            try:
+                topics = json.loads(row["payload"]).get("topics") or []
+            except (ValueError, AttributeError):
+                topics = []
+            out.append({"workspaceId": key[0], "filespace": key[1],
+                        "location": locs.get(key, {"kind": KIND_LUCIDLINK, "root": None, "provider": None}),
+                        "generatedAt": row["generated_at"], "stale": bool(row["stale"]), "topics": topics})
+        out.sort(key=lambda s: (s["generatedAt"] or "", s["workspaceId"], s["filespace"]), reverse=True)
+        return out
 
     def profile(self, workspace_id: Optional[str], filespace: str, now: Optional[float] = None) -> dict:
         """What a source holds, from the ledger only (nothing is read from the source)."""

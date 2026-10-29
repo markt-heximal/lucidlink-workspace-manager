@@ -147,3 +147,64 @@ def test_settings_503_when_vault_not_configured(client, env, supabase, monkeypat
     assert r.status_code == 503
     assert "VAULT_KEY" in r.json()["detail"]
     assert client.get("/vault/status").json()["configured"] is False
+
+
+# ---------------------------------------------------------------- favorites
+FAV = {"id": "f1", "workspaceId": "default", "filespace": "fs1", "kind": "lucidlink",
+       "path": "/Clients/Northwind", "label": "Northwind", "addedAt": "2026-10-01T10:00:00Z"}
+
+
+def test_favorites_older_vault_is_empty_and_settings_keep_them(seeded_vault, env):
+    assert vault.load_favorites() == []
+    stored = vault.save_favorites({"favorites": [{**FAV, "color": "red"},
+                                                 {**FAV, "id": "f2", "kind": "block", "label": None,
+                                                  "workspaceId": "local", "filespace": "NAS", "path": "/"}]})
+    assert stored[0] == FAV                                   # unknown field dropped
+    assert "label" not in stored[1]                           # optional
+    # A settings save carries favorites over, and settings never show them.
+    out = vault.save({"activeWorkspaceId": "ws2"})
+    assert "favorites" not in out
+    assert vault.load_favorites() == stored
+    assert vault.load()["workspaces"][0]["token"] == SA_TOKEN
+    # Encrypted at rest with the rest of the row.
+    raw = b"".join((env / n).read_bytes() for n in ("vault.db", "vault.db-wal") if (env / n).exists())
+    assert b"Northwind" not in raw
+
+
+def test_favorites_validation(seeded_vault):
+    bad = [
+        [], {"favorites": "x"}, {"favorites": [1]},
+        {"favorites": [{**FAV, "path": "Clients"}]},
+        {"favorites": [{**FAV, "kind": "s3"}]},
+        {"favorites": [{k: v for k, v in FAV.items() if k != "addedAt"}]},
+        {"favorites": [{**FAV, "label": 3}]},
+        {"favorites": [FAV, FAV]},
+        {"favorites": [{**FAV, "id": f"f{i}"} for i in range(201)]},
+    ]
+    for body in bad:
+        with pytest.raises(ValueError):
+            vault.save_favorites(body)
+    assert len(vault.save_favorites({"favorites": [{**FAV, "id": f"f{i}"} for i in range(200)]})) == 200
+    assert vault.save_favorites({"favorites": []}) == []
+    assert vault.load_favorites() == []
+
+
+def test_favorites_routes_owner_only(client, seeded_vault, supabase):
+    assert client.get("/vault/favorites").status_code == 401
+    assert client.get("/vault/favorites", headers={"Authorization": f"Bearer {OTHER_JWT}"}).status_code == 401
+    assert client.put("/vault/favorites", json={"favorites": []},
+                      headers={"Authorization": f"Bearer {OTHER_JWT}"}).status_code == 401
+
+    assert client.get("/vault/favorites", headers=owner_headers()).json() == {"favorites": []}
+    r = client.put("/vault/favorites", headers=owner_headers(), json={"favorites": [{**FAV, "extra": 1}]})
+    assert r.status_code == 200 and r.json() == {"favorites": [FAV]}
+    assert client.get("/vault/favorites", headers=owner_headers()).json() == {"favorites": [FAV]}
+    assert client.put("/vault/favorites", headers=owner_headers(),
+                      json={"favorites": [{**FAV, "path": "x"}]}).status_code == 400
+    assert client.get("/vault/favorites", headers=owner_headers()).json() == {"favorites": [FAV]}
+    assert "favorites" not in client.get("/vault/settings", headers=owner_headers()).json()
+
+
+def test_favorites_503_when_vault_not_configured(client, env, supabase, monkeypatch):
+    monkeypatch.delenv("VAULT_KEY")
+    assert client.get("/vault/favorites", headers=owner_headers()).status_code == 503

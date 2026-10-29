@@ -102,6 +102,11 @@ HTTP (file service, owner only):
 | GET | `/vault/status` | no auth: `{"configured": bool, "ownerConfigured": bool, "hasSettings": bool}` |
 | GET | `/vault/settings` | masked payload + `"updatedAt"` (ISO) |
 | PUT | `/vault/settings` | payload → saved masked payload + `"updatedAt"` |
+| GET/PUT | `/vault/favorites` | see "Favorites, synced" (Simplification phase 2) |
+
+Favorites live in the same encrypted row under `"favorites"` (Python:
+`load_favorites()`, `save_favorites(body)`); a settings save carries them over
+and the settings payload never includes them.
 
 ## Indexer HTTP API
 
@@ -651,6 +656,51 @@ is `unreachable`, not `sign_in`:
 except at the top of a cloud service, where it is "<service> (<account name>)",
 e.g. "Google Drive (mark.personal)", and iCloud Drive's root, "iCloud". The
 app pre-fills it instead of sanitising the folder name itself.
+
+### Simplification phase 2: sizes, kinds, topics everywhere, synced Favorites
+
+**Sizes.** `FilespaceStatus` gains `"totals": {"files": <live files>, "bytes": <their size>}`
+from the ledger (no reads), so Settings › Locations can list every location
+with its size.
+
+**By kind, across locations.** `GET /index/bykind?kind=&workspaceId=&filespace=&limit=100&offset=0`
+lists live files of one kind, newest first (by `mtime`, future-dated files last),
+across the same scopes as search (`workspaceId: "*"` = every location). Kinds
+map onto the profile's type classes:
+
+| `kind` | type classes |
+|---|---|
+| `documents` | document, pdf, spreadsheet |
+| `presentations` | presentation |
+| `images` | image, design |
+| `video` | video, audio |
+
+Result: `{"files": [{"workspaceId", "filespace", "location", "path", "name",
+"size", "mtime", "status", "type"}], "total": n, "kind"}`; `limit` max 500;
+400 for an unknown kind. A name's class is the profile's (`block.type_of`), so a
+`.psd` counts as design and an `.srt` as a document. It is what the Files "Kind" filter shows when no single
+folder is being browsed.
+
+**Topics everywhere.** `GET /index/surveys?workspaceId=*` returns the stored
+root-scope (`/`) survey of every location in scope, without generating any:
+`{"surveys": [{"workspaceId", "filespace", "location", "generatedAt", "stale",
+"topics": [Topic]}]}`, newest first. Locations never surveyed are left out.
+Generating stays per location (`POST /index/survey`).
+
+**Favorites, synced.** The file service keeps the owner's Favorites in the vault,
+so they follow the owner across devices. Owner-only, like `/vault/settings`:
+
+| Method | Path | Body | Result |
+|---|---|---|---|
+| GET | `/vault/favorites` | — | `{"favorites": [Favorite]}` (empty list when none) |
+| PUT | `/vault/favorites` | `{"favorites": [Favorite]}` | the stored list; replaces it; at most 200; 400 when malformed |
+
+`Favorite`: `{"id", "workspaceId", "filespace", "kind": "lucidlink"|"block",
+"path", "label", "addedAt": "ISO"}` (`label` optional; unknown fields dropped;
+`path` must start with `/`). Older vaults without favorites return an empty list.
+`id`, `workspaceId`, `filespace`, `path` and `addedAt` must be non-empty strings,
+`kind` one of the two values and ids unique; anything else is a 400 and the
+stored list is unchanged.
 
 ## Indexing controls
 
