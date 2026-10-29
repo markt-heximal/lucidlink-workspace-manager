@@ -208,3 +208,29 @@ def test_survey_excerpts_skip_invented_paths():
     assert docs[0]["excerpt"].startswith("First line second") and docs[0]["excerpt"].endswith("…")
     assert "excerpt" not in docs[1]
     assert card_excerpt("short text") == "short text"
+
+
+def test_assist_uses_engine_llm(make_service):
+    calls: list = []
+    svc = make_service(llm_answer="```html\n<ul><li>One</li></ul>\n```", llm_calls=calls)
+    with client(svc) as c:
+        body = c.post("/index/assist", json={"action": "summarize", "text": "Long text."}, headers=H).json()
+        assert body == {"html": "<ul><li>One</li></ul>", "action": "summarize"}
+        assert "Long text." in calls[-1]["messages"][1]["content"]
+        assert c.post("/index/assist", json={"action": "rewrite", "text": " "}, headers=H).status_code == 400
+        assert c.post("/index/assist", json={"action": "generate"}, headers=H).status_code == 400
+        assert c.post("/index/assist", json={"action": "delete", "text": "x"}, headers=H).status_code == 422
+        assert c.post("/index/assist", json={"action": "summarize", "text": "x"}).status_code == 401
+
+
+def test_assist_plain_text_is_escaped(make_service):
+    svc = make_service(llm_answer="Hello <b\n\nSecond")
+    with client(svc) as c:
+        body = c.post("/index/assist", json={"action": "continue", "text": "Start"}, headers=H).json()
+    assert body["html"] == "<p>Hello &lt;b</p><p>Second</p>"
+
+
+def test_assist_503_without_llm(make_service):
+    with client(make_service()) as c:
+        r = c.post("/index/assist", json={"action": "summarize", "text": "x"}, headers=H)
+    assert r.status_code == 503
