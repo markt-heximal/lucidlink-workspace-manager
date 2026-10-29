@@ -88,6 +88,23 @@ class SurveyBody(BaseModel):
     scope: str = "/"
 
 
+class RetryBody(BaseModel):
+    workspaceId: Optional[str] = None
+    filespace: str
+    paths: Optional[list[str]] = None
+    all: bool = False
+
+
+class PriorityItem(BaseModel):
+    workspaceId: str
+    filespace: str
+
+
+class ControlBody(BaseModel):
+    paused: Optional[bool] = None
+    priority: Optional[list[PriorityItem]] = None
+
+
 router = APIRouter(prefix="/index", dependencies=[Depends(require_internal_key)])
 
 
@@ -125,6 +142,32 @@ def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
            x_ws: Optional[str] = WorkspaceHeader):
     """Recently changed files; `limit` is capped at 200."""
     return {"files": svc.recent(_ws(workspaceId, x_ws), filespace or None, limit)}
+
+
+@router.get("/files")
+def list_files(filespace: str, status: Literal["failed", "skipped", "pending", "indexed"],
+               workspaceId: Optional[str] = None, limit: int = Query(default=50, ge=1),
+               offset: int = Query(default=0, ge=0), q: Optional[str] = None,
+               svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    """A source's files in one status, paged; `limit` is capped at 200."""
+    return svc.files(_ws(workspaceId, x_ws), filespace, status, limit, offset, q)
+
+
+@router.post("/retry")
+def retry(body: RetryBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    return {"requeued": svc.retry(_ws(body.workspaceId, x_ws), body.filespace, body.paths, body.all)}
+
+
+@router.get("/control")
+def get_control(svc: IndexerService = Depends(_service)):
+    return svc.control()
+
+
+@router.put("/control")
+def put_control(body: ControlBody, svc: IndexerService = Depends(_service)):
+    prio = None if body.priority is None else [{"workspaceId": p.workspaceId, "filespace": p.filespace}
+                                               for p in body.priority]
+    return svc.set_control(body.paused, prio)
 
 
 @router.get("/profile")
