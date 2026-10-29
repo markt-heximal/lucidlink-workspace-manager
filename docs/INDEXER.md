@@ -374,8 +374,8 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
 
 ### Folders from the app (no terminal)
 
-The owner connects and removes block storage from the web app (Engine ›
-Indexing › Add folder). The indexer sees a few **roots** read-only, mounted once
+The owner connects and removes block storage from the web app (Settings ›
+Storage Links › Local storage or NAS). The indexer sees a few **roots** read-only, mounted once
 by compose, and indexes only the folders chosen inside them; choices are kept in
 the index database, so nothing is restarted.
 
@@ -384,8 +384,9 @@ the index database, so nothing is restarted.
 | `volumes` | Drives and network shares | `BLOCK_ROOT_VOLUMES` (default `/Volumes`) | `/host/volumes` |
 | `icloud` | iCloud Drive | `BLOCK_ROOT_ICLOUD` | `/host/icloud` |
 | `desktop` | Desktop | `BLOCK_ROOT_DESKTOP` | `/host/desktop` |
+| `documents` | Documents | `BLOCK_ROOT_DOCUMENTS` | `/host/documents` |
 
-`start.sh` fills `BLOCK_ROOT_ICLOUD` and `BLOCK_ROOT_DESKTOP` on macOS when those
+`start.sh` fills `BLOCK_ROOT_ICLOUD`, `BLOCK_ROOT_DESKTOP` and `BLOCK_ROOT_DOCUMENTS` on macOS when those
 folders exist and the variables are unset. A root whose folder is unset, missing
 or empty is `available: false`. Browsing lists folders only, never follows a
 symlink (so `/Volumes/Macintosh HD`, a symlink to `/`, is not offered) and
@@ -411,7 +412,10 @@ connected one, is refused.
 | POST | `/index/folders/remove` | `{"name"}` | `{"removed", "files", "chunks"}`; 404 unknown name |
 | POST | `/index/folders/restart` | — | 202 `{"restarting": true}`: the indexer exits and Docker restarts it (for a share mounted after the indexer started that the container does not see yet) |
 
-`Root`: `{"id", "label", "hostPath": "/Volumes"|null, "available": bool}`.
+`Root`: `{"id", "label", "hostPath": "/Volumes"|null, "available": bool}`. The web
+app groups them as **Local storage** (`icloud`, `desktop`, `documents`) and
+**NAS** (`volumes`; external drives also appear there, since macOS mounts them
+under /Volumes too).
 `BlockSource` (also in `/index/status` → `blockSources`): `{"name", "workspaceId",
 "path", "kind": "block", "accepted", "error", "origin": "app"|"mini", "hostPath":
 "/Volumes/Projects"|null, "root": "volumes"|null, "folder": "/Projects"|null}`
