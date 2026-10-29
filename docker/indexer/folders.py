@@ -134,6 +134,7 @@ def browse(cfg: Config, root: str, folder: str, connected: Callable[[str, str, s
         p = ("" if folder == "/" else folder) + "/" + n
         host = host_path(cfg, root, p)
         entries.append({"name": n, "path": p, "hostPath": host, "provider": provider_of(root, p),
+                        "suggestedName": default_name(root, p),
                         "connected": connected(root, p, os.path.join(full, n), host)})
     parent = None if folder == "/" else (posixpath.dirname(folder) or "/")
     return {"root": root, "path": folder, "parent": parent, "entries": entries,
@@ -141,16 +142,19 @@ def browse(cfg: Config, root: str, folder: str, connected: Callable[[str, str, s
 
 
 def default_name(root: str, folder: str) -> str:
+    """A readable name for a new source: the folder's own name, except "iCloud" for iCloud
+    Drive's root and "<service> (<account>)" at the top of a cloud service, e.g.
+    "Google Drive (mark.personal)" for GoogleDrive-mark.personal@gmail.com or its My Drive."""
     base = posixpath.basename(folder) or ROOT_LABELS.get(root, root)
     if root == "icloud" and folder == "/":
         base = "iCloud"
     prov = provider_of(root, folder)
-    if prov and folder.strip("/").count("/") == 0 and prov["id"] != "other":
-        base = prov["label"] + (f" {prov['account'].split('@')[0]}" if prov["account"] else "")
-    out = "".join(c if c.isalnum() or c in "._-" else "-" for c in base)
-    while "--" in out:
-        out = out.replace("--", "-")
-    return out.strip("-")[:NAME_MAX] or "Folder"
+    if prov and prov["id"] != "other" and folder.strip("/").count("/") <= 1:
+        base = prov["label"] + (f" ({prov['account'].split('@')[0]})" if prov["account"] else "")
+    out = "".join(c if c.isalnum() or c in "._-() &" else "-" for c in base)
+    while "--" in out or "  " in out:
+        out = out.replace("--", "-").replace("  ", " ")
+    return out.strip("- ")[:NAME_MAX] or "Folder"
 
 
 def check_name(name: str) -> str:

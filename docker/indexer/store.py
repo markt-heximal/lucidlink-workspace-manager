@@ -500,6 +500,17 @@ class Store:
                               "ORDER BY changed_at DESC LIMIT ?", (ws, fs, limit))
         return out
 
+    def find_files(self, scopes: Iterable[tuple[str, str]], words: list[str], limit: int) -> list[dict]:
+        """Live files whose path contains every word (case-insensitive), per scope."""
+        like = " AND ".join("lower(path) LIKE ? ESCAPE '\\'" for _ in words)
+        pats = ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for w in words]
+        out: list[dict] = []
+        for ws, fs in scopes:
+            out += self.query("SELECT workspace_id, filespace, path, size, mtime, status, reason FROM files "
+                              f"WHERE workspace_id=? AND filespace=? AND status != 'deleted' AND {like} "
+                              "ORDER BY mtime DESC LIMIT ?", (ws, fs, *pats, limit))
+        return out
+
     def live_file_stats(self, ws: str, fs: str) -> list[dict]:
         """(path, size, mtime) of every live file, for GET /index/profile."""
         return self.query("SELECT path, size, mtime FROM files WHERE workspace_id=? AND filespace=? "

@@ -165,7 +165,7 @@ def test_new_drive_prompts(svc, roots):
         (roots["vols"] / "Camera").mkdir()
         new = c.get("/index/folders/prompts", headers=H).json()["newDrives"]
         assert [(d["name"], d["path"], d["hostPath"], d["suggestedName"]) for d in new] == [
-            ("Archive 3", "/Archive 3", "/Volumes/Archive 3", "Archive-3"), ("Camera", "/Camera", "/Volumes/Camera", "Camera")]
+            ("Archive 3", "/Archive 3", "/Volumes/Archive 3", "Archive 3"), ("Camera", "/Camera", "/Volumes/Camera", "Camera")]
         assert all(d["root"] == "volumes" and d["firstSeenAt"] for d in new)
 
         assert c.post("/index/folders/prompts/dismiss", json={"kind": "new", "path": "/Camera"}, headers=H).json() == {
