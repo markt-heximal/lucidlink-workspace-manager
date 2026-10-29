@@ -372,6 +372,51 @@ embedding cache (by chunk text hash) means it is re-read but not re-embedded.
   is the top 10 folders one level below the root by bytes (files directly in
   the root are in no folder).
 
+### Folders from the app (no terminal)
+
+The owner connects and removes block storage from the web app (Engine ›
+Indexing › Add folder). The indexer sees a few **roots** read-only, mounted once
+by compose, and indexes only the folders chosen inside them; choices are kept in
+the index database, so nothing is restarted.
+
+| Root id | Label | Host folder (`.env`) | In the container |
+|---|---|---|---|
+| `volumes` | Drives and network shares | `BLOCK_ROOT_VOLUMES` (default `/Volumes`) | `/host/volumes` |
+| `icloud` | iCloud Drive | `BLOCK_ROOT_ICLOUD` | `/host/icloud` |
+| `desktop` | Desktop | `BLOCK_ROOT_DESKTOP` | `/host/desktop` |
+
+`start.sh` fills `BLOCK_ROOT_ICLOUD` and `BLOCK_ROOT_DESKTOP` on macOS when those
+folders exist and the variables are unset. A root whose folder is unset, missing
+or empty is `available: false`. Browsing lists folders only, never follows a
+symlink (so `/Volumes/Macintosh HD`, a symlink to `/`, is not offered) and
+skips dot-names and system folders.
+
+Sources from `.env` (`BLOCK_SOURCES`, origin `mini`) and from the app (origin
+`app`) are listed together; either can be removed from the app. Removing a
+`mini` source records that in the database (`.env` is not edited, and the slot
+stays mounted until `add-folder.sh --remove` or a manual edit). Removing any
+source deletes its ledger rows, chunks and surveys, so its results leave search
+at once. Names are unique across all block sources, may not contain `/`, `;` or
+`=`, are at most 64 characters, and may not match a filespace in the block
+workspace. Folders are compared by **host path** (`BLOCK_SOURCE_PATH*` and the
+root host folders are passed to the container as plain strings), so the same
+folder reached through a slot and a root, or a folder inside or around a
+connected one, is refused.
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/index/folders` | — | `{"roots": [Root], "sources": [BlockSource]}` |
+| GET | `/index/folders/browse` | `?root=volumes&path=/` | `{"root", "path", "parent": "/…"\|null, "entries": [{"name", "path", "hostPath", "connected": "<source name>"\|null}], "truncated": bool}` (folders only, sorted by name, at most 500); 404 unknown root, 400 bad path, 503 root unavailable |
+| POST | `/index/folders` | `{"root", "path", "name"?}` | 201 `BlockSource`, first scan queued; 400 invalid (not a folder, bad name), 409 already connected, overlapping or name taken, 503 root unavailable |
+| POST | `/index/folders/remove` | `{"name"}` | `{"removed", "files", "chunks"}`; 404 unknown name |
+| POST | `/index/folders/restart` | — | 202 `{"restarting": true}`: the indexer exits and Docker restarts it (for a share mounted after the indexer started that the container does not see yet) |
+
+`Root`: `{"id", "label", "hostPath": "/Volumes"|null, "available": bool}`.
+`BlockSource` (also in `/index/status` → `blockSources`): `{"name", "workspaceId",
+"path", "kind": "block", "accepted", "error", "origin": "app"|"mini", "hostPath":
+"/Volumes/Projects"|null, "root": "volumes"|null, "folder": "/Projects"|null}`
+(`root`/`folder` only for `app` sources).
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is

@@ -97,6 +97,18 @@ services:
       # Connected block storage (docs/INDEXER.md, In Place, Phase A).
       - BLOCK_SOURCES=${BLOCK_SOURCES:-}
       - BLOCK_SOURCE_WORKSPACE=${BLOCK_SOURCE_WORKSPACE:-}
+      # Folders from the app (docs/INDEXER.md): the Mini folders behind the
+      # roots and the slots, as plain strings, so the indexer can show them and
+      # spot the same folder reached two ways.
+      - BLOCK_ROOT_VOLUMES=${BLOCK_ROOT_VOLUMES:-/Volumes}
+      - BLOCK_ROOT_ICLOUD=${BLOCK_ROOT_ICLOUD:-}
+      - BLOCK_ROOT_DESKTOP=${BLOCK_ROOT_DESKTOP:-}
+      - BLOCK_SOURCE_PATH=${BLOCK_SOURCE_PATH:-}
+      - BLOCK_SOURCE_PATH_2=${BLOCK_SOURCE_PATH_2:-}
+      - BLOCK_SOURCE_PATH_3=${BLOCK_SOURCE_PATH_3:-}
+      - BLOCK_SOURCE_PATH_4=${BLOCK_SOURCE_PATH_4:-}
+      - BLOCK_SOURCE_PATH_5=${BLOCK_SOURCE_PATH_5:-}
+      - BLOCK_SOURCE_PATH_6=${BLOCK_SOURCE_PATH_6:-}
     volumes:
       - lucidlink-data:/data
       # Up to six folders (NAS shares, drives, iCloud Drive, Desktop) indexed
@@ -109,6 +121,12 @@ services:
       - ${BLOCK_SOURCE_PATH_4:-./block-empty}:/block/source4:ro
       - ${BLOCK_SOURCE_PATH_5:-./block-empty}:/block/source5:ro
       - ${BLOCK_SOURCE_PATH_6:-./block-empty}:/block/source6:ro
+      # Places the owner browses from the app to connect folders without a
+      # restart: every drive and share mounted on the Mini, iCloud Drive and
+      # Desktop. Read-only; the indexer reads only the folders chosen in the app.
+      - ${BLOCK_ROOT_VOLUMES:-/Volumes}:/host/volumes:ro
+      - ${BLOCK_ROOT_ICLOUD:-./block-empty}:/host/icloud:ro
+      - ${BLOCK_ROOT_DESKTOP:-./block-empty}:/host/desktop:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
       interval: 30s

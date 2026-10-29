@@ -33,11 +33,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import dataclasses
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
+from . import folders
 from .block import KIND_BLOCK, KIND_LUCIDLINK, BlockSpec, NotMounted, parse_block_sources
 from .embedder import EmbedError
 from .scanner import FilespaceIndexer
@@ -85,7 +87,9 @@ class Scheduler:
         self._runtime: dict[Key, Runtime] = {}
         self._targets: list[Key] = []
         self._targets_at: Optional[float] = None
-        self._block_specs: list[BlockSpec] = parse_block_sources(self.cfg.block_sources)
+        self._env_specs: list[BlockSpec] = [dataclasses.replace(b, host_path=self.cfg.block_slot_hosts.get(b.path) or None)
+                                            for b in parse_block_sources(self.cfg.block_sources)]
+        self._specs: Optional[list[BlockSpec]] = None    # env + app folders, minus removed
         self._block_roots: dict[Key, str] = {}        # accepted block targets -> container path
         self._block_conflicts: dict[Key, str] = {}    # refused block names -> why
         self._block_ws: Optional[str] = None          # last resolved block workspace
@@ -107,11 +111,28 @@ class Scheduler:
     def is_target(self, ws: str, fs: str) -> bool:
         return (ws, fs) in self.targets()
 
+    @property
+    def _block_specs(self) -> list[BlockSpec]:
+        if self._specs is None:
+            self._specs = self._load_specs()
+        return self._specs
+
+    def _load_specs(self) -> list[BlockSpec]:
+        """BLOCK_SOURCES (minus names removed from the app) plus folders connected from the app."""
+        store = self.svc.store
+        removed = store.block_removed()
+        app = folders.app_specs(self.cfg, store.block_folders())
+        app_names = {b.name for b in app}
+        env = [b for b in self._env_specs if b.name not in removed and b.name not in app_names]
+        return env + app
+
     def refresh_targets(self, force: bool = False) -> list[Key]:
         """(workspace, filespace) pairs from the vault plus explicit overrides."""
         now = time.monotonic()
         if not force and self._targets_at is not None and now - self._targets_at < self.cfg.targets_refresh_sec:
             return list(self._targets)
+        if force:
+            self._specs = None
         try:
             workspaces = self.svc.settings.workspaces()
             self.settings_error = None
@@ -183,7 +204,8 @@ class Scheduler:
             elif error is None and key not in roots:
                 roots[key] = b.path
             listing.append({"name": b.name, "workspaceId": key[0], "path": b.path, "kind": KIND_BLOCK,
-                            "accepted": error is None, "error": error})
+                            "accepted": error is None, "error": error, "origin": b.origin,
+                            "hostPath": b.host_path, "root": b.root, "folder": b.folder})
         if conflicts:
             logger.warning("block sources refused: %s", "; ".join(conflicts.values()))
         return roots, conflicts, listing
