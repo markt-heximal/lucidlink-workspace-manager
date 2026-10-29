@@ -24,6 +24,7 @@ from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, R
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
+from . import activity as activity_mod
 from .assist import Action, assist
 from .config import Config
 from .folders import FolderError
@@ -263,6 +264,13 @@ def folder_file(name: str, path: str, svc: IndexerService = Depends(_service)):
     return FileResponse(full, media_type=media, content_disposition_type="inline", filename=filename)
 
 
+@router.get("/activity")
+def get_activity(request: Request, after: Optional[int] = Query(default=None, ge=0),
+                 limit: int = Query(default=200, ge=1, le=activity_mod.LIMIT_MAX)):
+    """Recent engine log lines for the app's engine console (docs: Engine activity feed)."""
+    return request.app.state.activity.read(after, limit)
+
+
 @router.get("/folders/prompts")
 def folder_prompts(svc: IndexerService = Depends(_service)):
     """New drives to offer and connected folders that have gone missing."""
@@ -299,6 +307,13 @@ def post_survey(body: SurveyBody, svc: IndexerService = Depends(_service),
     return svc.regenerate_survey(_ws(body.workspaceId, x_ws), body.filespace, body.scope)
 
 
+def _activity_lines() -> int:
+    try:
+        return int(os.environ.get("ACTIVITY_LINES", "1000"))
+    except ValueError:
+        return 1000
+
+
 def _restart_soon() -> None:
     """Shut down gracefully (SIGTERM) shortly after the response; Docker's restart policy starts us again."""
     threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
@@ -324,6 +339,7 @@ def create_app(service_factory: Optional[Callable[[], IndexerService]] = None,
 
     app = FastAPI(title="LucidLink Indexer", lifespan=lifespan)
     app.state.restart = restart
+    app.state.activity = activity_mod.install(_activity_lines())
 
     @app.get("/health")
     def health():
@@ -354,4 +370,8 @@ def create_app(service_factory: Optional[Callable[[], IndexerService]] = None,
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# Per-file lines go to the engine console (activity ring) but not to docker logs.
+for _h in logging.getLogger().handlers:
+    if not isinstance(_h, activity_mod.ActivityLog):
+        _h.addFilter(lambda r: r.name != "indexer.files")
 app = create_app()

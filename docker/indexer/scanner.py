@@ -57,6 +57,9 @@ from .source import FilespaceSource, NotDownloaded
 from .store import Store, now_iso
 
 logger = logging.getLogger("indexer.scanner")
+# One line per file read, skipped or failed: for the engine console only (docker
+# logs leave this logger out, see app.py), so it can be chatty.
+files_log = logging.getLogger("indexer.files")
 
 # Identifies ids recorded from SDK 1.0 listings (FsEntry.id). SDK 0.14 ids came
 # from get_entry's file_id; see FilespaceIndexer.scan for the one-time re-key.
@@ -516,6 +519,11 @@ class FilespaceIndexer:
                 progress(done, total, row["path"])
             outcome = self._index_file(row, out)
             setattr(out, outcome, getattr(out, outcome) + 1)
+            if outcome != "touched" and files_log.isEnabledFor(logging.INFO):
+                cur = self.store.get_file(self.ws, self.fs, row["file_id"]) or {}
+                why = f": {cur.get('reason')}" if outcome in ("skipped", "failed") and cur.get("reason") else ""
+                chunks = f" ({cur.get('chunk_count')} chunks)" if outcome == "indexed" else ""
+                files_log.info("[%s/%s] %s %s%s%s", self.ws, self.fs, outcome, row["path"], chunks, why)
             done += 1
         if progress:
             progress(done, total, None)

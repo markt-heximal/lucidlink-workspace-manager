@@ -592,6 +592,27 @@ a new service or account under `~/Library/CloudStorage` is offered like a new
 share, with `"root": "cloud"`; dismissing takes `{"kind": "new", "root":
 "cloud", "path"}` (`root` defaults to `volumes`).
 
+### Engine activity feed
+
+The web app's engine console (a right-side drawer, green on black) shows what
+the indexer is doing as it happens. The indexer keeps its recent log lines in
+memory, a ring of `ACTIVITY_LINES` (default 1000), from its own loggers
+(`indexer.*`) plus warnings and errors from anything else; request logs
+(`uvicorn.access`) and its own polling are left out. Nothing is written to disk
+or sent anywhere; owner-only like every `/index` route.
+
+| Method | Path | Body / query | Result |
+|---|---|---|---|
+| GET | `/index/activity` | `?after=<seq>&limit=200` | `{"events": [{"seq", "ts": "ISO", "level": "info"\|"warning"\|"error", "source": "worker"\|"vectors"\|…, "text"}], "last": seq, "dropped": bool}`: events after `seq` (all buffered ones when omitted), oldest first, at most `limit` (max 500); `dropped` is true when `after` is older than the buffer, so lines were missed |
+
+Besides scan summaries, each file read, skipped or failed gets a line
+(`source: "files"`, e.g. `[local/NAS] indexed /Clients/brief.pdf (12 chunks)`); those
+lines go only to the console, not to the container log.
+
+Poll it every 1-2 s while the console is open; `seq` only grows. Lines are the
+log text (they include file paths, as the logs do); anything that looks like a
+bearer token or key is masked.
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is
