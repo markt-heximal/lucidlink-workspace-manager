@@ -121,7 +121,7 @@ active workspace.
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}]}` |
-| GET | `/index/recent` | `?workspaceId&filespace&limit=20` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace) | `{"files": [RecentFile]}`, newest first |
+| GET | `/index/recent` | `?workspaceId&filespace&limit=20&kind=&change=&since=&before=` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace; `kind` as `/index/bykind`, `change` a comma list of new\|modified\|renamed\|deleted, `since` ≤ `when` < `before` (ISO); unknown kind/change or a bad time → 400; see What's new) | `{"files": [RecentFile], "next": ISO\|null}`, newest `when` first; pass `next` as `before` for the next page (ties on `when` stay on one page) |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
@@ -144,7 +144,8 @@ active workspace.
 {"workspaceId": "default", "filespace": "my-app-bucket", "path": "/Board/minutes.docx",
  "size": 48211, "mtime": "ISO|null", "status": "indexed|pending|skipped|failed|deleted",
  "indexedAt": "ISO|null", "change": "new|modified|renamed|deleted|null",
- "changedAt": "ISO|null", "previousPath": "/old/path|null"}
+ "changedAt": "ISO|null", "previousPath": "/old/path|null",
+ "when": "ISO", "type": "document|pdf|image|…"}
 ```
 
 Live files are ordered by their own `mtime`; deletions and renames by `changedAt`

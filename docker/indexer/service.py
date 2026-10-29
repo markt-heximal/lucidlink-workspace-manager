@@ -13,8 +13,8 @@ import os
 import stat as stat_mod
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Iterable, Optional
 
 import httpx
 
@@ -37,6 +37,7 @@ SNIPPET_CHARS = 300
 
 
 RECENT_MAX = 200
+RECENT_CHANGES = ("new", "modified", "renamed", "deleted")
 BYKIND_MAX = 500
 # GET /index/bykind: the app's Kind filter onto the profile's type classes.
 KIND_CLASSES = {
@@ -81,6 +82,28 @@ def _iso_seconds(v: Optional[str]) -> Optional[float]:
     try:
         return datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
     except ValueError:
+        return None
+
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _iso_micros(v: str, name: str) -> int:
+    """ISO 8601 → integer Unix microseconds (no offset = UTC); ValueError names the parameter."""
+    try:
+        dt = datetime.fromisoformat(v.strip().replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"{name} is not an ISO 8601 timestamp: {v!r}") from None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (dt - _EPOCH) // timedelta(microseconds=1)
+
+
+def _micros_iso(us: int) -> Optional[str]:
+    """Integer Unix microseconds → ISO 8601 UTC, fraction only when there is one (round-trips)."""
+    try:
+        return (_EPOCH + timedelta(microseconds=int(us))).isoformat().replace("+00:00", "Z")
+    except OverflowError:
         return None
 
 
@@ -629,38 +652,73 @@ class IndexerService:
         return out
 
     def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
-        """Most recently changed files, newest first, from the ledger.
+        """Most recently changed files, newest first (see recent_page)."""
+        return self.recent_page(workspace_id, filespace, limit)["files"]
+
+    def recent_page(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20, *,
+                    kind: Optional[str] = None, changes: Optional[Iterable[str]] = None,
+                    since: Optional[str] = None, before: Optional[str] = None) -> dict:
+        """One page of GET /index/recent: {"files", "next"} (docs: What's new).
 
         Live files are ordered by their own mtime (when the file changed, not when
-        the indexer noticed); deletions and renames by when the indexer saw them.
-        `change` is new | modified | renamed | deleted, or null when it can't be
-        derived (e.g. files found by a filespace's first crawl).
+        the indexer noticed); deletions and renames by when the indexer saw them;
+        that timestamp is each item's `when`. `change` is new | modified | renamed |
+        deleted, or null when it can't be derived (e.g. files found by a
+        filespace's first crawl). Filters (kind, change, since ≤ when < before)
+        apply in SQL before the limit. A page never splits files tied on `when`,
+        so it can run over `limit`; `next` is the `before` of the following page,
+        null when nothing older matches. Raises ValueError on a bad filter.
         """
         limit = max(1, min(int(limit), RECENT_MAX))
+        exts = None
+        if kind:
+            classes = KIND_CLASSES.get(kind)
+            if classes is None:
+                raise ValueError(f"unknown kind {kind!r}; expected one of {', '.join(KIND_CLASSES)}")
+            # The extensions type_of() puts in these classes (the first class listing one wins).
+            exts = {e for c in classes for e in TYPE_EXT[c] if type_of("x" + e) in classes}
+        if changes is not None:
+            changes = {c.strip() for c in changes if c.strip()}
+            bad = sorted(changes - set(RECENT_CHANGES))
+            if bad or not changes:
+                raise ValueError(f"unknown change {', '.join(bad) or '(empty)'}; "
+                                 f"expected some of {', '.join(RECENT_CHANGES)}")
+        since_us = _iso_micros(since, "since") if since else None
+        before_us = _iso_micros(before, "before") if before else None
         scopes = sorted(self.scopes(workspace_id, filespace))
         kinds = self.kinds()
         locs = self.locations()
-        seen: set[tuple[str, str, str]] = set()
-        items: list[tuple[float, dict]] = []
         # A day of slack for clock skew; anything later is a wrong timestamp, not a recent change.
-        for r in self.store.recent_files(scopes, limit, latest=time.time() + 86400):
+        latest = time.time() + 86400
+        query = lambda n, before_us: self.store.recent_files(
+            scopes, n, latest=latest, since_us=since_us, before_us=before_us, changes=changes, exts=exts)
+        seen: set[tuple[str, str, str]] = set()
+        rows: list[dict] = []
+        for r in query(limit, before_us):
             key = (r["workspace_id"], r["filespace"], r["file_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-            kind = r.get("change_kind")
-            by_change = r["status"] == "deleted" or kind == "renamed"
-            when = (_iso_seconds(r.get("changed_at")) if by_change else None) or mtime_seconds(r["mtime"]) or 0.0
-            items.append((when, {
+            if key not in seen:
+                seen.add(key)
+                rows.append(r)
+        rows.sort(key=lambda r: (-r["when_us"], r["path"], r["workspace_id"], r["filespace"]))
+        nxt = None
+        if len(rows) >= limit:
+            cut = rows[limit - 1]["when_us"]
+            older = any(r["when_us"] < cut for r in rows)
+            rows = [r for r in rows if r["when_us"] >= cut]
+            if older or query(1, cut):
+                nxt = _micros_iso(cut)
+        files = []
+        for r in rows:
+            name = r["path"].rsplit("/", 1)[-1]
+            files.append({
                 "workspaceId": r["workspace_id"], "filespace": r["filespace"],
                 "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
                 "location": locs.get((r["workspace_id"], r["filespace"])),
                 "size": r["size"], "mtime": mtime_iso(r["mtime"]), "status": r["status"],
-                "indexedAt": r.get("indexed_at"), "change": kind, "changedAt": r.get("changed_at"),
-                "previousPath": r.get("prev_path"),
-            }))
-        items.sort(key=lambda it: (-it[0], it[1]["path"]))
-        return [it[1] for it in items[:limit]]
+                "indexedAt": r.get("indexed_at"), "change": r.get("change_kind"), "changedAt": r.get("changed_at"),
+                "previousPath": r.get("prev_path"), "when": _micros_iso(r["when_us"]), "type": type_of(name),
+            })
+        return {"files": files, "next": nxt}
 
     def by_kind(self, workspace_id: Optional[str], filespace: Optional[str], kind: str,
                 limit: int = 100, offset: int = 0) -> dict:

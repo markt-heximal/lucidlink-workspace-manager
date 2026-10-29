@@ -472,28 +472,71 @@ class Store:
             return self.query(sql + " LIMIT ?", (ws, fs, int(limit)))
         return self.query(sql, (ws, fs))
 
-    def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int,
-                     latest: Optional[float] = None) -> list[dict]:
-        """Candidate rows for GET /index/recent: per scope, the newest live files by
-        mtime and the latest deletions/renames by changed_at. The caller merges
-        and orders them (mtime units vary, see service.mtime_seconds).
+    # A row's GET /index/recent timestamp in integer microseconds: when the indexer
+    # saw a deletion or rename (changed_at), else the file's own mtime in whichever
+    # unit it is stored (see service.mtime_seconds). Integer arithmetic, so a
+    # cursor round-trips exactly.
+    _MTIME_US = ("(CASE WHEN mtime > 1e17 THEN mtime / 1000 WHEN mtime > 1e14 THEN mtime "
+                 "WHEN mtime > 1e11 THEN mtime * 1000 ELSE mtime * 1000000 END)")
+    _BY_CHANGE = "((status = 'deleted' OR change_kind = 'renamed') AND changed_at IS NOT NULL)"
+    _CHANGED_US = "(CAST(strftime('%s', changed_at) AS INTEGER) * 1000000)"
 
-        `latest` (Unix seconds) leaves out files dated after it, in whichever unit
-        their mtime is stored: a file stamped in the future by a wrong clock is not
-        a recent change, and would otherwise crowd out every real one."""
-        out: list[dict] = []
-        future = ""
-        args: tuple = ()
+    def recent_files(self, scopes: Iterable[tuple[str, str]], limit: int,
+                     latest: Optional[float] = None, *, since_us: Optional[int] = None,
+                     before_us: Optional[int] = None, changes: Optional[Iterable[str]] = None,
+                     exts: Optional[Iterable[str]] = None) -> list[dict]:
+        """Candidate rows for GET /index/recent, per scope newest first: live files
+        by mtime, deletions and renames by changed_at (`when_us`, integer
+        microseconds, is added to each row). Each scope gives its newest `limit`
+        rows plus every row tied with the last of them, so a page cut at `limit`
+        across scopes never splits a tie. The caller merges the scopes.
+
+        Filters apply before the limit: `since_us` ≤ when < `before_us`;
+        `changes` keeps those change kinds; `exts` keeps names ending in one of
+        them (".pdf"…, ASCII case folded; a name that is only the extension, a
+        hidden file, has none).
+
+        `latest` (Unix seconds) leaves out live files dated after it, in whichever
+        unit their mtime is stored: a file stamped in the future by a wrong clock is
+        not a recent change, and would otherwise crowd out every real one."""
+        when = (f"(CASE WHEN {self._BY_CHANGE} THEN COALESCE({self._CHANGED_US}, {self._MTIME_US}) "
+                f"ELSE {self._MTIME_US} END)")
+        where = ["workspace_id=?", "filespace=?", "(status != 'deleted' OR changed_at IS NOT NULL)"]
+        args: list = []
         if latest is not None:
-            future = ("AND NOT ((mtime <= 1e11 AND mtime > ?) OR (mtime > 1e11 AND mtime <= 1e14 AND mtime > ?) "
-                      "OR (mtime > 1e14 AND mtime <= 1e17 AND mtime > ?) OR (mtime > 1e17 AND mtime > ?)) ")
-            args = (latest, latest * 1e3, latest * 1e6, latest * 1e9)
+            where.append(f"NOT (NOT {self._BY_CHANGE} AND {self._MTIME_US} > ?)")
+            args.append(int(latest * 1e6))
+        if changes is not None:
+            changes = sorted(set(changes))
+            if not changes:
+                return []
+            where.append(f"change_kind IN ({','.join('?' * len(changes))})")
+            args += changes
+        if exts is not None:
+            exts = sorted(set(exts))
+            if not exts:
+                return []
+            where.append("(" + " OR ".join("(path LIKE ? ESCAPE '\\' AND path NOT LIKE ? ESCAPE '\\' AND path != ?)"
+                                           for _ in exts) + ")")
+            for e in exts:
+                args += ["%" + like_escape(e), "%/" + like_escape(e), e]
+        # `w` is computed in the inner select; the time window filters on it outside.
+        outer, wargs = [], []
+        if since_us is not None:
+            outer.append("w >= ?")
+            wargs.append(int(since_us))
+        if before_us is not None:
+            outer.append("w < ?")
+            wargs.append(int(before_us))
+        sql = (f"WITH c AS (SELECT * FROM (SELECT *, {when} AS w FROM files WHERE {' AND '.join(where)})"
+               f"{' WHERE ' + ' AND '.join(outer) if outer else ''}) "
+               "SELECT * FROM c WHERE w >= COALESCE((SELECT w FROM c ORDER BY w DESC LIMIT 1 OFFSET ?), w) "
+               "ORDER BY w DESC, path")
+        out: list[dict] = []
         for ws, fs in scopes:
-            out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND status != 'deleted' "
-                              f"{future}ORDER BY mtime DESC, path LIMIT ?", (ws, fs, *args, limit))
-            out += self.query("SELECT * FROM files WHERE workspace_id=? AND filespace=? AND changed_at IS NOT NULL "
-                              "AND (status = 'deleted' OR change_kind = 'renamed') "
-                              "ORDER BY changed_at DESC LIMIT ?", (ws, fs, limit))
+            for r in self.query(sql, (ws, fs, *args, *wargs, max(1, int(limit)) - 1)):
+                r["when_us"] = r.pop("w")
+                out.append(r)
         return out
 
     def find_files(self, scopes: Iterable[tuple[str, str]], words: list[str], limit: int) -> list[dict]:

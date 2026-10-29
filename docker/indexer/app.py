@@ -181,10 +181,16 @@ def find(q: str = Query(default=""), workspaceId: Optional[str] = None, filespac
 
 @router.get("/recent")
 def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
-           limit: int = Query(default=20, ge=1), svc: IndexerService = Depends(_service),
-           x_ws: Optional[str] = WorkspaceHeader):
-    """Recently changed files; `limit` is capped at 200."""
-    return {"files": svc.recent(_ws(workspaceId, x_ws), filespace or None, limit)}
+           limit: int = Query(default=20, ge=1), kind: Optional[str] = None, change: Optional[str] = None,
+           since: Optional[str] = None, before: Optional[str] = None,
+           svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    """Recently changed files, newest first, with filters and a `next` cursor; `limit` is capped at 200."""
+    try:
+        return svc.recent_page(_ws(workspaceId, x_ws), filespace or None, limit, kind=kind or None,
+                               changes=change.split(",") if change else None,
+                               since=since or None, before=before or None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/bykind")
