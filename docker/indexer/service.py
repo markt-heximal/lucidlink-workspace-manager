@@ -80,6 +80,7 @@ class NotFound(Exception):
 
 
 LIST_MAX = 2000
+ALL_WORKSPACES = "*"
 
 
 def _age_sec(iso_ts: str) -> float:
@@ -147,7 +148,14 @@ class IndexerService:
         return targets[0][0] if targets else None
 
     def scopes(self, workspace_id: Optional[str], filespace: Optional[str]) -> set[Scope]:
-        """Search scope: one filespace, or every enabled filespace of the workspace."""
+        """Search scope: one filespace, or every enabled filespace of the workspace.
+
+        workspaceId "*" means every workspace, the Mini's drives included ("All drives");
+        with a filespace it is that name in whichever workspace has it.
+        """
+        if workspace_id == ALL_WORKSPACES:
+            keys = [k for k in self.scheduler.targets() if self.scheduler.enabled(*k)]
+            return {k for k in keys if not filespace or k[1] == filespace}
         ws = self.resolve_workspace(workspace_id)
         if ws is None:
             return set()
