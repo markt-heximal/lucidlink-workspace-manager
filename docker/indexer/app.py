@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import mimetypes
 import os
 import signal
 import threading
@@ -20,7 +21,7 @@ from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .assist import Action, assist
@@ -239,6 +240,21 @@ def add_folder(body: FolderBody, svc: IndexerService = Depends(_service)):
 @router.post("/folders/remove")
 def remove_folder(body: FolderRemoveBody, svc: IndexerService = Depends(_service)):
     return svc.remove_folder(body.name)
+
+
+@router.get("/folders/list")
+def list_folder(name: str, path: str = Query(default="/"), svc: IndexerService = Depends(_service)):
+    """One folder of a connected drive or folder, read-only."""
+    return svc.list_folder(name, path)
+
+
+@router.get("/folders/file")
+def folder_file(name: str, path: str, svc: IndexerService = Depends(_service)):
+    """A file of a connected drive or folder (Range requests give 206)."""
+    full = svc.folder_file(name, path)
+    filename = os.path.basename(full)
+    media = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return FileResponse(full, media_type=media, content_disposition_type="inline", filename=filename)
 
 
 @router.get("/folders/prompts")

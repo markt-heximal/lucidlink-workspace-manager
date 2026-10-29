@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat as stat_mod
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -19,7 +20,8 @@ import httpx
 from . import ask as ask_mod
 from . import folders as folders_mod
 from . import survey as survey_mod
-from .block import KIND_LUCIDLINK, TYPES, RoutingSourceProvider, mounted, type_of
+from .block import KIND_LUCIDLINK, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
+from .block import NotMounted as NotMountedError
 from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
@@ -75,6 +77,9 @@ def _iso_seconds(v: Optional[str]) -> Optional[float]:
 
 class NotFound(Exception):
     pass
+
+
+LIST_MAX = 2000
 
 
 def _age_sec(iso_ts: str) -> float:
@@ -312,6 +317,66 @@ class IndexerService:
             if not name or not self.store.dismiss_missing(name):
                 raise NotFound(f"no missing folder called {name!r}")
         return {"dismissed": True}
+
+    def _block_source(self, name: str) -> "LocalSource":
+        spec = next((b for b in self.scheduler._block_specs if b.name == name and b.error is None), None)
+        if spec is None:
+            raise NotFound(f"no connected folder called {name!r}")
+        if not mounted(spec.path):
+            raise folders_mod.FolderError(503, f"{name} can't be reached right now.")
+        return LocalSource(spec.path)
+
+    def list_folder(self, name: str, path: str) -> dict:
+        """One folder of a connected block source, read-only (docs: Browsing and opening)."""
+        src = self._block_source(name)
+        folder = folders_mod.normalize_folder(path)
+        try:
+            entries = src.list_dir(folder)
+        except PathRefused:
+            raise folders_mod.FolderError(400, "That path is outside the folder, or goes through a link.") from None
+        except (FileNotFoundError, NotADirectoryError):
+            raise NotFound(f"{folder} isn't in {name}") from None
+        except NotMountedError:
+            raise folders_mod.FolderError(503, f"{name} can't be reached right now.") from None
+        dirs = sorted((e for e in entries if e.type == "dir"), key=lambda e: e.name.casefold())
+        files = sorted((e for e in entries if e.type == "file"), key=lambda e: e.name.casefold())
+        ordered = (dirs + files)[:LIST_MAX]
+        ws = self.scheduler._block_workspace()
+        ids = [e.file_id for e in ordered if e.type == "file"]
+        status: dict[str, str] = {}
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            for r in self.store.query(
+                    f"SELECT file_id, status FROM files WHERE workspace_id=? AND filespace=? "
+                    f"AND file_id IN ({','.join('?' * len(part))})", [ws, name, *part]):
+                status[r["file_id"]] = r["status"]
+        base = "" if folder == "/" else folder
+        out = [{"name": e.name, "path": f"{base}/{e.name}", "isDir": e.type == "dir",
+                "size": e.size if e.type == "file" else None, "mtime": mtime_iso(e.mtime),
+                "status": (status.get(e.file_id) if e.type == "file" else None)} for e in ordered]
+        parent = None if folder == "/" else (folder.rsplit("/", 1)[0] or "/")
+        return {"name": name, "path": folder, "parent": parent, "entries": out,
+                "truncated": len(dirs) + len(files) > LIST_MAX}
+
+    def folder_file(self, name: str, path: str) -> str:
+        """Absolute path of a regular file in a connected block source, for streaming."""
+        src = self._block_source(name)
+        folder = folders_mod.normalize_folder(path)
+        if folder == "/":
+            raise folders_mod.FolderError(400, "That's a folder, not a file.")
+        try:
+            _rel, full = src._resolve(folder)
+        except PathRefused:
+            raise folders_mod.FolderError(400, "That path is outside the folder, or goes through a link.") from None
+        try:
+            st = os.lstat(full)
+        except (FileNotFoundError, NotADirectoryError):
+            raise NotFound(f"{folder} isn't in {name}") from None
+        if stat_mod.S_ISDIR(st.st_mode):
+            raise folders_mod.FolderError(400, "That's a folder, not a file.")
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise NotFound(f"{folder} isn't a file")
+        return full
 
     def remove_folder(self, name: str) -> dict:
         spec = next((b for b in self.scheduler._block_specs if b.name == name), None)

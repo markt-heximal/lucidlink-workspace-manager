@@ -219,3 +219,41 @@ def test_missing_waits_for_the_grace_period(svc, roots):
         shutil.rmtree(roots["slot"])
         assert c.get("/index/folders/prompts", headers=H).json()["missing"] == []
         assert svc.store.missing_row("Archive-old") is not None
+
+
+def test_list_and_open_a_connected_folder(svc, roots):
+    proj = roots["vols"] / "Projects"
+    (proj / "b.txt").write_text("hello world")
+    (proj / ".DS_Store").write_text("x")
+    os.symlink(proj / "b.txt", proj / "link.txt")
+    with client(svc) as c:
+        assert c.post("/index/folders", json={"root": "volumes", "path": "/Projects", "name": "P"},
+                      headers=H).status_code == 201
+        svc.scheduler.run_job("ws1", "P", full=True)
+        top = c.get("/index/folders/list", params={"name": "P"}, headers=H).json()
+        assert top["path"] == "/" and top["parent"] is None and top["truncated"] is False
+        # Folders first; no dot-files, no links.
+        assert [(e["name"], e["isDir"]) for e in top["entries"]] == [("Clients", True), ("b.txt", False)]
+        f = top["entries"][1]
+        assert f["path"] == "/b.txt" and f["size"] == 11 and f["mtime"] and f["status"] in ("indexed", "skipped")
+        assert top["entries"][0]["size"] is None and top["entries"][0]["status"] is None
+        deep = c.get("/index/folders/list", params={"name": "P", "path": "/Clients/Northwind"}, headers=H).json()
+        assert deep["parent"] == "/Clients" and deep["entries"][0]["status"] == "indexed"
+
+        r = c.get("/index/folders/file", params={"name": "P", "path": "/b.txt"}, headers=H)
+        assert r.status_code == 200 and r.content == b"hello world"
+        assert r.headers["content-type"].startswith("text/plain")
+        assert r.headers["content-disposition"].startswith("inline")
+        part = c.get("/index/folders/file", params={"name": "P", "path": "/b.txt"},
+                     headers={**H, "Range": "bytes=6-10"})
+        assert part.status_code == 206 and part.content == b"world"
+
+        bad = {"/link.txt": 400, "/../../etc/passwd": 400, "/Clients": 400, "/nope.txt": 404}
+        for path, code in bad.items():
+            assert c.get("/index/folders/file", params={"name": "P", "path": path},
+                         headers=H).status_code == code, path
+        assert c.get("/index/folders/list", params={"name": "P", "path": "/nope"}, headers=H).status_code == 404
+        assert c.get("/index/folders/list", params={"name": "nope"}, headers=H).status_code == 404
+        assert c.get("/index/folders/list", params={"name": "P"}).status_code == 401
+        os.rename(proj, roots["base"] / "away")
+        assert c.get("/index/folders/list", params={"name": "P"}, headers=H).status_code == 503
