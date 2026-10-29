@@ -314,6 +314,18 @@ cannot write to it whatever the code does.
 | `BLOCK_SOURCES` | `name=/container/path` entries separated by `;`, e.g. `NAS=/block/source1`. Empty: no block sources. |
 | `BLOCK_SOURCE_WORKSPACE` | Workspace id the block sources belong to (they appear in that workspace's "all filespaces" search). Default: the vault's active workspace. |
 
+**The helper.** `docker/add-folder.sh` does the steps above in one command on
+the Mini: `./add-folder.sh smb://nas.local/Projects` (mounts the share first;
+a sub-path after the share is allowed), `./add-folder.sh /Volumes/Projects
+--name Studio`, `--list` and `--remove NAME`. It picks the first free slot,
+refuses a folder that is already connected, inside or around another slot,
+names a source after the folder (iCloud Drive becomes `iCloud`), backs up
+`.env` (mode 600) before editing `BLOCK_SOURCE_PATH[_N]` and `BLOCK_SOURCES`,
+recreates only `lucidlink-indexer`, then reports what the indexer says about
+the new source (accepted, or why it was refused). `--yes` skips the question,
+`--no-restart` only edits `.env`. Removing a source stops indexing it; chunks
+already indexed from it stay in the index until it is cleared.
+
 **Keys.** A block source is a target `(workspaceId, name)` like a filespace,
 with `kind: "block"`. A name that collides with a vault filespace in that
 workspace is refused and not indexed: the filespace keeps the key and keeps
