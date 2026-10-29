@@ -38,10 +38,11 @@ def answer(svc: "IndexerService", scopes: "set[Scope]", question: str, k: int = 
     context = "\n---\n".join(f"PATH: {r['path']}\nEXCERPT: {r['text'][:EXCERPT_CHARS]}" for r, _ in used)
     label = ", ".join(sorted({fs for _, fs in scopes}))
     kinds = svc.kinds()
+    locs = svc.locations()
     text = svc.llm.chat(ASK_SYSTEM, f"Filespace: {label}\nQuestion: {question}\n\nExcerpts:\n{context}")
     return {
         "answer": text,
         "sources": list(dict.fromkeys(r["path"] for r, _ in used))[:MAX_SOURCES],
-        "citations": [{"kind": kinds.get((r["workspace_id"], r["filespace"]), "lucidlink"), "workspaceId": r["workspace_id"], "filespace": r["filespace"], "path": r["path"], "chunkIndex": r["chunk_index"], "score": round(s, 4)}
+        "citations": [{"kind": kinds.get((r["workspace_id"], r["filespace"]), "lucidlink"), "workspaceId": r["workspace_id"], "filespace": r["filespace"], "location": locs.get((r["workspace_id"], r["filespace"])), "path": r["path"], "chunkIndex": r["chunk_index"], "score": round(s, 4)}
                       for r, s in used],
     }

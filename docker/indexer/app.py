@@ -171,6 +171,14 @@ def search(body: SearchBody, svc: IndexerService = Depends(_service), x_ws: Opti
                                   body.pathPrefix)}
 
 
+@router.get("/find")
+def find(q: str = Query(default=""), workspaceId: Optional[str] = None, filespace: Optional[str] = None,
+         limit: int = Query(default=20, ge=1, le=100), svc: IndexerService = Depends(_service),
+         x_ws: Optional[str] = WorkspaceHeader):
+    """Files by name across locations: instant, no AI (docs: Find by name)."""
+    return {"results": svc.find(_ws(workspaceId, x_ws), filespace, q, limit)}
+
+
 @router.get("/recent")
 def recent(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
            limit: int = Query(default=20, ge=1), svc: IndexerService = Depends(_service),

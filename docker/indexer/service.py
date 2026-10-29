@@ -80,6 +80,29 @@ class NotFound(Exception):
 
 
 LIST_MAX = 2000
+FIND_MAX = 100
+FIND_CANDIDATES = 400   # per scope, before ranking
+
+# lastError -> what the app can say and do about it (docs: Why something is wrong).
+_PROBLEMS = (   # first match wins: a network failure reported as "authentication failed" is a network failure
+    ("offline", ("not mounted",)),
+    ("too_big", ("413", "payload too large", "too large")),
+    ("engine", ("embedder", "embedding", "llm ", "llm:", "ruvector", "vector store")),
+    ("unreachable", ("host not found", "connection refused", "connection reset", "timed out", "timeout",
+                     "network is unreachable", "name or service not known", "temporary failure in name")),
+    ("sign_in", ("authentication failed", "lease expired", "unauthorized", "forbidden", "invalid token",
+                 "token expired", " 401", " 403")),
+)
+
+
+def problem_of(error: Optional[str]) -> Optional[dict]:
+    if not error:
+        return None
+    low = " " + error.lower()
+    for kind, needles in _PROBLEMS:
+        if any(n in low for n in needles):
+            return {"kind": kind, "detail": error}
+    return {"kind": "other", "detail": error}
 # Roots whose new top folders are offered: mounted shares and drives, and cloud sync apps.
 PROMPT_ROOTS = ("volumes", "cloud")
 ALL_WORKSPACES = "*"
@@ -166,6 +189,48 @@ class IndexerService:
             return {(ws, filespace)}
         return {k for k in self.scheduler.targets() if k[0] == ws and self.scheduler.enabled(*k)}
 
+    def location(self, ws: str, fs: str, kind: Optional[str] = None) -> dict:
+        """Where a source lives, for badges: kind, plus root and provider for block sources."""
+        if kind is None:
+            kind = self.kinds().get((ws, fs), KIND_LUCIDLINK)
+        root = provider = None
+        if kind != KIND_LUCIDLINK and ws == self.scheduler._block_workspace():
+            spec = next((b for b in self.scheduler._block_specs if b.name == fs), None)
+            if spec is not None:
+                root, provider = spec.root, spec.provider
+        return {"kind": kind, "root": root, "provider": provider}
+
+    def locations(self) -> "dict[tuple[str, str], dict]":
+        """location() for every known source, computed once per request."""
+        kinds = self.kinds()
+        return {key: self.location(key[0], key[1], k) for key, k in kinds.items()}
+
+    def find(self, workspace_id: Optional[str], filespace: Optional[str], q: str, limit: int = 20) -> list[dict]:
+        """Files whose name or path matches every word of `q` (docs: Find by name)."""
+        words = [w for w in (q or "").lower().split() if w]
+        if len((q or "").strip()) < 2 or not words:
+            return []
+        limit = max(1, min(int(limit), FIND_MAX))
+        scopes = sorted(self.scopes(workspace_id, filespace))
+        locs = self.locations()
+        first = words[0]
+        hits: list[tuple[tuple, dict]] = []
+        for r in self.store.find_files(scopes, words, FIND_CANDIDATES):
+            name = r["path"].rsplit("/", 1)[-1]
+            low = name.lower()
+            rank = 0 if low.startswith(first) else 1 if all(w in low for w in words) else 2
+            ts = mtime_seconds(r["mtime"]) or 0.0
+            hits.append(((rank, -ts, r["path"]), {
+                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+                "kind": locs.get((r["workspace_id"], r["filespace"]), {}).get("kind", KIND_LUCIDLINK),
+                "location": locs.get((r["workspace_id"], r["filespace"]),
+                                     {"kind": KIND_LUCIDLINK, "root": None, "provider": None}),
+                "path": r["path"], "name": name, "size": r["size"], "mtime": mtime_iso(r["mtime"]),
+                "status": r["status"], "reason": r["reason"],
+            }))
+        hits.sort(key=lambda h: h[0])
+        return [h[1] for h in hits[:limit]]
+
     def kinds(self) -> dict[tuple[str, str], str]:
         """(workspace, filespace) -> "lucidlink" | "block", from the ledger."""
         return self.store.kinds()
@@ -194,6 +259,8 @@ class IndexerService:
             # A refused block source with this name shows here too (the
             # filespace itself keeps working).
             "lastError": row.get("last_error") or self.scheduler.block_conflict(ws, fs),
+            "problem": problem_of(row.get("last_error") or self.scheduler.block_conflict(ws, fs)),
+            "location": self.location(ws, fs, row.get("kind")),
             "progress": dict(rt.progress),
             "surveyError": rt.survey_error,
         }
@@ -529,6 +596,7 @@ class IndexerService:
         hits = self.vectors.search(q, max(1, min(k, 200)), scopes, path_prefix)
         rows = self.store.chunk_rows([pid for pid, _ in hits])
         kinds = self.kinds()
+        locs = self.locations()
         out = []
         for pid, score in hits:
             r = rows.get(pid)
@@ -538,6 +606,7 @@ class IndexerService:
             out.append({
                 "workspaceId": r["workspace_id"], "filespace": r["filespace"],
                 "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
+                "location": locs.get((r["workspace_id"], r["filespace"])),
                 "chunkIndex": r["chunk_index"], "score": round(score, 4),
                 "snippet": text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else ""),
                 "mtime": mtime_iso(r["mtime"]),
@@ -555,6 +624,7 @@ class IndexerService:
         limit = max(1, min(int(limit), RECENT_MAX))
         scopes = sorted(self.scopes(workspace_id, filespace))
         kinds = self.kinds()
+        locs = self.locations()
         seen: set[tuple[str, str, str]] = set()
         items: list[tuple[float, dict]] = []
         # A day of slack for clock skew; anything later is a wrong timestamp, not a recent change.
@@ -569,6 +639,7 @@ class IndexerService:
             items.append((when, {
                 "workspaceId": r["workspace_id"], "filespace": r["filespace"],
                 "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
+                "location": locs.get((r["workspace_id"], r["filespace"])),
                 "size": r["size"], "mtime": mtime_iso(r["mtime"]), "status": r["status"],
                 "indexedAt": r.get("indexed_at"), "change": kind, "changedAt": r.get("changed_at"),
                 "previousPath": r.get("prev_path"),

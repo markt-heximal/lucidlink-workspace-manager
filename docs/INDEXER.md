@@ -545,6 +545,43 @@ Poll it every 1-2 s while the console is open; `seq` only grows. Lines are the
 log text (they include file paths, as the logs do); anything that looks like a
 bearer token or key is masked.
 
+### Plain answers for the app (simplification, phase 1)
+
+**Find by name.** `GET /index/find?q=&workspaceId=&filespace=&limit=20` matches
+file and folder **names** in the ledger (no AI, instant), across the same
+scopes as search (`workspaceId: "*"` = every location). Case-insensitive; a
+name that starts with the query ranks above one that contains it, then newer
+first. Every word of a multi-word query must appear in the path. Files the
+indexer could not read (video, online-only, too large) are still found, since
+they are in the ledger. Result: `{"results": [{"workspaceId", "filespace",
+"kind", "location": Location, "path", "name", "size", "mtime", "status",
+"reason"}]}` (`limit` max 100; `q` at least 2 characters, else empty).
+
+**Where each item lives.** Every search hit, find result, recent file, ask
+citation and `FilespaceStatus` now carries `"location"`:
+`{"kind": "lucidlink"|"block", "root": "volumes"|"icloud"|"desktop"|"documents"|"cloud"|null,
+"provider": {"id","label","account"}|null}`, so the app can badge iCloud,
+Desktop, Google Drive and NAS correctly everywhere (`root` is null for `.env`
+slots and LucidLink).
+
+**Why something is wrong.** `FilespaceStatus` gains `"problem"`: null, or
+`{"kind": "sign_in"|"offline"|"unreachable"|"too_big"|"engine"|"other", "detail"}`,
+classified from `lastError` (`detail` is the raw text, for Engine only):
+
+| kind | from | the app says |
+|---|---|---|
+| `sign_in` | authentication failed, lease expired, token, 401/403 | "Sign in to LucidLink again" |
+| `unreachable` | host not found, connection refused/timed out, network | "Can't reach LucidLink right now" |
+| `offline` | block source path not mounted | "<name> is offline" |
+| `too_big` | 413 / payload too large | "Some files are too large to read" |
+| `engine` | embedder/LLM/vector errors | "Search is temporarily unavailable" |
+| `other` | anything else | "Something went wrong reading <name>" |
+
+**Suggested names.** Browse entries carry `"suggestedName"`: the folder name,
+except at the top of a cloud service, where it is "<service> (<account name>)",
+e.g. "Google Drive (mark.personal)", and iCloud Drive's root, "iCloud". The
+app pre-fills it instead of sanitising the folder name itself.
+
 ## Indexing controls
 
 The owner manages indexing from Engine › Indexer: what failed and why, what is

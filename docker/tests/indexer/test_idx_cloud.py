@@ -73,7 +73,7 @@ def test_cloud_folder_skips_online_only_until_allowed(make_service, cloud, place
                                                                    ("GoogleDrive-mark@heximal.com", "google-drive")]
         src = c.post("/index/folders", json={"root": "cloud", "path": "/GoogleDrive-mark@heximal.com"},
                      headers=H).json()
-        assert src["name"] == "Google-Drive-mark" and src["downloadOnlineOnly"] is False
+        assert src["name"] == "Google Drive (mark)" and src["downloadOnlineOnly"] is False
         assert src["provider"] == {"id": "google-drive", "label": "Google Drive", "account": "mark@heximal.com"}
         name = src["name"]
 
