@@ -118,7 +118,7 @@ active workspace.
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}]}` |
 | GET | `/index/recent` | `?workspaceId&filespace&limit=20` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace) | `{"files": [RecentFile]}`, newest first |
-| POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
+| POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
 | POST | `/index/assist` | `{"action": "summarize"\|"rewrite"\|"shorten"\|"lengthen"\|"continue"\|"generate"\|"custom", "text"?, "instruction"?}` | `{"html", "action"}`: the document editor's AI menu, on this engine's LLM; 400 when there is nothing to work on, 503 when no LLM |

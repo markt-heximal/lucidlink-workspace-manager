@@ -155,7 +155,8 @@ def test_ask_answers_with_citations(make_service):
     assert body["answer"] == "Rent is 1200 (see /money/budget.md)."
     assert body["sources"][0] == "/money/budget.md"
     assert body["citations"][0]["path"] == "/money/budget.md"
-    assert set(body["citations"][0]) == {"path", "chunkIndex", "score", "kind"}
+    assert set(body["citations"][0]) == {"path", "chunkIndex", "score", "kind", "workspaceId", "filespace"}
+    assert body["citations"][0]["workspaceId"] == "ws1" and body["citations"][0]["filespace"] == "fsA"
     assert body["citations"][0]["kind"] == "lucidlink"
     sent = calls[-1]          # calls[0] is the post-sync survey
     assert sent["stream"] is True
