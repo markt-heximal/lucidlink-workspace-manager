@@ -73,7 +73,8 @@ def test_block_source_is_a_target_of_kind_block(block, share):
     kinds = {f["filespace"]: f["kind"] for f in st["filespaces"]}
     assert kinds == {"fsA": "lucidlink", "fsB": "lucidlink", "NAS": "block"}
     assert st["blockSources"] == [{"name": "NAS", "workspaceId": "ws1", "path": str(share), "kind": "block",
-                                   "accepted": True, "error": None}]
+                                   "accepted": True, "error": None, "origin": "mini",
+                                   "hostPath": None, "root": None, "folder": None}]
 
 
 def test_block_workspace_from_config_or_local(block, make_service, share):

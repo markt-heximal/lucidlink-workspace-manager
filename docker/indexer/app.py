@@ -13,6 +13,9 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
+import signal
+import threading
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
@@ -22,6 +25,7 @@ from pydantic import BaseModel, Field
 
 from .assist import Action, assist
 from .config import Config
+from .folders import FolderError
 from .embedder import EmbedError
 from .llm import LLMError, LLMUnavailable
 from .service import IndexerService, NotFound
@@ -93,6 +97,16 @@ class AssistBody(BaseModel):
     action: Action
     text: str = Field(default="", max_length=200_000)
     instruction: str = Field(default="", max_length=4_000)
+
+
+class FolderBody(BaseModel):
+    root: str
+    path: str = "/"
+    name: Optional[str] = Field(default=None, max_length=200)
+
+
+class FolderRemoveBody(BaseModel):
+    name: str = Field(min_length=1)
 
 
 class RetryBody(BaseModel):
@@ -200,6 +214,34 @@ def assist_route(body: AssistBody, svc: IndexerService = Depends(_service)):
     return assist(svc.llm, body.action, body.text, body.instruction)
 
 
+@router.get("/folders")
+def get_folders(svc: IndexerService = Depends(_service)):
+    """Places the engine can see and the connected block storage folders."""
+    return svc.folders()
+
+
+@router.get("/folders/browse")
+def browse_folders(root: str, path: str = Query(default="/"), svc: IndexerService = Depends(_service)):
+    return svc.browse_folders(root, path)
+
+
+@router.post("/folders", status_code=201)
+def add_folder(body: FolderBody, svc: IndexerService = Depends(_service)):
+    return svc.add_folder(body.root, body.path, body.name)
+
+
+@router.post("/folders/remove")
+def remove_folder(body: FolderRemoveBody, svc: IndexerService = Depends(_service)):
+    return svc.remove_folder(body.name)
+
+
+@router.post("/folders/restart", status_code=202)
+def restart(request: Request):
+    """Exit so Docker restarts the indexer (it then sees shares mounted since it started)."""
+    request.app.state.restart()
+    return {"restarting": True}
+
+
 @router.get("/survey")
 def get_survey(filespace: str, workspaceId: Optional[str] = None, scope: str = Query(default="/"),
                svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
@@ -212,8 +254,13 @@ def post_survey(body: SurveyBody, svc: IndexerService = Depends(_service),
     return svc.regenerate_survey(_ws(body.workspaceId, x_ws), body.filespace, body.scope)
 
 
+def _restart_soon() -> None:
+    """Shut down gracefully (SIGTERM) shortly after the response; Docker's restart policy starts us again."""
+    threading.Timer(0.5, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+
+
 def create_app(service_factory: Optional[Callable[[], IndexerService]] = None,
-               start_scheduler: bool = True) -> FastAPI:
+               start_scheduler: bool = True, restart: Callable[[], None] = _restart_soon) -> FastAPI:
     """Build the app. The service is created in the lifespan, so importing this
     module never touches /data."""
 
@@ -231,6 +278,7 @@ def create_app(service_factory: Optional[Callable[[], IndexerService]] = None,
             svc.stop()
 
     app = FastAPI(title="LucidLink Indexer", lifespan=lifespan)
+    app.state.restart = restart
 
     @app.get("/health")
     def health():
@@ -247,6 +295,10 @@ def create_app(service_factory: Optional[Callable[[], IndexerService]] = None,
     @app.exception_handler(EmbedError)
     async def _embed_error(_, e: EmbedError):
         return JSONResponse(status_code=503, content={"detail": f"Embedder unavailable: {e}"})
+
+    @app.exception_handler(FolderError)
+    async def _folder_error(_, e: FolderError):
+        return JSONResponse(status_code=e.status, content={"detail": e.detail})
 
     @app.exception_handler(NotFound)
     async def _not_found(_, e: NotFound):

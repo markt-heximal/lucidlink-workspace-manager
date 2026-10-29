@@ -8,6 +8,7 @@ run the whole thing against an in-memory filespace, a fake embedder and
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ from typing import Optional
 import httpx
 
 from . import ask as ask_mod
+from . import folders as folders_mod
 from . import survey as survey_mod
 from .block import KIND_LUCIDLINK, TYPES, RoutingSourceProvider, type_of
 from .config import Config
@@ -183,6 +185,79 @@ class IndexerService:
             "blockSources": list(self.scheduler.block_sources),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
         }
+
+    # ------------------------------------------------------------ folders from the app
+    def folders(self) -> dict:
+        self.scheduler.refresh_targets(force=True)
+        return {"roots": folders_mod.roots(self.config), "sources": list(self.scheduler.block_sources)}
+
+    def _connected(self):
+        """(root, folder, container path, host path) -> name of the source that is that folder."""
+        specs = self.scheduler._block_specs
+        by_app = {(b.root, b.folder): b.name for b in specs if b.origin == "app"}
+        by_host = {b.host_path.rstrip("/"): b.name for b in specs if b.host_path}
+        by_real = {}
+        for b in specs:
+            try:
+                by_real[os.path.realpath(b.path)] = b.name
+            except OSError:
+                pass
+
+        def find(root: str, folder: str, full: str, host: Optional[str]) -> Optional[str]:
+            return (by_app.get((root, folder)) or (by_host.get(host.rstrip("/")) if host else None)
+                    or by_real.get(os.path.realpath(full)))
+        return find
+
+    def browse_folders(self, root: str, path: str) -> dict:
+        return folders_mod.browse(self.config, root, path, self._connected())
+
+    def add_folder(self, root: str, path: str, name: Optional[str]) -> dict:
+        folder, full = folders_mod.resolve(self.config, root, path)
+        name = folders_mod.check_name(name if name and name.strip() else folders_mod.default_name(root, folder))
+        specs = self.scheduler._block_specs
+        if any(b.name == name for b in specs):
+            raise folders_mod.FolderError(409, f"There's already a folder called {name}. Pick another name.")
+        ws = self.scheduler._block_workspace()
+        kinds = self.store.kinds()
+        if any(k == (ws, name) and kinds.get(k, KIND_LUCIDLINK) == KIND_LUCIDLINK for k in self.scheduler.targets()):
+            raise folders_mod.FolderError(409, f"{name} is the name of a LucidLink filespace. Pick another name.")
+        host = folders_mod.host_path(self.config, root, folder)
+        real = os.path.realpath(full)
+        for b in specs:
+            rel = folders_mod.overlap(host, b.host_path) if host and b.host_path else None
+            if rel is None:
+                try:
+                    rel = folders_mod.overlap(real, os.path.realpath(b.path))
+                except OSError:
+                    rel = None
+            if rel == "same":
+                raise folders_mod.FolderError(409, f"That folder is already connected as {b.name}.")
+            if rel == "inside":
+                raise folders_mod.FolderError(409, f"That folder is inside {b.name}, which is already connected.")
+            if rel == "around":
+                raise folders_mod.FolderError(
+                    409, f"{b.name} is inside that folder. Remove {b.name} first, or pick a folder inside it.")
+        self.store.add_block_folder(name, root, folder, now_iso())
+        self.scheduler.refresh_targets(force=True)
+        self.scheduler.request_sync([(ws, name)])
+        for entry in self.scheduler.block_sources:
+            if entry["name"] == name:
+                return entry
+        raise folders_mod.FolderError(500, "The folder was saved but isn't listed; check the indexer log.")
+
+    def remove_folder(self, name: str) -> dict:
+        spec = next((b for b in self.scheduler._block_specs if b.name == name), None)
+        if spec is None:
+            raise NotFound(f"no connected folder called {name!r}")
+        if spec.origin == "app":
+            self.store.remove_block_folder(name)
+        else:
+            self.store.add_block_removed(name, now_iso())
+        ws = self.scheduler._block_workspace()
+        self.scheduler.refresh_targets(force=True)
+        files, chunks = self.store.purge_source(ws, name)
+        logger.info("removed block source %s (%s): %d files, %d chunks forgotten", name, spec.origin, files, chunks)
+        return {"removed": name, "files": files, "chunks": chunks}
 
     # ------------------------------------------------------------ control
     def sync(self, workspace_id: Optional[str], filespace: Optional[str]) -> list[dict]:

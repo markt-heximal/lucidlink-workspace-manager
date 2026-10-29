@@ -6,7 +6,7 @@ patching os.environ; `Config.from_env()` is what the container uses.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _int(name: str, default: int, floor: int = 0) -> int:
@@ -69,6 +69,12 @@ class Config:
     # and the workspace they belong to ("" = the vault's active workspace).
     block_sources: str = ""
     block_source_workspace: str = ""
+    # Folders from the app (folders.py): roots mounted read-only under this
+    # directory, their folders on the Mini, and the Mini folders behind the
+    # BLOCK_SOURCES slots (/block/sourceN), all as plain strings.
+    block_root_base: str = "/host"
+    block_root_hosts: dict = field(default_factory=dict)
+    block_slot_hosts: dict = field(default_factory=dict)
 
     @property
     def llm_configured(self) -> bool:
@@ -102,4 +108,10 @@ class Config:
             job_budget_sec=_float("INDEX_JOB_BUDGET_SEC", 120.0),
             block_sources=os.environ.get("BLOCK_SOURCES", "").strip(),
             block_source_workspace=os.environ.get("BLOCK_SOURCE_WORKSPACE", "").strip(),
+            block_root_base=os.environ.get("BLOCK_ROOT_BASE", "/host").rstrip("/") or "/host",
+            block_root_hosts={rid: os.environ.get(var, "").strip()
+                              for rid, var in (("volumes", "BLOCK_ROOT_VOLUMES"), ("icloud", "BLOCK_ROOT_ICLOUD"),
+                                               ("desktop", "BLOCK_ROOT_DESKTOP"))},
+            block_slot_hosts={f"/block/source{n}": os.environ.get(
+                "BLOCK_SOURCE_PATH" if n == 1 else f"BLOCK_SOURCE_PATH_{n}", "").strip() for n in range(1, 7)},
         )

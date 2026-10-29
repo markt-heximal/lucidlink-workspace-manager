@@ -5,6 +5,18 @@ cd "$(dirname "$0")"
 echo "=== LucidLink Workspace Manager ==="
 echo ""
 
+# Folders from the app: share iCloud Drive and Desktop with the indexer (read-only)
+# the first time, so they can be browsed and connected from Engine > Indexing.
+if [ "$(uname)" = Darwin ] && [ -f .env ]; then
+  for pair in "BLOCK_ROOT_ICLOUD=$HOME/Library/Mobile Documents/com~apple~CloudDocs" "BLOCK_ROOT_DESKTOP=$HOME/Desktop"; do
+    key="${pair%%=*}"; dir="${pair#*=}"
+    if ! grep -q "^$key=" .env && [ -d "$dir" ]; then
+      printf '%s=%s\n' "$key" "$dir" >> .env
+      echo "Shared $dir with the indexer (read-only) as $key."
+    fi
+  done
+fi
+
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 export GIT_SHA
 

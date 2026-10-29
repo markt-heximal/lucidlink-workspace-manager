@@ -110,6 +110,18 @@ CREATE TABLE IF NOT EXISTS control (
     paused_at TEXT,
     priority  TEXT NOT NULL DEFAULT '[]'
 );
+-- Block storage folders connected from the web app (folders.py), and names of
+-- .env (BLOCK_SOURCES) sources the owner removed from the app.
+CREATE TABLE IF NOT EXISTS block_folders (
+    name       TEXT PRIMARY KEY,
+    root       TEXT NOT NULL,
+    folder     TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS block_removed (
+    name       TEXT PRIMARY KEY,
+    removed_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS mirror_points (
     collection TEXT NOT NULL,
     point_id   INTEGER NOT NULL,
@@ -217,6 +229,35 @@ class Store:
     def execute(self, sql: str, args: Iterable = ()) -> int:
         with self._lock:
             return self._conn.execute(sql, tuple(args)).rowcount
+
+    # ------------------------------------------------------------ block folders
+    def block_folders(self) -> list[dict]:
+        return self.query("SELECT name, root, folder, created_at FROM block_folders ORDER BY created_at, name")
+
+    def add_block_folder(self, name: str, root: str, folder: str, now: str) -> None:
+        with self.tx() as c:
+            c.execute("INSERT INTO block_folders (name, root, folder, created_at) VALUES (?, ?, ?, ?)",
+                      (name, root, folder, now))
+            c.execute("DELETE FROM block_removed WHERE name=?", (name,))
+
+    def remove_block_folder(self, name: str) -> bool:
+        return self.execute("DELETE FROM block_folders WHERE name=?", (name,)) > 0
+
+    def block_removed(self) -> set[str]:
+        return {r["name"] for r in self.query("SELECT name FROM block_removed")}
+
+    def add_block_removed(self, name: str, now: str) -> None:
+        self.execute("INSERT OR REPLACE INTO block_removed (name, removed_at) VALUES (?, ?)", (name, now))
+
+    def purge_source(self, ws: str, fs: str) -> tuple[int, int]:
+        """Forget everything indexed for one source: (files, chunks) deleted."""
+        with self.tx() as c:
+            files = c.execute("DELETE FROM files WHERE workspace_id=? AND filespace=?", (ws, fs)).rowcount
+            chunks = c.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=?", (ws, fs)).rowcount
+            c.execute("DELETE FROM surveys WHERE workspace_id=? AND filespace=?", (ws, fs))
+            c.execute("DELETE FROM filespaces WHERE workspace_id=? AND filespace=?", (ws, fs))
+        self.bump()
+        return files, chunks
 
     # ------------------------------------------------------------ filespaces
     def ensure_filespace(self, ws: str, fs: str) -> None:
