@@ -267,9 +267,25 @@ def test_search_on_large_index_never_scans_mirror_bookkeeping(make_service, ruv,
     # Status shows the count kept by the last sync instead of re-scanning per poll.
     assert svc.status()["vectorStore"]["points"] == svc.store.chunk_count()
     assert calls == []
-    # Sync still does its full check (and refreshes the cached count).
+    # Sync with nothing changed since its last clean pass skips the scans too…
+    svc.vectors.sync_mirror()
+    assert calls == []
+    # …and does its full check (refreshing the cached count) once anything changed.
+    svc.store.bump()
     svc.vectors.sync_mirror()
     assert "mirror_counts" in calls and "mirror_missing" in calls
+
+
+def test_sync_after_rename_still_pushes_metadata(make_service, ruv):
+    """A rename only forgets mirror rows; it must defeat the clean-sync shortcut."""
+    svc = make_service(ruvector=ruv.transport)
+    s = _index(svc, {"/a.md": para("alpha")})
+    svc.vectors.sync_mirror()                    # clean, nothing changed
+    s.move("/a.md", "/moved.md")
+    run(svc)
+    name = svc.vectors.mirror.collection
+    assert {m["path"] for _, m in ruv.collections[name]["points"].values()} == {"/moved.md"}
+    assert svc.store.mirror_counts(name) == (svc.store.chunk_count(), 0)
 
 
 def test_search_does_not_wait_for_a_running_sync(make_service, ruv):

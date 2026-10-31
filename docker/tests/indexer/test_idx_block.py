@@ -382,3 +382,64 @@ def test_profile_from_ledger_only(block, share, monkeypatch):
     monkeypatch.setattr(LocalSource, "stat", boom)
     assert svc.profile("ws1", "NAS")["totals"]["files"] == 1
     assert svc.profile(None, "fsA")["kind"] == "lucidlink"
+
+
+class _Pool:
+    def __init__(self):
+        self.submitted = []
+
+    def submit(self, fn, key):
+        self.submitted.append(key)
+
+
+def test_busy_workspace_session_never_holds_back_a_block_source(block, share):
+    """fsA and fsB share ws1's SDK session; NAS (block, also ws1) leases none."""
+    write(share, "/a.md", para("alpha"))
+    svc = block()
+    sch, pool = svc.scheduler, _Pool()
+    sch.cfg.concurrency = 3
+    sch.refresh_targets(force=True)
+    sch.runtime("ws1", "fsA", create=True).running = True    # a long fsA job
+    sch._pool = pool
+    try:
+        sch._dispatch()
+    finally:
+        sch._pool = None
+    assert ("ws1", "NAS") in pool.submitted                 # block folder runs alongside
+    assert ("ws1", "fsB") not in pool.submitted             # would only wait for fsA's session
+
+
+def test_stale_not_mounted_clears_once_the_folder_is_there(make_service, tmp_path):
+    root = tmp_path / "share"
+    svc = make_service(block_sources=f"NAS={root}")
+    run(svc, "NAS")
+    assert svc.filespace_status("ws1", "NAS")["lastError"] == NOT_MOUNTED
+    write(root, "/a.md", para("alpha"))
+    seen = []
+    rt = svc.scheduler.runtime("ws1", "NAS", create=True)
+    orig = svc.store.update_filespace
+
+    def watch(ws, fs, **cols):                 # the error is gone as soon as the scan starts
+        if fs == "NAS" and "last_error" in cols:
+            seen.append((rt.phase, cols["last_error"]))
+        return orig(ws, fs, **cols)
+
+    svc.store.update_filespace = watch
+    run(svc, "NAS")
+    assert seen[0] == ("scanning", None)
+    st = svc.filespace_status("ws1", "NAS")
+    assert st["lastError"] is None and st["state"] == "idle" and set(ledger(svc)) == {"/a.md"}
+
+
+def test_scan_reports_progress_while_listing(block, share):
+    for i in range(3):
+        write(share, f"/d{i}/f.md", para(f"doc{i}"))
+    svc = block()
+    seen = []
+    rt = svc.scheduler.runtime("ws1", "NAS", create=True)
+    rt.progress = type("P", (dict,), {"update": lambda self, **kw: (seen.append(dict(kw)), dict.update(self, **kw))})(
+        rt.progress)
+    run(svc, "NAS")
+    listed = [p for p in seen if p.get("total") == 0 and p.get("current")]
+    assert listed and listed[-1]["done"] == 6                # 3 folders + 3 files listed
+    assert [p["done"] for p in listed] == sorted(p["done"] for p in listed)

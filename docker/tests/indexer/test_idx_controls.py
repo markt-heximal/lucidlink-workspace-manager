@@ -1,6 +1,7 @@
 """Indexing controls: files by status, retry, pause and priority."""
 from __future__ import annotations
 
+import time
 from contextlib import contextmanager
 
 from fastapi.testclient import TestClient
@@ -280,7 +281,21 @@ def test_pause_blocks_dispatch_not_queries(make_service):
     rt.running, rt.phase = False, None
 
     svc.set_control(paused=False)
-    assert sorted(dispatch(svc)) == [("ws1", "fsA"), ("ws1", "fsB")]
+    # Same workspace (one SDK session): they take turns rather than one
+    # holding a slot while it waits for the other's session.
+    sch, pool = svc.scheduler, FakePool()
+    sch._pool = pool
+    sch._dispatch()
+    assert len(pool.submitted) == 1
+    sch._dispatch()
+    assert len(pool.submitted) == 1                  # the other waits: its session is busy
+    sch._runtime[pool.submitted[0]].running = False  # first job returns
+    sch._runtime[pool.submitted[0]].last_run_end = time.monotonic()
+    sch._dispatch()
+    assert sorted(pool.submitted) == [("ws1", "fsA"), ("ws1", "fsB")]
+    for key in pool.submitted:
+        sch._runtime[key].running = False
+    sch._pool = None
     assert svc.status()["paused"] is False
     assert svc.filespace_status("ws1", "fsA")["state"] == "idle"
 

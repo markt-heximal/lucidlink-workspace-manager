@@ -304,6 +304,8 @@ class RuvectorMirror:
         self.rehydrations = 0
         # (collection, monotonic time, store generation, live, dead)
         self._counts_cache: Optional[tuple[str, float, int, int, int]] = None
+        # Store generation (and when) of the last sync that left nothing unmirrored.
+        self._clean: Optional[tuple[int, float]] = None
 
     @property
     def collection(self) -> Optional[str]:
@@ -373,6 +375,7 @@ class RuvectorMirror:
         self.rehydrations += 1
         self.store.mirror_clear(name)
         self._counts_cache = None
+        self._clean = None
         self._create(name)
         self._ready = name
         self._push_missing(name)
@@ -448,11 +451,20 @@ class RuvectorMirror:
         """Bring the collection up to date with SQLite; rebuild if too many dead."""
         def op(name):
             self._verify(name)  # each sync cycle, so a silent restart is caught
+            # Nothing search-visible changed since a sync that left nothing to
+            # push: skip the two full-table scans (~20 s on a large index, run
+            # after every job). Re-checked at least every COUNTS_TTL_SEC.
+            gen = self.store.generation
+            c = self._clean
+            if c is not None and c[0] == gen and time.monotonic() - c[1] < COUNTS_TTL_SEC:
+                return 0
             live, dead = self._counts(name, refresh=True)
             if dead and dead > DEAD_RATIO_REBUILD * max(live, 1):
                 self._rebuild(name)
                 return 0
-            return self._push_missing(name)
+            pushed = self._push_missing(name)
+            self._clean = (gen, time.monotonic())
+            return pushed
         return self._run(op) or 0
 
     def _counts(self, name: str, refresh: bool = False, compute: bool = True,

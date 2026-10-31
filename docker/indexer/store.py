@@ -1254,6 +1254,7 @@ class Store:
         """Make a file's live points look unmirrored so metadata is re-upserted."""
         self.execute("DELETE FROM mirror_points WHERE point_id IN (SELECT point_id FROM chunks "
                      "WHERE workspace_id=? AND filespace=? AND file_id=?)", (ws, fs, file_id))
+        self.bump()   # the mirror now has work to do; a clean-sync shortcut must not skip it
 
     def mirror_counts(self, collection: str) -> tuple[int, int]:
         """(live mirrored points, dead mirrored points)."""

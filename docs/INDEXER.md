@@ -320,6 +320,14 @@ When `RUVECTOR_URL` is set, Ruvector is a mirror used to accelerate search:
   the collection is rebuilt.
 - Any Ruvector error falls back to local search for that request and is shown
   in `/index/status`.
+- Bookkeeping (what is not yet mirrored; live and dead counts) is a scan of
+  every chunk, ~10 s each at 1.6 M chunks, so it never runs on a search. New
+  points are pushed by the sync at the end of each indexing job; search
+  over-fetches by the last known dead count. A sync is skipped when nothing
+  search-visible changed since its last clean pass (store generation; a
+  rename or re-key also counts), re-checked at least every 10 minutes. The
+  scans run on a private read connection, not under the shared store lock.
+  `vectorStore.points` in `/index/status` is the count from the last sync.
 
 ## Survey (Discover topics)
 
@@ -1251,3 +1259,13 @@ under `/index/*` (internal key at the indexer, owner session at the proxy).
   `"priority": int|null` (its 0-based position in that list) and
   `"state": "paused"` while paused and no job is running for it (this takes
   precedence over `idle` and `error`; `disabled` still wins).
+
+Scheduling: at most `INDEX_CONCURRENCY` jobs run at once. A LucidLink job
+holds its workspace's SDK session for its whole run, so two filespaces of one
+workspace never run together: the second is not dispatched until the first
+returns (before, it took a slot and showed `scanning` with no progress while
+it waited). Block sources lease no session and always run alongside. A full
+scan logs `scan started` and reports `progress` (`done` = entries listed so
+far, `total` 0, `current` = the folder) while it lists, so a slow cloud folder
+shows movement. A stale `block source path not mounted` error is cleared as
+soon as a job finds the folder mounted.

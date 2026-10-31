@@ -43,7 +43,7 @@ from . import folders
 
 # The workspace id of drives the engine computer reaches itself (NAS, USB, local folders).
 LOCAL_WORKSPACE = "local"
-from .block import KIND_BLOCK, KIND_LUCIDLINK, BlockSpec, NotMounted, parse_block_sources
+from .block import KIND_BLOCK, KIND_LUCIDLINK, NOT_MOUNTED, BlockSpec, NotMounted, parse_block_sources
 from .embedder import EmbedError
 from .scanner import FilespaceIndexer
 from .source import SourceError, configured_filespaces
@@ -343,11 +343,25 @@ class Scheduler:
                 rt = self._runtime.setdefault(key, Runtime())
                 if rt.running or not self.enabled(*key):
                     continue
+                if self._session_busy(key):
+                    continue
                 if rt.full_requested or rt.hints or rt.more_pending or now >= rt.next_scan_at:
                     rt.running = True
                     running += 1
                     assert self._pool is not None
                     self._pool.submit(self._job_safe, key)
+
+    def _session_busy(self, key: Key) -> bool:
+        """True when another LucidLink filespace of the same workspace is running.
+        A job holds its workspace's SDK session for its whole run, so a second
+        one would only wait for it — showing "scanning" with no progress while
+        holding a slot another source (a block folder, another workspace) could
+        use. Block sources lease no session and never wait. Caller holds _cv."""
+        blocks = self._block_roots   # refreshed by this dispatch's refresh_targets
+        if key in blocks:
+            return False
+        return any(rt.running and k[0] == key[0] and k != key and k not in blocks
+                   for k, rt in self._runtime.items())
 
     def _job_safe(self, key: Key) -> None:
         try:
@@ -375,6 +389,12 @@ class Scheduler:
             with self.svc.router.lease(ws, fs) as source:
                 idx = FilespaceIndexer(store, source, ws, fs, self.svc.embedder, self.cfg)
                 rt.phase = "scanning"
+                # Leased, so a block folder is mounted now: drop a stale "not
+                # mounted" left by a run that was cut short (e.g. a restart
+                # during a long scan of a cloud folder).
+                row = store.filespace_row(ws, fs)
+                if row is not None and row["last_error"] == NOT_MOUNTED:
+                    store.update_filespace(ws, fs, last_error=None)
                 # Hints are advisory: a failed or incomplete one is logged and
                 # left to the next periodic scan, never escalated to a full scan
                 # (a hint names a path, possibly a bogus one).
@@ -386,7 +406,8 @@ class Scheduler:
                         logger.warning("[%s/%s] hint %s failed: %s", ws, fs, h, e)
                 if full:
                     scan_started = time.monotonic()
-                    res = idx.scan("/")
+                    logger.info("[%s/%s] scan started", ws, fs)
+                    res = idx.scan("/", progress=lambda n, d: rt.progress.update(done=n, total=0, current=d))
                     scan_took = time.monotonic() - scan_started
                     logger.info("[%s/%s] scan %d: seen=%d new=%d changed=%d renamed=%d deleted=%d "
                                 "get_entry=%d rekeyed=%d%s", ws, fs, res.scan_id, res.seen, res.new, res.changed,

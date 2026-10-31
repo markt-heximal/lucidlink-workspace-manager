@@ -270,9 +270,11 @@ class FilespaceIndexer:
         self.store.update_file(self.ws, self.fs, file_id, **cols)
 
     # ------------------------------------------------------------ scan
-    def scan(self, root: str = "/", prune: bool = True) -> ScanResult:
+    def scan(self, root: str = "/", prune: bool = True,
+             progress: Optional[Callable[[int, str], None]] = None) -> ScanResult:
         """Breadth-first metadata walk of `root`; tombstone unseen files under it
-        only if every directory listed."""
+        only if every directory listed. progress(entries listed so far, folder)
+        after each folder, so a slow listing (a cloud folder) shows movement."""
         root = normpath(root)
         scan_id = self.store.next_scan_id(self.ws, self.fs)
         res = ScanResult(scan_id=scan_id, root=root)
@@ -284,6 +286,7 @@ class FilespaceIndexer:
         if root != "/" and (hidden_path(root + "/x") or package_root(root + "/x")):
             return res   # hidden, or a package (handled as a file, never walked)
         queue = deque([root])
+        listed = 0
         while queue:
             d = queue.popleft()
             try:
@@ -293,6 +296,9 @@ class FilespaceIndexer:
                 res.failed_dirs.append(d)
                 res.complete = False
                 continue
+            listed += len(entries)
+            if progress:
+                progress(listed, d)
             for e in entries:
                 path = join(d, e.name)
                 if e.type == "dir":
