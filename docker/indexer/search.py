@@ -213,13 +213,69 @@ class Retrieval:
     meaning_ok: bool = True
 
 
+# ---------------------------------------------------------------- file limits
+MAX_FILE_REFS = 500
+
+
+@dataclass
+class FileSet:
+    """A request limited to some files (`files: [FileRef]`): FileRefs resolved
+    once against the ledger. Refs not in the ledger (or deleted) are ignored."""
+    rows: list[dict]                       # live ledger rows, newest first per path
+    _pids: Optional[set[int]] = None
+
+    @property
+    def keys(self) -> set[tuple[str, str, str]]:
+        return {(r["workspace_id"], r["filespace"], r["file_id"]) for r in self.rows}
+
+    @property
+    def scopes(self) -> "set[Scope]":
+        return {(r["workspace_id"], r["filespace"]) for r in self.rows}
+
+    def point_ids(self, store) -> set[int]:
+        if self._pids is None:
+            self._pids = store.point_ids_of(self.keys)
+        return self._pids
+
+    def within(self, scopes: "set[Scope]") -> "FileSet":
+        return FileSet([r for r in self.rows if (r["workspace_id"], r["filespace"]) in scopes])
+
+
+def ref_key(ref: dict) -> tuple[str, str, str]:
+    return (ref["workspaceId"], ref["filespace"], ref["path"])
+
+
+def resolve_files(svc: "IndexerService", refs: list[dict]) -> FileSet:
+    return FileSet(svc.store.files_at_paths([ref_key(r) for r in refs]))
+
+
+def file_scopes(svc: "IndexerService", workspace_id: Optional[str], filespace: Optional[str],
+                files: FileSet) -> "set[Scope]":
+    """Scopes of a file-limited request: the refs' own locations, narrowed by an
+    explicit workspaceId ("*" = any) and/or filespace when the body gives them."""
+    out = files.scopes
+    if workspace_id and workspace_id != "*":
+        out = {s for s in out if s[0] == workspace_id}
+    if filespace:
+        out = {s for s in out if s[1] == filespace}
+    return out
+
+
 def retrieve(svc: "IndexerService", scopes: "set[Scope]", query: str, mode: str = "all",
-             filters: Optional[Filters] = None, pool: int = POOL, question: bool = False) -> Retrieval:
+             filters: Optional[Filters] = None, pool: int = POOL, question: bool = False,
+             only: Optional[FileSet] = None, qcache: Optional[dict] = None) -> Retrieval:
     """Run the channels, apply filters and fuse. Raises EmbedError only when
-    meaning is the only signal available. question=True: Ask (any content word)."""
+    meaning is the only signal available. question=True: Ask (any content word).
+    only: limit every channel (meaning, keyword, name) to these files.
+    qcache: reuse a query embedding across calls of one request."""
     filters = filters or Filters()
     plan = QueryPlan(query, any_term=question)
     store = svc.store
+    if only is not None:
+        only = only.within(scopes)
+        if not only.rows:
+            return Retrieval([], store.fts_ready and mode != "meaning", False, store.fts_ready)
+    keys = only.keys if only is not None else None
     kw_ready = store.fts_ready
     prefix = filters.path_prefix
     if mode == "keyword" and not kw_ready:
@@ -229,11 +285,19 @@ def retrieve(svc: "IndexerService", scopes: "set[Scope]", query: str, mode: str 
     names: list[int] = []
     meaning_ok = True
     if mode in ("all", "keyword") and kw_ready:
-        kw = store.keyword_search(scopes, plan.match, pool, prefix, ranked=_rankable(store, plan)) if plan.match else []
-        names = store.name_chunk_hits(scopes, plan.compact, NAME_POOL, prefix)
+        kw = (store.keyword_search(scopes, plan.match, pool, prefix, ranked=_rankable(store, plan), files=keys)
+              if plan.match else [])
+        names = store.name_chunk_hits(scopes, plan.compact, NAME_POOL, prefix, files=keys)
     if mode in ("all", "meaning"):
         try:
-            vec = svc.vectors.search(svc.embedder.embed_query(query), pool, scopes, prefix)
+            if qcache is not None and query in qcache:
+                qv = qcache[query]
+            else:
+                qv = svc.embedder.embed_query(query)
+                if qcache is not None:
+                    qcache[query] = qv
+            vec = svc.vectors.search(qv, pool, scopes, prefix,
+                                     point_ids=only.point_ids(store) if only is not None else None)
         except EmbedError:
             if mode == "meaning" or not (kw or names):
                 raise
@@ -246,6 +310,8 @@ def retrieve(svc: "IndexerService", scopes: "set[Scope]", query: str, mode: str 
 
     def hit(pid: int) -> Optional[Hit]:
         if pid not in rows:
+            return None
+        if keys is not None and (rows[pid]["workspace_id"], rows[pid]["filespace"], rows[pid]["file_id"]) not in keys:
             return None
         return hits.setdefault(pid, Hit(pid, rows[pid]))
 
@@ -341,15 +407,21 @@ def snippet(text: str, plan: Optional[QueryPlan]) -> tuple[str, bool, list[list[
 # ---------------------------------------------------------------- All search
 def search(svc: "IndexerService", workspace_id: Optional[str], filespace: Optional[str], query: str,
            k: int = 20, path_prefix: Optional[str] = None, mode: str = "all",
-           filters: Optional[dict] = None) -> dict:
+           filters: Optional[dict] = None, files: Optional[list[dict]] = None) -> dict:
+    """files: [FileRef] limits every result to those files (docs: Collections)."""
     mode = mode if mode in MODES else "all"
     f = Filters.parse(filters, path_prefix)
-    scopes = svc.scopes(workspace_id, filespace)
+    only = None
+    if files is not None:
+        only = resolve_files(svc, files)
+        scopes = file_scopes(svc, workspace_id, filespace, only)
+    else:
+        scopes = svc.scopes(workspace_id, filespace)
     empty = {"results": [], "files": [], "total": 0, "counts": {"meaning": 0, "keyword": 0, "both": 0, "name": 0},
              "refinements": []}
     if not scopes or not svc.store.has_chunks(scopes):
         return empty
-    ret = retrieve(svc, scopes, query, mode, f)
+    ret = retrieve(svc, scopes, query, mode, f, only=only)
     plan = QueryPlan(query)
     kinds = svc.kinds()
     locs = svc.locations()
@@ -378,17 +450,7 @@ def search(svc: "IndexerService", workspace_id: Optional[str], filespace: Option
               "name": sum(1 for x in files if x["why"]["name"])}
     refinements = _refinements(svc, files, plan, mode, f, scopes, query)
     fmax = max(1, min(int(k), FILES_MAX))
-    out_files = []
-    for x in files[:fmax]:
-        r = x["_row"]
-        key = (r["workspace_id"], r["filespace"])
-        name = r["path"].rsplit("/", 1)[-1]
-        out_files.append({
-            "workspaceId": r["workspace_id"], "filespace": r["filespace"],
-            "kind": kinds.get(key, KIND_LUCIDLINK), "location": locs.get(key),
-            "path": r["path"], "name": name, "size": r.get("size"), "mtime": _mtime_iso(r["mtime"]),
-            "type": type_of(name), "score": round(x["score"], 4), "why": x["why"], "snippets": x["snippets"],
-        })
+    out_files = [_file_out(x["_row"], x["score"], x["why"], x["snippets"], kinds, locs) for x in files[:fmax]]
     body = {"results": results, "files": out_files, "total": total, "counts": counts, "refinements": refinements}
     if ret.capped:
         body["totalApprox"] = True
@@ -396,6 +458,96 @@ def search(svc: "IndexerService", workspace_id: Optional[str], filespace: Option
         body["keywordReady"] = False
     if not ret.meaning_ok:
         body["meaningUnavailable"] = True
+    return body
+
+
+def _file_out(r: dict, score: float, why: dict, snippets: list, kinds: dict, locs: dict) -> dict:
+    """One SearchFile from a chunk or ledger row (workspace_id, filespace, path, size, mtime)."""
+    key = (r["workspace_id"], r["filespace"])
+    name = r["path"].rsplit("/", 1)[-1]
+    return {
+        "workspaceId": r["workspace_id"], "filespace": r["filespace"],
+        "kind": kinds.get(key, KIND_LUCIDLINK), "location": locs.get(key),
+        "path": r["path"], "name": name, "size": r.get("size"), "mtime": _mtime_iso(r["mtime"]),
+        "type": type_of(name), "score": round(score, 4), "why": why, "snippets": snippets,
+    }
+
+
+# ---------------------------------------------------------------- collections
+COLLECTION_K = 200
+COLLECTION_K_MAX = 500
+NO_MATCH = {"meaning": False, "keyword": False, "name": False, "mentions": 0}
+
+
+def collection_files(svc: "IndexerService", query: str, mode: str = "all", filters: Optional[dict] = None,
+                     scope: Optional[dict] = None, pinned: Optional[list[dict]] = None,
+                     excluded: Optional[list[dict]] = None, k: int = COLLECTION_K) -> dict:
+    """A collection's current members (docs: Collections): the saved search's
+    file results (up to k) ∪ pinned − excluded; pinned first, then by score.
+    Excluded wins over pinned. Pinned refs not live in the ledger are dropped."""
+    mode = mode if mode in MODES else "all"
+    k = max(1, min(int(k), COLLECTION_K_MAX))
+    f = Filters.parse(filters)
+    excl = {ref_key(r) for r in excluded or []}
+    pin_order = {key: i for i, key in enumerate(dict.fromkeys(ref_key(r) for r in pinned or []))
+                 if key not in excl}
+    pins = resolve_files(svc, [{"workspaceId": a, "filespace": b, "path": c} for a, b, c in pin_order])
+    # One row per pinned path (the newest live file there).
+    pin_rows: dict[tuple, dict] = {}
+    for r in pins.rows:
+        pin_rows.setdefault((r["workspace_id"], r["filespace"], r["path"]), r)
+    kinds = svc.kinds()
+    locs = svc.locations()
+
+    matched: list[dict] = []
+    capped = False
+    extra = {}
+    if (query or "").strip():
+        scopes = svc.scopes("*", None) if scope is None else svc.scopes(scope.get("workspaceId"),
+                                                                       scope.get("filespace") or None)
+        if scopes and svc.store.has_chunks(scopes):
+            plan = QueryPlan(query)
+            qcache: dict = {}
+            ret = retrieve(svc, scopes, query, mode, f, qcache=qcache)
+            capped = ret.capped
+            if not ret.keyword_ready:
+                extra["keywordReady"] = False
+            if not ret.meaning_ok:
+                extra["meaningUnavailable"] = True
+            matched = [x for x in _group_files(ret, plan, mode)
+                       if (x["_row"]["workspace_id"], x["_row"]["filespace"], x["_row"]["path"]) not in excl]
+            # Pinned files the pool did not reach: ask the same search, limited to them.
+            seen = {(x["_row"]["workspace_id"], x["_row"]["filespace"], x["_row"]["path"]) for x in matched}
+            missing = FileSet([r for key, r in pin_rows.items() if key not in seen])
+            if missing.rows:
+                more = retrieve(svc, scopes, query, mode, f, only=missing, qcache=qcache)
+                matched += _group_files(more, plan, mode)
+
+    by_path = {(x["_row"]["workspace_id"], x["_row"]["filespace"], x["_row"]["path"]): x for x in matched}
+    pinned_out = []
+    for key, r in pin_rows.items():
+        x = by_path.get(key)
+        if x is not None:
+            item = _file_out(x["_row"], x["score"], x["why"], x["snippets"], kinds, locs)
+        else:
+            item = _file_out(r, 0.0, dict(NO_MATCH), [], kinds, locs)
+        item["pinned"] = True
+        pinned_out.append((-item["score"], pin_order[key], item))
+    pinned_out.sort(key=lambda t: (t[0], t[1]))
+    rest = []
+    for x in matched:
+        key = (x["_row"]["workspace_id"], x["_row"]["filespace"], x["_row"]["path"])
+        if key in pin_rows:
+            continue
+        if len(rest) >= k:
+            break
+        item = _file_out(x["_row"], x["score"], x["why"], x["snippets"], kinds, locs)
+        item["pinned"] = False
+        rest.append(item)
+    total = len(set(by_path) | set(pin_rows))
+    body = {"files": [t[2] for t in pinned_out] + rest, "total": total, **extra}
+    if capped:
+        body["totalApprox"] = True
     return body
 
 

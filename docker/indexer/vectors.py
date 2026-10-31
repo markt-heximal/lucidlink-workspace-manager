@@ -98,7 +98,8 @@ class LocalIndex:
             return len(self._ids)
 
     def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
-               path_prefix: Optional[str] = None) -> list[tuple[int, float]]:
+               path_prefix: Optional[str] = None, point_ids: Optional[set[int]] = None) -> list[tuple[int, float]]:
+        """point_ids: only these points (a request limited to some files)."""
         with self._lock:
             self._load()
             if not len(self._ids) or self._matrix.shape[1] != len(q):
@@ -108,6 +109,8 @@ class LocalIndex:
                 mask &= np.array([s in scopes for s in self._scopes], dtype=bool)
             if path_prefix and path_prefix != "/":
                 mask &= np.array([_under(p, path_prefix) for p in self._paths], dtype=bool)
+            if point_ids is not None:
+                mask &= np.isin(self._ids, np.fromiter(point_ids, dtype=np.int64, count=len(point_ids)))
             idx = np.nonzero(mask)[0]
             if not len(idx):
                 return []
@@ -365,9 +368,14 @@ class VectorService:
         logger.warning("ruvector %s failed, using local for %.0fs: %s", what, MIRROR_COOLDOWN_SEC, e)
 
     def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
-               path_prefix: Optional[str] = None) -> list[tuple[int, float]]:
-        # A path filter is applied exactly by the local index; the mirror is
-        # only an accelerator for the plain case.
+               path_prefix: Optional[str] = None, point_ids: Optional[set[int]] = None) -> list[tuple[int, float]]:
+        # A path filter or a file limit (point_ids) is applied exactly by the
+        # local index; the mirror is only an accelerator for the plain case.
+        if point_ids is not None:
+            if not point_ids:
+                return []
+            self.last_backend = "local"
+            return self.local.search(q, k, scopes, path_prefix, point_ids)
         if self._mirror_usable() and not (path_prefix and path_prefix != "/"):
             try:
                 hits = self.mirror.search(q, k, scopes)

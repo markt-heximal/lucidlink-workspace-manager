@@ -97,8 +97,8 @@ app builds) is accepted and they are dropped unread, never a 400. Any stored
 copy is purged from the encrypted row on the next write, and proactively by
 `purge_retired()`, which the file service runs once at startup and before its
 first `/vault/settings` or `/vault/favorites` read (`ensure_migrated()`). The
-purge re-encrypts the row without them, keeps workspaces, tokens, favorites and
-`updatedAt` as stored, and logs only the number of profiles removed.
+purge re-encrypts the row without them, keeps workspaces, tokens, favorites,
+collections and `updatedAt` as stored, and logs only the number of profiles removed.
 
 HTTP (file service, owner only):
 
@@ -108,10 +108,14 @@ HTTP (file service, owner only):
 | GET | `/vault/settings` | masked payload + `"updatedAt"` (ISO) |
 | PUT | `/vault/settings` | payload → saved masked payload + `"updatedAt"` |
 | GET/PUT | `/vault/favorites` | see "Favorites, synced" (Simplification phase 2) |
+| GET/PUT | `/vault/collections` | see "Collections (step 1): saved searches with pins" |
 
 Favorites live in the same encrypted row under `"favorites"` (Python:
 `load_favorites()`, `save_favorites(body)`); a settings save carries them over
-and the settings payload never includes them.
+and the settings payload never includes them. Collections live there too, under
+`"collections"` (`load_collections()`, `save_collections(body)`), with the same
+rules: settings and favorites saves keep them, the retired-key purge keeps them,
+and `/vault/settings` never returns them.
 
 ## Indexer HTTP API
 
@@ -893,6 +897,85 @@ statistics come from a 2,000-chunk random sample cached for 10 minutes (the
 first request after that pays ~50 ms). One-time costs on upgrade: keyword
 backfill ~6–7.5 s per 100k chunks (75 s for 1M, in the background), folded-name
 migration ~1.5 s per 300k files (at startup).
+
+### Collections (step 1): saved searches with pins
+
+A collection is a saved search (query, mode, filters, scope) plus files the
+owner pinned into it or excluded from it. The definitions are stored in the
+vault; the engine computes the current members on demand.
+
+**1. Vault (file service, owner only).**
+
+| Method | Path | Body | Result |
+|---|---|---|---|
+| GET | `/vault/collections` | — | `{"collections": [Collection]}` (empty list for vaults saved before collections) |
+| PUT | `/vault/collections` | `{"collections": [Collection]}` | the stored list; replaces it; 400 when malformed (stored list unchanged); 503 when the vault is not configured |
+
+```
+Collection = {"id": non-empty string, unique,
+              "name": 1–80 characters (not only spaces),
+              "query": string ("" = the collection is pins only; default ""),
+              "mode": "all" | "meaning" | "keyword" (default "all"),
+              "filters": object, the /index/search filter keys only (kind, pathPrefix,
+                         modifiedAfter, modifiedBefore, include, exclude, inName);
+                         unknown keys and null values dropped; default {},
+              "scope": {"workspaceId", "filespace"?} | null (null = All locations; default null),
+              "pinned": [FileRef] (≤ 500), "excluded": [FileRef] (≤ 500)   (default []),
+              "createdAt": ISO, "updatedAt": ISO, "lastViewedAt": ISO | null (default null)}
+FileRef    = {"workspaceId", "filespace", "path" (starts with "/")}
+```
+
+At most 100 collections. Unknown fields are dropped (top level, inside
+`filters`, `scope` and each FileRef); a file repeated in `pinned` or `excluded`
+is stored once. Filter values are type-checked (`kind` one of the four kinds,
+dates ISO, `include`/`exclude` lists of ≤ 20 strings, `inName` boolean). The
+stored list is returned in the canonical shape above (every field present).
+
+**2. Search and Ask limited to files.** `POST /index/search` and
+`POST /index/ask` accept an optional `"files": [FileRef]` (≤ 500; more, or a
+path not starting with `/`, is 422). Results and Ask retrieval then come only
+from those files: the meaning, keyword and name lists are all limited. The refs
+are resolved once per request against the ledger (live rows at those paths →
+file ids; point ids only when the meaning list runs), then the keyword and name
+SQL is limited to those file ids and the vector scan is masked to those point
+ids (always the local index; the Ruvector mirror is skipped). A ref not in the
+ledger, or deleted, is ignored; `"files": []` matches nothing. With `files`,
+scopes come from the refs, so `workspaceId`/`filespace` may be omitted; when
+the body gives them they narrow the refs (`workspaceId` `"*"` = any). The
+proxy's `X-Workspace-Id` header is **ignored** with `files` (it is the app's
+active workspace and must not hide refs in other workspaces). Ask's response is
+unchanged; its citations and sources come only from those files.
+
+**3. Members: `POST /index/collection/files`.**
+
+Request: `{"query": "", "mode": "all", "filters": {…} | null, "scope":
+{"workspaceId","filespace"?} | null, "pinned": [FileRef], "excluded": [FileRef],
+"k": 200}` (all optional; `k` 1–500, pinned/excluded ≤ 500 each, else 422).
+
+Response: `{"files": [SearchFile + "pinned": bool], "total", "totalApprox"?}`
+(plus `keywordReady: false` / `meaningUnavailable: true` as in All search).
+SearchFile is the All search file shape (`workspaceId, filespace, kind,
+location, path, name, size, mtime, type, score, why, snippets`).
+
+- Members = the saved search's file results (up to `k`, over `scope`; null =
+  every enabled location) ∪ pinned − excluded. `k` caps the search results
+  only; pins always come back.
+- **Excluded wins**: a file both pinned and excluded is not a member.
+- Order: pinned first (by score, best first; ties — including every unmatched
+  pin — in the order of the `pinned` list), then the other results by score.
+- A pinned file the search also matches (within its scope and filters) carries that match's `why`, `score` and
+  `snippets` (even beyond the top `k` or the retrieval pool: the same search is
+  re-run limited to those pins, reusing the query embedding). Otherwise it has
+  `why` all false (`mentions` 0), `score` 0, `snippets` [], and name, size,
+  mtime and location from the ledger. Pins may be any live ledger file, indexed
+  or not (an image, a skipped video); pins not in the ledger (or deleted) are
+  dropped.
+- Query empty (or only spaces) → pinned only, no embedder call.
+- `total` = distinct members (all matched files, not only the top `k`, ∪
+  pins); `totalApprox: true` when a retrieval list hit its cap (as All search).
+
+The collection page and "Ask this collection" use this: Ask sends the member
+refs as `files`.
 
 ## Indexing controls
 

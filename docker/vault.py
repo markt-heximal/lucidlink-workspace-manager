@@ -51,6 +51,15 @@ _FAVORITES_KEY = "favorites"
 MAX_FAVORITES = 200
 _FAVORITE_FIELDS = ("id", "workspaceId", "filespace", "kind", "path", "label", "addedAt")
 _FAVORITE_KINDS = ("lucidlink", "block")
+# Collections (saved searches with pins) live in the same row, served by
+# `/vault/collections`, never in the settings payload.
+_COLLECTIONS_KEY = "collections"
+MAX_COLLECTIONS = 100
+MAX_COLLECTION_REFS = 500
+COLLECTION_NAME_MAX = 80
+_COLLECTION_MODES = ("all", "meaning", "keyword")
+_FILTER_KINDS = ("documents", "presentations", "images", "video")
+_FILTER_TERMS_MAX = 20
 # `sa_live:` style prefixes are shown so the owner can tell token kinds apart.
 _PREFIX = re.compile(r"^([A-Za-z0-9_-]{1,24}:)")
 
@@ -134,6 +143,9 @@ def _normalise(data: dict) -> dict:
     favs = data.get(_FAVORITES_KEY)
     if isinstance(favs, list):
         out[_FAVORITES_KEY] = favs
+    cols = data.get(_COLLECTIONS_KEY)
+    if isinstance(cols, list):
+        out[_COLLECTIONS_KEY] = cols
     return out
 
 
@@ -178,7 +190,7 @@ def masked(payload: dict) -> dict:
 
     Each workspace token becomes `<prefix>••••<last4>` and gains a `tokenSet`
     flag. Only the current settings keys are copied, so retired keys (MinIO
-    profiles) and favorites never reach the response.
+    profiles), favorites and collections never reach the response.
     """
     out = copy.deepcopy({k: payload.get(k, v) for k, v in _empty().items()})
     for ws in out.get("workspaces") or []:
@@ -293,7 +305,7 @@ def _update(fn) -> tuple[dict, str]:
 def save(payload: dict) -> dict:
     """Merge `payload` into the vault and return the masked result + `updatedAt`.
 
-    Favorites stored in the same row are carried over untouched.
+    Favorites and collections stored in the same row are carried over untouched.
     """
     new, updated_at = _update(lambda stored: merge(stored, payload))
     return {**masked(new), "updatedAt": updated_at}
@@ -307,7 +319,7 @@ def purge_retired() -> int:
     """Re-encrypt the stored row without retired keys (MinIO profiles).
 
     One-time migration for vaults written before Simplification phase 4.
-    Workspaces, tokens, favorites and `updatedAt` are kept exactly as stored.
+    Workspaces, tokens, favorites, collections and `updatedAt` are kept exactly as stored.
     Returns how many MinIO profiles were removed (0 when there was nothing to
     purge, or no row). Logs that count only, never any value.
     """
@@ -394,6 +406,157 @@ def save_favorites(body: Any) -> list[dict]:
     favs = validate_favorites(body)
     _update(lambda stored: {**stored, _FAVORITES_KEY: favs})
     return copy.deepcopy(favs)
+
+
+# ---------------------------------------------------------------- collections
+def _iso(v: Any) -> bool:
+    if not isinstance(v, str) or not v:
+        return False
+    try:
+        datetime.fromisoformat(v.replace("Z", "+00:00"))
+        return True
+    except ValueError:
+        return False
+
+
+def _file_ref(item: Any, where: str) -> dict:
+    if not isinstance(item, dict):
+        raise ValueError(f"{where} must be an object")
+    for key in ("workspaceId", "filespace", "path"):
+        if not isinstance(item.get(key), str) or not item[key]:
+            raise ValueError(f"{where} needs a non-empty string '{key}'")
+    if not item["path"].startswith("/"):
+        raise ValueError(f"{where} 'path' must start with '/'")
+    return {"workspaceId": item["workspaceId"], "filespace": item["filespace"], "path": item["path"]}
+
+
+def _file_refs(items: Any, where: str) -> list[dict]:
+    if not isinstance(items, list):
+        raise ValueError(f"{where} must be a list")
+    if len(items) > MAX_COLLECTION_REFS:
+        raise ValueError(f"{where}: at most {MAX_COLLECTION_REFS} files")
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for j, item in enumerate(items):
+        ref = _file_ref(item, f"{where}[{j}]")
+        key = (ref["workspaceId"], ref["filespace"], ref["path"])
+        if key not in seen:          # a repeated file is kept once
+            seen.add(key)
+            out.append(ref)
+    return out
+
+
+def _collection_filters(f: Any, where: str) -> dict:
+    """The /index/search filter keys only; unknown keys dropped, nulls omitted."""
+    if f is None:
+        return {}
+    if not isinstance(f, dict):
+        raise ValueError(f"{where} 'filters' must be an object")
+    out: dict = {}
+    if f.get("kind") is not None:
+        if f["kind"] not in _FILTER_KINDS:
+            raise ValueError(f"{where} 'filters.kind' must be one of {', '.join(_FILTER_KINDS)}")
+        out["kind"] = f["kind"]
+    if f.get("pathPrefix") is not None:
+        if not isinstance(f["pathPrefix"], str):
+            raise ValueError(f"{where} 'filters.pathPrefix' must be a string")
+        out["pathPrefix"] = f["pathPrefix"]
+    for key in ("modifiedAfter", "modifiedBefore"):
+        if f.get(key) is not None:
+            if not _iso(f[key]):
+                raise ValueError(f"{where} 'filters.{key}' must be an ISO date")
+            out[key] = f[key]
+    for key in ("include", "exclude"):
+        if f.get(key) is not None:
+            terms = f[key]
+            if (not isinstance(terms, list) or len(terms) > _FILTER_TERMS_MAX
+                    or not all(isinstance(t, str) for t in terms)):
+                raise ValueError(f"{where} 'filters.{key}' must be a list of at most "
+                                 f"{_FILTER_TERMS_MAX} strings")
+            out[key] = list(terms)
+    if f.get("inName") is not None:
+        if not isinstance(f["inName"], bool):
+            raise ValueError(f"{where} 'filters.inName' must be true or false")
+        out["inName"] = f["inName"]
+    return out
+
+
+def _collection_scope(sc: Any, where: str) -> Optional[dict]:
+    if sc is None:
+        return None
+    if not isinstance(sc, dict) or not isinstance(sc.get("workspaceId"), str) or not sc["workspaceId"]:
+        raise ValueError(f"{where} 'scope' must be null or {{\"workspaceId\", \"filespace\"?}}")
+    out = {"workspaceId": sc["workspaceId"]}
+    fs = sc.get("filespace")
+    if fs is not None:
+        if not isinstance(fs, str) or not fs:
+            raise ValueError(f"{where} 'scope.filespace' must be a non-empty string")
+        out["filespace"] = fs
+    return out
+
+
+def validate_collections(body: Any) -> list[dict]:
+    """`{"collections": [Collection]}` -> the clean list to store. ValueError when malformed.
+
+    Unknown fields (top level and inside `filters`, `scope` and file refs) are
+    dropped; a file repeated in `pinned` or `excluded` is kept once. Collections
+    hold no secrets, so they are stored and returned as they are.
+    """
+    if not isinstance(body, dict) or not isinstance(body.get("collections"), list):
+        raise ValueError("Body must be {\"collections\": [...]}")
+    items = body["collections"]
+    if len(items) > MAX_COLLECTIONS:
+        raise ValueError(f"At most {MAX_COLLECTIONS} collections")
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, item in enumerate(items):
+        where = f"Collection {i}"
+        if not isinstance(item, dict):
+            raise ValueError(f"{where} must be an object")
+        if not isinstance(item.get("id"), str) or not item["id"]:
+            raise ValueError(f"{where} needs a non-empty string 'id'")
+        if item["id"] in seen:
+            raise ValueError(f"Duplicate collection id '{item['id']}'")
+        seen.add(item["id"])
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip() or len(name) > COLLECTION_NAME_MAX:
+            raise ValueError(f"{where} 'name' must be 1–{COLLECTION_NAME_MAX} characters")
+        query = item.get("query", "")
+        if query is None:
+            query = ""
+        if not isinstance(query, str):
+            raise ValueError(f"{where} 'query' must be a string")
+        mode = item.get("mode", "all")
+        if mode not in _COLLECTION_MODES:
+            raise ValueError(f"{where} 'mode' must be one of {', '.join(_COLLECTION_MODES)}")
+        for key in ("createdAt", "updatedAt"):
+            if not _iso(item.get(key)):
+                raise ValueError(f"{where} needs an ISO date '{key}'")
+        viewed = item.get("lastViewedAt")
+        if viewed is not None and not _iso(viewed):
+            raise ValueError(f"{where} 'lastViewedAt' must be an ISO date or null")
+        out.append({
+            "id": item["id"], "name": name, "query": query, "mode": mode,
+            "filters": _collection_filters(item.get("filters"), where),
+            "scope": _collection_scope(item.get("scope"), where),
+            "pinned": _file_refs(item.get("pinned", []), f"{where} 'pinned'"),
+            "excluded": _file_refs(item.get("excluded", []), f"{where} 'excluded'"),
+            "createdAt": item["createdAt"], "updatedAt": item["updatedAt"], "lastViewedAt": viewed,
+        })
+    return out
+
+
+def load_collections() -> list[dict]:
+    """The stored Collections; an empty list for vaults saved before collections existed."""
+    cols = load().get(_COLLECTIONS_KEY)
+    return copy.deepcopy(cols) if isinstance(cols, list) else []
+
+
+def save_collections(body: Any) -> list[dict]:
+    """Validate and replace the stored Collections; returns the stored list."""
+    cols = validate_collections(body)
+    _update(lambda stored: {**stored, _COLLECTIONS_KEY: cols})
+    return copy.deepcopy(cols)
 
 
 # ---------------------------------------------------------------- lookups
@@ -489,6 +652,26 @@ def put_favorites(body: Any = Body(...),
                   _owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
     try:
         return {"favorites": save_favorites(body)}
+    except VaultError as e:
+        raise _vault_http_error(e)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/collections")
+def get_collections(_owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
+    try:
+        ensure_migrated()
+        return {"collections": load_collections()}
+    except VaultError as e:
+        raise _vault_http_error(e)
+
+
+@router.put("/collections")
+def put_collections(body: Any = Body(...),
+                    _owner: owner_auth.Owner = Depends(owner_auth.require_owner)):
+    try:
+        return {"collections": save_collections(body)}
     except VaultError as e:
         raise _vault_http_error(e)
     except ValueError as e:

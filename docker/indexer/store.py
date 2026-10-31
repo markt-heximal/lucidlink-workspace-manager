@@ -761,19 +761,59 @@ class Store:
             args += [p, like_escape(p) + "/%"]
         return where, args
 
+    @staticmethod
+    def _files_sql(files: Optional[Iterable[tuple[str, str, str]]], alias: str = "c") -> tuple[str, list]:
+        """` AND (ws, fs, file_id) IN (...)` for a request limited to some files (empty: no limit)."""
+        if files is None:
+            return "", []
+        keys = sorted(set(files))
+        if not keys:
+            return " AND 0", []
+        sql = (f" AND ({alias}.workspace_id, {alias}.filespace, {alias}.file_id) IN (VALUES "
+               + ",".join("(?, ?, ?)" for _ in keys) + ")")
+        return sql, [x for k in keys for x in k]
+
+    def files_at_paths(self, refs: Iterable[tuple[str, str, str]]) -> list[dict]:
+        """Live ledger rows (any status but deleted) at these (workspace, filespace, path)s."""
+        refs = list(dict.fromkeys(refs))
+        out: list[dict] = []
+        for i in range(0, len(refs), 300):
+            part = refs[i:i + 300]
+            out += self.query(
+                "SELECT workspace_id, filespace, file_id, path, size, mtime, status FROM files "
+                "WHERE status != 'deleted' AND (workspace_id, filespace, path) IN (VALUES "
+                + ",".join("(?, ?, ?)" for _ in part) + ") ORDER BY mtime DESC",
+                [x for r in part for x in r])
+        return out
+
+    def point_ids_of(self, files: Iterable[tuple[str, str, str]]) -> set[int]:
+        """Chunk point ids of these (workspace, filespace, file_id)s."""
+        keys = sorted(set(files))
+        out: set[int] = set()
+        for i in range(0, len(keys), 300):
+            part = keys[i:i + 300]
+            out |= {r["point_id"] for r in self.query(
+                "SELECT point_id FROM chunks WHERE (workspace_id, filespace, file_id) IN (VALUES "
+                + ",".join("(?, ?, ?)" for _ in part) + ")", [x for k in part for x in k])}
+        return out
+
     def keyword_search(self, scopes: Iterable[tuple[str, str]], match: str, limit: int,
-                       path_prefix: Optional[str] = None, ranked: bool = True) -> list[tuple[int, float]]:
+                       path_prefix: Optional[str] = None, ranked: bool = True,
+                       files: Optional[Iterable[tuple[str, str, str]]] = None) -> list[tuple[int, float]]:
         """Chunks matching the FTS5 query `match`, best BM25 first: [(point_id, bm25)].
 
         bm25() is negative (more negative = better). Empty when the index is not
         ready or the query is rejected. ranked=False (a term in a large share of
         the corpus, where ranking every match would cost ~1 s per million) takes
         the newest matching chunks instead, which stops after `limit` rows.
+        `files`: only chunks of these (workspace, filespace, file_id)s.
         """
         scopes = sorted(scopes)
         if not scopes or not match or not self.fts_ready:
             return []
         where, args = self._scope_sql(scopes, path_prefix)
+        fsql, fargs = self._files_sql(files)
+        where, args = where + fsql, args + fargs
         sql = ("SELECT c.point_id, bm25(chunks_fts) AS r FROM chunks_fts "
                "JOIN chunks c ON c.point_id = chunks_fts.rowid "
                "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace AND f.file_id=c.file_id "
@@ -849,7 +889,8 @@ class Store:
         return out
 
     def name_chunk_hits(self, scopes: Iterable[tuple[str, str]], compact: str, limit: int,
-                        path_prefix: Optional[str] = None) -> list[int]:
+                        path_prefix: Optional[str] = None,
+                        files: Optional[Iterable[tuple[str, str, str]]] = None) -> list[int]:
         """First chunk of indexed files whose folded name contains `compact`, best
         (name starts with it) and newest first: the "file is called that" channel."""
         scopes = sorted(scopes)
@@ -857,6 +898,8 @@ class Store:
             return []
         where, args = self._scope_sql(scopes, path_prefix)
         where = where.replace("c.workspace_id", "f.workspace_id").replace("c.filespace", "f.filespace")
+        fsql, fargs = self._files_sql(files, "f")
+        where, args = where + fsql, args + fargs
         sql = ("SELECT c.point_id FROM files f JOIN chunks c ON c.workspace_id=f.workspace_id "
                "AND c.filespace=f.filespace AND c.file_id=f.file_id AND c.chunk_index=0 "
                f"WHERE f.status = 'indexed' AND instr(f.name_fold, ?) > 0 AND {where} "

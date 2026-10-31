@@ -9,7 +9,7 @@ indexer is unreachable or answers `empty`.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from . import search as search_mod
 
@@ -27,14 +27,16 @@ MAX_SOURCES = 10
 EMPTY_ANSWER = "Nothing is indexed for this filespace yet. Wait for the indexer to finish a sync, then ask again."
 
 
-def answer(svc: "IndexerService", scopes: "set[Scope]", question: str, k: int = 12) -> dict:
-    """Raises LLMUnavailable (503) / LLMError (502) / EmbedError."""
+def answer(svc: "IndexerService", scopes: "set[Scope]", question: str, k: int = 12,
+           only: "Optional[search_mod.FileSet]" = None) -> dict:
+    """Raises LLMUnavailable (503) / LLMError (502) / EmbedError.
+    only: retrieve (and so cite) from these files only (a collection)."""
     svc.llm_required()
     empty = {"answer": EMPTY_ANSWER, "sources": [], "citations": [], "empty": True}
-    if not svc.store.has_chunks(scopes):
+    if not scopes or not svc.store.has_chunks(scopes):
         return empty
     ret = search_mod.retrieve(svc, scopes, question, "all", pool=max(search_mod.POOL // 2, k),
-                              question=True)
+                              question=True, only=only)
     used = [(h.row, h.score) for h in ret.hits[:max(1, k)]]
     if not used:
         return empty

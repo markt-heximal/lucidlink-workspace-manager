@@ -662,9 +662,17 @@ class IndexerService:
         return self.search_all(workspace_id, filespace, query, k, path_prefix)["results"]
 
     def search_all(self, workspace_id: Optional[str], filespace: Optional[str], query: str, k: int = 20,
-                   path_prefix: Optional[str] = None, mode: str = "all", filters: Optional[dict] = None) -> dict:
-        """All search: chunk results, file results, counts and refinements (docs: All search)."""
-        return search_mod.search(self, workspace_id, filespace, query, k, path_prefix, mode, filters)
+                   path_prefix: Optional[str] = None, mode: str = "all", filters: Optional[dict] = None,
+                   files: Optional[list[dict]] = None) -> dict:
+        """All search: chunk results, file results, counts and refinements (docs: All search).
+        files: [FileRef] limits results to those files (docs: Collections)."""
+        return search_mod.search(self, workspace_id, filespace, query, k, path_prefix, mode, filters, files)
+
+    def collection_files(self, query: str, mode: str = "all", filters: Optional[dict] = None,
+                         scope: Optional[dict] = None, pinned: Optional[list[dict]] = None,
+                         excluded: Optional[list[dict]] = None, k: int = search_mod.COLLECTION_K) -> dict:
+        """A collection's current members (docs: Collections)."""
+        return search_mod.collection_files(self, query, mode, filters, scope, pinned, excluded, k)
 
     def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
         """Most recently changed files, newest first (see recent_page)."""
@@ -827,8 +835,13 @@ class IndexerService:
             "lastScanAt": row.get("last_scan_at"),
         }
 
-    def ask(self, workspace_id: Optional[str], filespace: Optional[str], question: str, k: int = 12) -> dict:
-        return ask_mod.answer(self, self.scopes(workspace_id, filespace), question, k)
+    def ask(self, workspace_id: Optional[str], filespace: Optional[str], question: str, k: int = 12,
+            files: Optional[list[dict]] = None) -> dict:
+        """files: [FileRef] limits retrieval (and citations) to those files."""
+        if files is None:
+            return ask_mod.answer(self, self.scopes(workspace_id, filespace), question, k)
+        only = search_mod.resolve_files(self, files)
+        return ask_mod.answer(self, search_mod.file_scopes(self, workspace_id, filespace, only), question, k, only)
 
     def get_survey(self, workspace_id: Optional[str], filespace: str, scope: str = "/") -> dict:
         ws = self.resolve_workspace(workspace_id)

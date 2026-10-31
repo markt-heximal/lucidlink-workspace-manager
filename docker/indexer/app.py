@@ -31,6 +31,7 @@ from .config import Config
 from .folders import FolderError
 from .embedder import EmbedError
 from .llm import LLMError, LLMUnavailable
+from .search import COLLECTION_K, COLLECTION_K_MAX, MAX_FILE_REFS
 from .service import IndexerService, NotFound
 
 logger = logging.getLogger("indexer.app")
@@ -85,6 +86,12 @@ class SearchFilters(BaseModel):
     inName: bool = False
 
 
+class FileRef(BaseModel):
+    workspaceId: str = Field(min_length=1)
+    filespace: str = Field(min_length=1)
+    path: str = Field(pattern=r"^/")
+
+
 class SearchBody(BaseModel):
     workspaceId: Optional[str] = None
     filespace: Optional[str] = None
@@ -93,6 +100,8 @@ class SearchBody(BaseModel):
     pathPrefix: Optional[str] = None
     mode: Literal["all", "meaning", "keyword"] = "all"
     filters: Optional[SearchFilters] = None
+    # Limit results to these files (a collection); scopes then come from the refs.
+    files: Optional[list[FileRef]] = Field(default=None, max_length=MAX_FILE_REFS)
 
 
 class AskBody(BaseModel):
@@ -100,6 +109,36 @@ class AskBody(BaseModel):
     filespace: Optional[str] = None
     question: str = Field(min_length=1)
     k: int = Field(default=12, ge=1, le=50)
+    files: Optional[list[FileRef]] = Field(default=None, max_length=MAX_FILE_REFS)
+
+
+class CollectionScope(BaseModel):
+    workspaceId: str = Field(min_length=1)
+    filespace: Optional[str] = None
+
+
+class CollectionBody(BaseModel):
+    query: str = ""
+    mode: Literal["all", "meaning", "keyword"] = "all"
+    filters: Optional[SearchFilters] = None
+    scope: Optional[CollectionScope] = None
+    pinned: list[FileRef] = Field(default_factory=list, max_length=MAX_FILE_REFS)
+    excluded: list[FileRef] = Field(default_factory=list, max_length=MAX_FILE_REFS)
+    k: int = Field(default=COLLECTION_K, ge=1, le=COLLECTION_K_MAX)
+
+
+def _refs(files: Optional[list[FileRef]]) -> Optional[list[dict]]:
+    return None if files is None else [f.model_dump() for f in files]
+
+
+def _filters(f: Optional[SearchFilters]) -> Optional[dict]:
+    if f is None:
+        return None
+    out = f.model_dump(exclude_defaults=True)
+    for key in ("modifiedAfter", "modifiedBefore"):
+        if key in out:   # echo back as ISO in refinement patches
+            out[key] = out[key].isoformat().replace("+00:00", "Z")
+    return out
 
 
 class SurveyBody(BaseModel):
@@ -180,14 +219,19 @@ def hint(body: HintBody, svc: IndexerService = Depends(_service), x_ws: Optional
 
 @router.post("/search")
 def search(body: SearchBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
-    filters = None
-    if body.filters is not None:
-        filters = body.filters.model_dump(exclude_defaults=True)
-        for key in ("modifiedAfter", "modifiedBefore"):
-            if key in filters:   # echo back as ISO in refinement patches
-                filters[key] = filters[key].isoformat().replace("+00:00", "Z")
-    return svc.search_all(_ws(body.workspaceId, x_ws), body.filespace, body.query, body.k,
-                          body.pathPrefix, body.mode, filters)
+    # With `files`, only the body's own workspaceId narrows (the proxy's header
+    # is the app's active workspace, which must not hide refs elsewhere).
+    ws = body.workspaceId if body.files is not None else _ws(body.workspaceId, x_ws)
+    return svc.search_all(ws, body.filespace, body.query, body.k,
+                          body.pathPrefix, body.mode, _filters(body.filters), _refs(body.files))
+
+
+@router.post("/collection/files")
+def collection_files(body: CollectionBody, svc: IndexerService = Depends(_service)):
+    """A collection's current members: saved search ∪ pinned − excluded (docs: Collections)."""
+    return svc.collection_files(body.query, body.mode, _filters(body.filters),
+                                body.scope.model_dump() if body.scope else None,
+                                _refs(body.pinned), _refs(body.excluded), body.k)
 
 
 @router.get("/find")
@@ -265,7 +309,8 @@ def profile(filespace: str, workspaceId: Optional[str] = None, svc: IndexerServi
 
 @router.post("/ask")
 def ask(body: AskBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
-    return svc.ask(_ws(body.workspaceId, x_ws), body.filespace, body.question, body.k)
+    ws = body.workspaceId if body.files is not None else _ws(body.workspaceId, x_ws)
+    return svc.ask(ws, body.filespace, body.question, body.k, _refs(body.files))
 
 
 @router.post("/assist")
