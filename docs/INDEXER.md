@@ -127,13 +127,14 @@ active workspace.
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/index/status` | — | `{"filespaces": [FilespaceStatus], "embedder": {"model", "dim", "ok", "error"}, "vectorStore": {"backend": "ruvector"\|"local", "ok", "points", "error"}, "relatedFiles": {"fileVectors", "ready"}}` |
+| GET | `/index/status` | — | `{"filespaces": [FilespaceStatus], "embedder": {"model", "dim", "ok", "error"}, "vectorStore": {"backend": "ruvector"\|"local", "ok", "points", "error"}, "relatedFiles": {"fileVectors", "ready"}, "discovered": {"locations": n switched on, "running": null\|{workspaceId, filespace, phase, done, total}}}` |
 | POST | `/index/sync` | `{"workspaceId"?, "filespace"?}` | 202 `{"queued": [{"workspaceId","filespace"}]}` |
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?, "mode"?: "all"\|"meaning"\|"keyword", "filters"?: {…}}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}], "files", "total", "counts", "refinements"}` — hybrid ranked (meaning + keywords + names); see "Search quality" and "All search" |
 | GET | `/index/recent` | `?workspaceId&filespace&limit=20&kind=&change=&since=&before=` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace; `kind` as `/index/bykind`, `change` a comma list of new\|modified\|renamed\|deleted, `since` ≤ `when` < `before` (ISO); unknown kind/change or a bad time → 400; see What's new) | `{"files": [RecentFile], "next": ISO\|null}`, newest `when` first; pass `next` as `before` for the next page (ties on `when` stay on one page) |
 | POST | `/index/related` | `{"workspaceId"?, "filespace", "path", "k"?: 10, "scope"?: {"workspaceId","filespace"?}\|null}` | versions, shared names, similar meaning and references of one file; see "Related files (Collections step 2)"; 404 when the file is not in the ledger |
+| GET/POST | `/index/discover…`, `/index/collection/suggest` | see "Discovered collections (Collections step 3)" | proposed collections per switched-on location; keep / dismiss / rename / merge; suggestions for a collection |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
@@ -1041,8 +1042,9 @@ in the same folder" or ", edited the same week" when `near` is set.
   a lowercase word, a comma, "The/A/Our…" or a title (Mr, Dr…), not at the
   start of a line, sentence or table cell ("Smallest", "Meeting"). Words fused
   by PDF extraction ("14Shareholder", "Performance1"), figures that start
-  with a digit ("2011F", "73x") and all-capitals words over 10 letters
-  (headings run together) are not names; codes start with a letter
+  with a digit ("2011F", "73x"), all-capitals words over 10 letters
+  (headings run together), machine ids (hex digits with a digit in them:
+  "DC78AACC", "e25bb512") and words over 30 characters are not names; codes start with a letter
   ("WS2008", "T03"). Names are scored
   by rarity (log of total ÷ chunks containing it) and frequency in the file.
   Other files score the sum of the names they share; every version (not only
@@ -1079,6 +1081,132 @@ call takes 0.3–2.6 s, also while a location is being rescanned.
 Names and `mentionedBy` need the keyword index (`keywordReady: false` until
 it is built); meaning needs the file vectors. Images and other unindexed files
 still get versions by name and `mentionedBy`.
+
+### Discovered collections (Collections step 3)
+
+The engine proposes collections nobody made: groups of files whose links are
+strong, named by the local AI. Proposed, not imposed: the owner keeps, renames,
+merges or dismisses each one. It runs only on locations the owner switches on
+(rollout: one location first), in the background at low priority
+(`indexer/discover.py`).
+
+**Switching it on.** `POST /index/discover/start {"workspaceId"?, "filespace"}`
+switches a location on and asks for a run (404 for an unknown location);
+`POST /index/discover/stop` switches it off (its groups stay). A background
+thread (nice 10) checks every 60 s: a location runs when asked, and again once
+a day if its file vectors changed (`meta.fv_seq` moved). Nothing runs while
+indexing is paused or before the first file-vector pass has finished. A run
+stopped by a restart is asked for again.
+
+**One run** (`discover.run`, all on a private read-only connection):
+
+1. Files → documents: the location's indexed files, with backup copies (same
+   name and size) and `x.pdf.json` sidecars of an indexed `x.pdf` folded into
+   one node (the newest copy; on a tie the shallower path). Only documents,
+   spreadsheets, presentations and PDFs count, and none inside system folders
+   (browser caches, Local Settings, AppData, Library, temp, logs, caches,
+   `.app`/`.lproj` bundles…): an old computer's backup is full of those, and
+   they link to each other strongly.
+2. Links between documents, each with a strength; strengths combine as
+   independent evidence (1 − Π(1 − s)), plus 0.1 for time and place:
+   - **names** (strong): capitalised words and codes that read as names
+     (`related.scan_names`, the Related files rules) in the first 40 chunks of
+     each document, mentioned by 2–40 documents here and in at most
+     max(50, 0.02% of all chunks) chunks across the archive. Each shared name
+     counts 0.7 (in ≤ 5 documents), 0.55 (≤ 15) or 0.4 (≤ 40).
+   - **versions** (0.9): the same version-stripped base name
+     (`related.version_base`; at most 50 per base unless the name is long and
+     specific), or half the smaller document's passages in common (passages in
+     2–8 documents; more is boilerplate).
+   - **references** (0.8): a document names another's file ("… Budget
+     2024.xlsx …", the longest real name; folder listings and `.log` files
+     skipped; a name matching more than 3 documents is ignored).
+   - **meaning** (medium): each among the other's 10 closest by file vector
+     (0.35), or 3 closest (0.5), and cosine ≥ 0.7. Compared in 1024 × 8192
+     blocks, a few tens of MB at a time.
+   - **time and place** (weak, +0.1): the same folder (not one of more than 50
+     documents), or saved within a week (not in a week when more than 100
+     documents were saved: an archive copied in).
+
+   A link needs 0.5 in all; each document keeps its 15 strongest.
+3. Groups: Louvain communities of that graph (modularity, resolution 1); a
+   community over 60 documents is split again at resolution 2, 4, 8 (and
+   then cut to its 60 best-connected). A group needs at least 3 different
+   documents once versions are folded, so a file and its drafts are not a
+   collection. Score = internal link strength per document × log2(1 +
+   documents); groups are listed strongest first.
+4. Reconcile with the stored groups: a new group sharing at least half its
+   files (Jaccard) with a dismissed, kept or merged group is not proposed
+   again; one matching a proposal keeps its id, and its name when the owner
+   gave it or when the AI gave it and 70% of the files are the same. Proposals
+   that match nothing are dropped.
+
+On the Mini, markt-ibm (77k indexed files → 11k documents once copies,
+sidecars and system files are set aside) takes about 5 minutes and up to
+~620 MB, most of it reading names (4 minutes); archive (1.8k documents)
+takes 25 s. It proposed 612 groups there covering 8,263 files: board
+committee minutes, audit packs, 10-K drafts, strategy reviews.
+
+**Names.** A new group is called after its two most shared names ("ThinkTank ·
+Acme"), else its folder (`namedBy: "auto"`). After each pass the AI names up
+to 20 proposals, strongest first (`namedBy: "ai"`): it sees the recurring
+names, top folders, dates, up to 30 paths and three 300-character excerpts,
+and answers `{"name", "summary"}` (2–6 words; one sentence). An unusable answer
+keeps the made-up name; an unreachable AI is left alone for 10 minutes. A
+group the owner renamed (`namedBy: "you"`) is never renamed.
+
+**Storage.** `discover_scopes` (switched-on locations, last run, `stats` JSON,
+`fv_seq`) and `discover_groups` (`status` proposed | kept | dismissed |
+merged, name, `named_by`, summary, score, size, `keys` = every file id in it,
+`data` JSON = files with reasons, names, folders, dates). Purging a source
+deletes both.
+
+**API**
+
+| Method | Path | Body / query | Response |
+|---|---|---|---|
+| GET | `/index/discover` | | `{"ai", "ready", "locations": [{workspaceId, filespace, location, enabled, state: running\|waiting\|done\|error\|idle, progress?: {phase: reading\|linking\|comparing\|grouping, done, total}, lastRunAt, error, stats, groups: {proposed, kept, dismissed}, unnamed}]}` |
+| POST | `/index/discover/start` | `{"workspaceId"?, "filespace"}` | that location's entry; 404 if unknown |
+| POST | `/index/discover/stop` | `{"workspaceId"?, "filespace"}` | `{"enabled": false}`; 404 if it was never on |
+| GET | `/index/discover/groups` | `workspaceId?` (`*` = all), `filespace?`, `status` (proposed), `limit` (50, ≤ 200), `offset` | `{"total", "groups": [Group]}`; 400 for an unknown status |
+| GET | `/index/discover/groups/{id}` | | Group + detail; 404 |
+| POST | `/index/discover/groups/{id}` | `{"action": "keep"\|"dismiss"\|"restore"\|"rename", "name"?}` | Group + detail; 400 for a blank name or a merged group |
+| POST | `/index/discover/merge` | `{"ids": [2–20], "name"?}` | the new proposal + detail; originals become `merged` (`mergedInto`); 404 / 400 |
+| POST | `/index/collection/suggest` | `{"pinned": [FileRef] (≥ 1), "excluded"?, "k"?: 20, "since"?: ISO, "scope"?}` | `{"names", "files": [RelatedFile + "strength"]}` |
+
+```
+Group  = {"id", "workspaceId", "filespace", "location", "status", "name", "namedBy",
+          "summary", "description": "23 files across Projects, Finance and Mail, 2023–2025",
+          "files", "documents", "score", "names": [{"name", "files"}],
+          "folders": [{"folder", "files"}], "first", "last", "createdAt", "updatedAt",
+          "mergedInto"?}
+detail = {"items": [{workspaceId, filespace, kind, location, path, name, size, mtime,
+                     type, reason, copies, names}],
+          "timeline": [{"month": "2024-03", "files"}], "byTime": [path, oldest first],
+          "missing": files gone since the run,
+          "collection": {"name", "pinned": [FileRef] (≤ 500)}}
+```
+
+Each file's `reason` says why it belongs: "Mentions ThinkTank and Acme" (the
+group's names it carries), else its strongest link inside the group ("A version
+of …", "Names …", "Named in …", "About the same thing as …"), ending ", in the
+same folder" or ", edited the same week".
+
+**Keep** marks the group kept and answers with `collection`; the app saves it
+through `PUT /vault/collections` (`query: ""`, the files as pins), like "Make
+a collection from here". **Ask this collection** is `/index/ask` with
+`files` = those pins. **Timeline** and **People and organisations** are
+`timeline`/`byTime` and `names`.
+
+**Grows on its own:** `POST /index/collection/suggest` takes any collection's
+pins (kept, discovered or saved from a search) and returns files outside it
+that link strongly (combined strength ≥ 0.5): files mentioning the names at
+least 20% (and 2) of its files share (up to 8, rare across the archive),
+versions of its 10 newest files, and files whose meaning is as close to the
+collection's centre as its own files are (at least its lower quartile, ≥ 0.7).
+`excluded` and backup copies of members are left out; `since` keeps only files
+changed after it (what is new since the owner last looked); `scope` defaults
+to the collection's own locations.
 
 ## Indexing controls
 

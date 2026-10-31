@@ -30,6 +30,7 @@ from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
 from .source import SdkSourceProvider, SettingsProvider, SourceProvider, VaultSettings
 from .store import FILE_ORDER, Store, fold_name, now_iso
+from . import discover as discover_mod
 from . import related as related_mod
 from .vectors import FileIndex, LocalIndex, RuvectorMirror, Scope, VectorService
 from .worker import Scheduler, iso
@@ -52,6 +53,12 @@ AGE_BUCKETS = (("7d", 7), ("30d", 30), ("90d", 90), ("older", None))
 LARGEST_FOLDERS = 10
 # Related files: seconds between passes of the file-vector builder.
 FILE_VECTOR_INTERVAL = 60.0
+# Discovered collections: seconds between checks for a run to do, groups named
+# per check, and how long to leave the AI alone after it failed.
+DISCOVER_INTERVAL = 60.0
+DISCOVER_NAMES_PER_PASS = 20
+DISCOVER_LLM_BACKOFF = 600.0
+DISCOVER_LIMIT_MAX = 200
 
 
 def mtime_seconds(v: Optional[int]) -> Optional[float]:
@@ -175,6 +182,10 @@ class IndexerService:
         self.file_index = FileIndex(self.store, self.embedder.model)
         # True once a pass of the file-vector builder found nothing left to do.
         self.file_vectors_ready = False
+        # Discovered collections: the run in progress {"key", "phase", "done", "total"}.
+        self.discover_running: Optional[dict] = None
+        self._dc_wake = threading.Event()
+        self._dc_llm_retry_at = 0.0
         self.scheduler = Scheduler(self)
         # Block keys get a LocalSource; everything else the filespace provider
         # (looked up per lease, so `self.sources` can be swapped in tests).
@@ -187,6 +198,7 @@ class IndexerService:
         self.scheduler.start()
         self._start_fts_backfill()
         self._start_file_vectors()
+        self._start_discovery()
 
     def build_file_vectors(self, batch: int = 200, pause: float = 0.0,
                            stop: Optional[threading.Event] = None) -> int:
@@ -239,6 +251,83 @@ class IndexerService:
         self._fv_thread = threading.Thread(target=run, name="indexer-file-vectors", daemon=True)
         self._fv_thread.start()
 
+    def _start_discovery(self) -> None:
+        """Discovered collections in the background, at low priority: a run for
+        each location switched on (when asked, and again daily if its files
+        changed), then names from the AI, a few per pass."""
+        self._dc_stop = threading.Event()
+
+        def run():
+            try:
+                os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), 10)
+            except (AttributeError, OSError):
+                pass
+            while not self._dc_stop.is_set():
+                try:
+                    self.discover_pass(stop=self._dc_stop, pause=1.0)
+                except Exception:
+                    logger.exception("discover: pass failed")
+                self._dc_wake.wait(DISCOVER_INTERVAL)
+                self._dc_wake.clear()
+
+        self._dc_thread = threading.Thread(target=run, name="indexer-discover", daemon=True)
+        self._dc_thread.start()
+
+    def discover_pass(self, stop: Optional[threading.Event] = None, pause: float = 0.0) -> None:
+        """Runs that are due, then up to DISCOVER_NAMES_PER_PASS AI names.
+        Waits while indexing is paused or file vectors are still being built."""
+        if self.store.control()["paused"] or not self.file_vectors_ready:
+            return
+        targets = set(self.scheduler.targets())
+        for sc in self.store.discover_scopes():
+            key = (sc["workspace_id"], sc["filespace"])
+            if stop is not None and stop.is_set():
+                return
+            if sc["enabled"] and key in targets and self._discover_due(sc):
+                self._discover_run(*key, stop=stop, pause=pause)
+        if not self.llm.configured or time.monotonic() < self._dc_llm_retry_at:
+            return
+        rows = [r for r in self.store.discover_group_rows(statuses=["proposed"]) if r["named_by"] == "auto"]
+        for r in rows[:DISCOVER_NAMES_PER_PASS]:
+            if stop is not None and stop.is_set():
+                return
+            try:
+                discover_mod.name_group(self, r)
+            except LLMUnavailable as e:
+                logger.warning("discover: AI unavailable, names wait %.0fs: %s", DISCOVER_LLM_BACKOFF, e)
+                self._dc_llm_retry_at = time.monotonic() + DISCOVER_LLM_BACKOFF
+                return
+            except Exception as e:      # LLMError and the like: skip this group this pass
+                logger.warning("discover: naming group %s failed: %s", r["id"], e)
+
+    def _discover_due(self, sc: dict) -> bool:
+        if sc["requested_at"]:
+            return True
+        if not sc["finished_at"] or sc["error"]:
+            return False
+        age = time.time() - datetime.fromisoformat(sc["finished_at"].replace("Z", "+00:00")).timestamp()
+        return age >= discover_mod.RERUN_EVERY and self.store.fv_seq() != sc["fv_seq"]
+
+    def _discover_run(self, ws: str, fs: str, stop: Optional[threading.Event] = None, pause: float = 0.0) -> None:
+        seq = self.store.fv_seq()
+        self.store.discover_mark(ws, fs, started_at=now_iso(), requested_at=None, error=None)
+        self.discover_running = {"workspaceId": ws, "filespace": fs, "phase": "starting", "done": 0, "total": 0}
+
+        def progress(phase, done, total):
+            self.discover_running = {"workspaceId": ws, "filespace": fs, "phase": phase, "done": done,
+                                     "total": total}
+
+        try:
+            stats = discover_mod.run(self, ws, fs, stop=stop, progress=progress, pause=pause)
+            self.store.discover_mark(ws, fs, finished_at=now_iso(), fv_seq=seq, stats=stats)
+        except discover_mod.Stopped:
+            self.store.discover_mark(ws, fs, requested_at=now_iso())     # finish after a restart
+        except Exception as e:
+            logger.exception("discover [%s/%s]: run failed", ws, fs)
+            self.store.discover_mark(ws, fs, finished_at=now_iso(), error=f"{type(e).__name__}: {e}")
+        finally:
+            self.discover_running = None
+
     def _start_fts_backfill(self) -> None:
         """Build the keyword index for chunks that predate it, in the background
         (short batches; search stays meaning-only until it is done)."""
@@ -268,6 +357,11 @@ class IndexerService:
         if stop is not None:
             stop.set()
             self._fv_thread.join(10)
+        stop = getattr(self, "_dc_stop", None)
+        if stop is not None:
+            stop.set()
+            self._dc_wake.set()
+            self._dc_thread.join(10)
         self.scheduler.stop()
         self.sources.close()
         self.store.close()
@@ -405,6 +499,8 @@ class IndexerService:
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
             "relatedFiles": {"fileVectors": self.file_index.count(), "ready": self.file_vectors_ready},
+            "discovered": {"locations": sum(1 for sc in self.store.discover_scopes() if sc["enabled"]),
+                           "running": dict(self.discover_running) if self.discover_running else None},
             "blockSources": list(self.scheduler.block_sources),
             "engine": self.engine_info(),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
@@ -750,6 +846,115 @@ class IndexerService:
                 raise NotFound("file not found in the index")
             row = max(rows, key=lambda r: r["mtime"] or 0)
             return related_mod.related(self, row, scopes | {(row["workspace_id"], row["filespace"])}, k)
+
+    # ------------------------------------------------------------ discovered collections
+    def _discover_location(self, workspace_id: Optional[str], filespace: str) -> tuple[str, str]:
+        ws = self.resolve_workspace(workspace_id)
+        if not ws or (ws, filespace) not in set(self.scheduler.targets()):
+            raise NotFound(f"no location called {filespace!r}")
+        return ws, filespace
+
+    def _discover_scope_out(self, sc: dict, counts: dict) -> dict:
+        key = (sc["workspace_id"], sc["filespace"])
+        run = self.discover_running
+        running = run is not None and (run["workspaceId"], run["filespace"]) == key
+        state = ("running" if running else "error" if sc["error"]
+                 else "waiting" if sc["requested_at"] and sc["enabled"] else "done" if sc["finished_at"] else "idle")
+        return {"workspaceId": key[0], "filespace": key[1], "location": self.locations().get(key),
+                "enabled": bool(sc["enabled"]), "state": state,
+                "progress": ({"phase": run["phase"], "done": run["done"], "total": run["total"]} if running else None),
+                "lastRunAt": sc["finished_at"], "error": sc["error"],
+                "stats": json.loads(sc["stats"]) if sc["stats"] else None,
+                "groups": {s: counts.get((key, s), 0) for s in ("proposed", "kept", "dismissed")},
+                "unnamed": counts.get((key, "unnamed"), 0)}
+
+    def discover_status(self) -> dict:
+        """Locations switched on for discovery, their last run and their groups."""
+        counts: dict = defaultdict(int)
+        for r in self.store.query("SELECT workspace_id, filespace, status, named_by, COUNT(*) AS n "
+                                  "FROM discover_groups GROUP BY 1, 2, 3, 4"):
+            key = (r["workspace_id"], r["filespace"])
+            counts[(key, r["status"])] += r["n"]
+            if r["status"] == "proposed" and r["named_by"] == "auto":
+                counts[(key, "unnamed")] += r["n"]
+        return {"ai": self.llm.configured, "ready": self.file_vectors_ready,
+                "locations": [self._discover_scope_out(sc, counts) for sc in self.store.discover_scopes()]}
+
+    def discover_start(self, workspace_id: Optional[str], filespace: str) -> dict:
+        """Switch discovery on for one location and run it soon (docs: Discovered collections)."""
+        ws, fs = self._discover_location(workspace_id, filespace)
+        self.store.discover_request(ws, fs)
+        self._dc_wake.set()
+        return next(x for x in self.discover_status()["locations"] if (x["workspaceId"], x["filespace"]) == (ws, fs))
+
+    def discover_stop(self, workspace_id: Optional[str], filespace: str) -> dict:
+        """No more runs for this location; its groups stay."""
+        ws = self.resolve_workspace(workspace_id)
+        if not ws or not self.store.discover_disable(ws, filespace):
+            raise NotFound(f"discovery is not on for {filespace!r}")
+        return {"workspaceId": ws, "filespace": filespace, "enabled": False}
+
+    def discover_groups(self, workspace_id: Optional[str], filespace: Optional[str], status: str = "proposed",
+                        limit: int = 50, offset: int = 0) -> dict:
+        """Groups, strongest first. workspaceId "*" (or none with no filespace) = every location."""
+        if status not in ("proposed", "kept", "dismissed", "merged"):
+            raise ValueError(f"unknown status {status!r}")
+        ws = None if workspace_id == ALL_WORKSPACES or (not workspace_id and not filespace) \
+            else self.resolve_workspace(workspace_id)
+        rows = self.store.discover_group_rows(ws, filespace or None, [status])
+        limit = max(1, min(int(limit), DISCOVER_LIMIT_MAX))
+        return {"total": len(rows), "groups": [discover_mod.group_out(self, r) for r in rows[offset:offset + limit]]}
+
+    def discover_group(self, gid: str) -> dict:
+        row = self.store.discover_group_row(gid)
+        if row is None:
+            raise NotFound("no such group")
+        with self.store.read_view():
+            return discover_mod.group_out(self, row, files=True)
+
+    def discover_act(self, gid: str, action: str, name: Optional[str] = None) -> dict:
+        """keep | dismiss | restore (back to proposed) | rename. Keep answers with the
+        group's files and the collection to save ({name, pinned})."""
+        row = self.store.discover_group_row(gid)
+        if row is None:
+            raise NotFound("no such group")
+        if action == "rename":
+            name = " ".join((name or "").split())
+            if not name or len(name) > discover_mod.NAME_MAX:
+                raise ValueError(f"name must be 1–{discover_mod.NAME_MAX} characters")
+            self.store.discover_update(gid, name=name, named_by="you")
+        elif action in ("keep", "dismiss", "restore"):
+            if row["status"] == "merged":
+                raise ValueError("this group was merged into another")
+            self.store.discover_update(gid, status={"keep": "kept", "dismiss": "dismissed",
+                                                    "restore": "proposed"}[action])
+        else:
+            raise ValueError(f"unknown action {action!r}")
+        return self.discover_group(gid)
+
+    def discover_merge(self, ids: list[str], name: Optional[str] = None) -> dict:
+        try:
+            return discover_mod.merge(self, ids, name)
+        except LookupError as e:
+            raise NotFound(str(e)) from None
+
+    def collection_suggest(self, pinned: list[dict], excluded: Optional[list[dict]] = None,
+                           k: int = discover_mod.SUGGEST_K, since: Optional[str] = None,
+                           scope: Optional[dict] = None) -> dict:
+        """Files outside a collection that link strongly to it (docs: Discovered
+        collections, "Grows on its own"). since: only files changed after it."""
+        after = None
+        if since:
+            after = _iso_micros(since, "since") / 1e6
+        with self.store.read_view():
+            members = search_mod.resolve_files(self, pinned).rows
+            if not members:
+                return {"names": [], "files": []}
+            scopes = (search_mod.FileSet(members).scopes if scope is None
+                      else self.scopes(scope.get("workspaceId"), scope.get("filespace") or None))
+            excl = {(r["workspace_id"], r["filespace"], r["file_id"])
+                    for r in search_mod.resolve_files(self, excluded or []).rows}
+            return discover_mod.suggest(self, members, excl, scopes, max(1, min(int(k), 50)), after)
 
     def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
         """Most recently changed files, newest first (see recent_page)."""

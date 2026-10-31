@@ -31,6 +31,7 @@ from .config import Config
 from .folders import FolderError
 from .embedder import EmbedError
 from .llm import LLMError, LLMUnavailable
+from .discover import SUGGEST_K
 from .related import K as RELATED_K, K_MAX as RELATED_K_MAX
 from .search import COLLECTION_K, COLLECTION_K_MAX, MAX_FILE_REFS
 from .service import IndexerService, NotFound
@@ -134,6 +135,30 @@ class RelatedBody(BaseModel):
     path: str = Field(pattern=r"^/")
     k: int = Field(default=RELATED_K, ge=1, le=RELATED_K_MAX)
     # Where related files may live (null = every enabled location).
+    scope: Optional[CollectionScope] = None
+
+
+class DiscoverLocationBody(BaseModel):
+    workspaceId: Optional[str] = None
+    filespace: str = Field(min_length=1)
+
+
+class DiscoverActionBody(BaseModel):
+    action: Literal["keep", "dismiss", "restore", "rename"]
+    name: Optional[str] = Field(default=None, max_length=200)
+
+
+class DiscoverMergeBody(BaseModel):
+    ids: list[str] = Field(min_length=2, max_length=20)
+    name: Optional[str] = Field(default=None, max_length=200)
+
+
+class SuggestBody(BaseModel):
+    pinned: list[FileRef] = Field(min_length=1, max_length=MAX_FILE_REFS)
+    excluded: list[FileRef] = Field(default_factory=list, max_length=MAX_FILE_REFS)
+    k: int = Field(default=SUGGEST_K, ge=1, le=50)
+    since: Optional[str] = None
+    # Where suggestions may come from (null = the collection's own locations).
     scope: Optional[CollectionScope] = None
 
 
@@ -249,6 +274,71 @@ def related(body: RelatedBody, svc: IndexerService = Depends(_service), x_ws: Op
     """Versions, shared names, similar meaning and references of one file (docs: Related files); 404 if unknown."""
     return svc.related(_ws(body.workspaceId, x_ws), body.filespace, body.path, body.k,
                        body.scope.model_dump() if body.scope else None)
+
+
+@router.get("/discover")
+def discover_status(svc: IndexerService = Depends(_service)):
+    """Locations switched on for discovered collections, with their runs and group counts."""
+    return svc.discover_status()
+
+
+@router.post("/discover/start")
+def discover_start(body: DiscoverLocationBody, svc: IndexerService = Depends(_service),
+                   x_ws: Optional[str] = WorkspaceHeader):
+    """Switch discovery on for a location and run it soon (docs: Discovered collections); 404 if unknown."""
+    return svc.discover_start(_ws(body.workspaceId, x_ws), body.filespace)
+
+
+@router.post("/discover/stop")
+def discover_stop(body: DiscoverLocationBody, svc: IndexerService = Depends(_service),
+                  x_ws: Optional[str] = WorkspaceHeader):
+    """No more discovery runs for a location; its groups stay."""
+    return svc.discover_stop(_ws(body.workspaceId, x_ws), body.filespace)
+
+
+@router.get("/discover/groups")
+def discover_groups(workspaceId: Optional[str] = None, filespace: Optional[str] = None,
+                    status: str = Query(default="proposed"), limit: int = Query(default=50, ge=1),
+                    offset: int = Query(default=0, ge=0), svc: IndexerService = Depends(_service)):
+    """Discovered groups, strongest first; `limit` is capped at 200."""
+    try:
+        return svc.discover_groups(workspaceId, filespace, status, limit, offset)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/discover/groups/{gid}")
+def discover_group(gid: str, svc: IndexerService = Depends(_service)):
+    """One group: its files with why each belongs, the timeline, and the collection to save."""
+    return svc.discover_group(gid)
+
+
+@router.post("/discover/groups/{gid}")
+def discover_act(gid: str, body: DiscoverActionBody, svc: IndexerService = Depends(_service)):
+    """Keep, dismiss, restore or rename a group."""
+    try:
+        return svc.discover_act(gid, body.action, body.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/discover/merge")
+def discover_merge(body: DiscoverMergeBody, svc: IndexerService = Depends(_service)):
+    """One proposed group from several of the same location."""
+    try:
+        return svc.discover_merge(body.ids, body.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/collection/suggest")
+def collection_suggest(body: SuggestBody, svc: IndexerService = Depends(_service)):
+    """Files outside a collection that link strongly to it (docs: Discovered collections)."""
+    try:
+        return svc.collection_suggest(_refs(body.pinned), _refs(body.excluded), body.k, body.since,
+                                      body.scope.model_dump() if body.scope else None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/find")

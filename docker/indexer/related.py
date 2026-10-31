@@ -64,6 +64,9 @@ CAPS_MAX = 10                # longer all-capitals words are headings run togeth
 _TOKEN = re.compile(r"[^\W_]+")
 # Words fused by PDF text extraction: "14Shareholder", "Performance1".
 _GLUED = re.compile(r"^\d+[A-Za-z]{3,}$|^[A-Z]?[a-z]{3,}\d+$")
+# Machine ids and hashes ("DC78AACC", "e25bb512…"): hex digits with a digit in them.
+_HEX = re.compile(r"^(?=[^\d]*\d)[0-9A-Fa-f]{4,}$")
+TOKEN_MAX = 30
 _HONORIFIC = re.compile(r"(?:^|\s)(?:Mr|Mrs|Ms|Mx|Dr|Prof|Sir)\.?\s+$")
 _BREAK = re.compile(r"[.!?:;\n\r\t•|]")
 _DETERMINERS = frozenset("the a an our their this that these those".split())
@@ -126,12 +129,10 @@ def _strip_versions(name: str) -> str:
     return s
 
 
-def distinctive_names(svc: "IndexerService", texts: list[str]) -> list[tuple[str, str, float]]:
-    """[(folded term, as written, weight)] of the rarest names in `texts`, best
-    first: capitalised words and codes ("ThinkTank", "Acme", "AB123") found in
-    at most max(NAME_DF_FLOOR, NAME_DF_RATIO of all chunks) chunks, and at
-    least one outside these texts."""
-    store = svc.store
+def scan_names(texts: Iterable[str]) -> tuple[Counter, Counter, dict[str, Counter]]:
+    """(occurrences, chunks containing it, forms as written) of the words in
+    `texts` that read as names at least once: capitalised words and codes
+    ("ThinkTank", "Acme", "AB123"), folded. No rarity check: see distinctive_names."""
     tf: Counter = Counter()
     in_chunks: Counter = Counter()
     named: set[str] = set()                # read as a name at least once
@@ -141,8 +142,8 @@ def distinctive_names(svc: "IndexerService", texts: list[str]) -> list[tuple[str
         for m in _TOKEN.finditer(t):
             tok = m.group()
             # Codes start with a letter ("WS2008", "T03"); "2011F", "73x" are figures.
-            if (len(tok) < 3 or tok[0].isdigit() or _GLUED.match(tok)
-                    or (tok.isupper() and len(tok) > CAPS_MAX)):
+            if (len(tok) < 3 or len(tok) > TOKEN_MAX or tok[0].isdigit() or _GLUED.match(tok)
+                    or _HEX.match(tok) or (tok.isupper() and len(tok) > CAPS_MAX)):
                 continue
             code = any(c.isdigit() for c in tok)
             if not (tok[0].isupper() or code):
@@ -156,11 +157,25 @@ def distinctive_names(svc: "IndexerService", texts: list[str]) -> list[tuple[str
             if f not in named and (code or _name_like(t, m.start())):
                 named.add(f)
         in_chunks.update(seen)
-    tf = Counter({f: n for f, n in tf.items() if f in named})
+    return Counter({f: n for f, n in tf.items() if f in named}), in_chunks, shown
+
+
+def name_cap(store) -> int:
+    """Chunks a name may appear in and still count as distinctive."""
+    return max(NAME_DF_FLOOR, int(max(1, store.chunk_total()) * NAME_DF_RATIO))
+
+
+def distinctive_names(svc: "IndexerService", texts: list[str]) -> list[tuple[str, str, float]]:
+    """[(folded term, as written, weight)] of the rarest names in `texts`, best
+    first: capitalised words and codes ("ThinkTank", "Acme", "AB123") found in
+    at most max(NAME_DF_FLOOR, NAME_DF_RATIO of all chunks) chunks, and at
+    least one outside these texts."""
+    store = svc.store
+    tf, in_chunks, shown = scan_names(texts)
     if not tf:
         return []
     total = max(1, store.chunk_total())
-    cap = max(NAME_DF_FLOOR, int(total * NAME_DF_RATIO))
+    cap = name_cap(store)
     # A word the corpus sample sees often is common; skip it before the exact
     # (and, for common words, slow) vocabulary lookup.
     n_sample, sample = _corpus_df(store)

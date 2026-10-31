@@ -166,6 +166,38 @@ CREATE TABLE IF NOT EXISTS file_vectors (
     PRIMARY KEY (workspace_id, filespace, file_id, model)
 );
 CREATE INDEX IF NOT EXISTS file_vectors_seq ON file_vectors (model, seq);
+-- Discovered collections: the locations the owner switched on, and the groups
+-- the engine proposed there. A group's `keys` (its files, JSON) let the next run
+-- recognise it, so a dismissed group stays dismissed and a name is kept.
+CREATE TABLE IF NOT EXISTS discover_scopes (
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    requested_at TEXT,
+    started_at   TEXT,
+    finished_at  TEXT,
+    fv_seq       INTEGER NOT NULL DEFAULT 0,   -- file vectors as of the last run
+    error        TEXT,
+    stats        TEXT,                         -- JSON
+    PRIMARY KEY (workspace_id, filespace)
+);
+CREATE TABLE IF NOT EXISTS discover_groups (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    status       TEXT NOT NULL,     -- proposed | kept | dismissed | merged
+    name         TEXT NOT NULL,
+    named_by     TEXT NOT NULL,     -- auto | ai | you
+    summary      TEXT,
+    score        REAL NOT NULL DEFAULT 0,
+    size         INTEGER NOT NULL,
+    keys         TEXT NOT NULL,     -- JSON [file_id]
+    data         TEXT NOT NULL,     -- JSON: files, names, folders, dates
+    merged_into  TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS discover_groups_scope ON discover_groups (workspace_id, filespace, status, score);
 """
 
 # Keyword index over chunk text (docs: Search quality). External content, so the
@@ -609,6 +641,8 @@ class Store:
             chunks = c.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=?", (ws, fs)).rowcount
             c.execute("DELETE FROM surveys WHERE workspace_id=? AND filespace=?", (ws, fs))
             c.execute("DELETE FROM filespaces WHERE workspace_id=? AND filespace=?", (ws, fs))
+            c.execute("DELETE FROM discover_groups WHERE workspace_id=? AND filespace=?", (ws, fs))
+            c.execute("DELETE FROM discover_scopes WHERE workspace_id=? AND filespace=?", (ws, fs))
             self._fv_drop(c, "workspace_id=? AND filespace=?", (ws, fs))
         self.bump()
         return files, chunks
@@ -1465,3 +1499,117 @@ class Store:
             logger.warning("related match rejected %r: %s", match, e)
             return {}
         return {(r[0], r[1], r[2]): int(r[3]) for r in rows}
+
+    # ------------------------------------------------------------ discovered collections
+    def fv_seq(self) -> int:
+        """The file-vector write counter: it moves whenever a file's meaning changes."""
+        return int(self.scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='fv_seq'") or 0)
+
+    def discover_files(self, ws: str, fs: str) -> list[dict]:
+        """Indexed files of one source (the files discovery groups)."""
+        return self.query(f"SELECT {self._ROW_COLS} FROM files WHERE workspace_id=? AND filespace=? "
+                          "AND status='indexed'", (ws, fs))
+
+    def iter_discover_texts(self, ws: str, fs: str, max_chunks: int,
+                            batch: int = 2000) -> Iterator[tuple[str, list[str]]]:
+        """(file_id, its first `max_chunks` chunk texts) for every file of a source
+        with chunks, on a read-only connection."""
+        with self.reader() as c:
+            cur = c.execute("SELECT file_id, text FROM chunks WHERE workspace_id=? AND filespace=? "
+                            "AND chunk_index < ? ORDER BY file_id, chunk_index", (ws, fs, int(max_chunks)))
+            fid, texts = None, []
+            while True:
+                rows = cur.fetchmany(batch)
+                if not rows:
+                    break
+                for f, t in rows:
+                    if f != fid:
+                        if fid is not None:
+                            yield fid, texts
+                        fid, texts = f, []
+                    texts.append(t)
+            if fid is not None:
+                yield fid, texts
+
+    def shared_hash_files(self, ws: str, fs: str, max_spread: int) -> Iterator[list[str]]:
+        """For each passage found in 2..max_spread files of a source: those file_ids."""
+        with self.reader() as c:
+            cur = c.execute(
+                "SELECT json_group_array(DISTINCT file_id) FROM chunks WHERE workspace_id=? AND filespace=? "
+                "GROUP BY text_hash HAVING COUNT(DISTINCT file_id) BETWEEN 2 AND ?", (ws, fs, int(max_spread)))
+            while True:
+                rows = cur.fetchmany(5000)
+                if not rows:
+                    break
+                for (ids,) in rows:
+                    yield json.loads(ids)
+
+    def distinct_passages(self, ws: str, fs: str) -> dict[str, int]:
+        """{file_id: distinct passages} for a source."""
+        with self.reader() as c:
+            return {f: int(n) for f, n in c.execute(
+                "SELECT file_id, COUNT(DISTINCT text_hash) FROM chunks WHERE workspace_id=? AND filespace=? "
+                "GROUP BY file_id", (ws, fs))}
+
+    def discover_scopes(self) -> list[dict]:
+        return self.query("SELECT * FROM discover_scopes ORDER BY workspace_id, filespace")
+
+    def discover_scope(self, ws: str, fs: str) -> Optional[dict]:
+        return self.one("SELECT * FROM discover_scopes WHERE workspace_id=? AND filespace=?", (ws, fs))
+
+    def discover_request(self, ws: str, fs: str) -> None:
+        """Switch discovery on for a source and ask for a run."""
+        self.execute("INSERT INTO discover_scopes (workspace_id, filespace, enabled, requested_at) VALUES (?, ?, 1, ?) "
+                     "ON CONFLICT (workspace_id, filespace) DO UPDATE SET enabled=1, requested_at=excluded.requested_at",
+                     (ws, fs, now_iso()))
+
+    def discover_disable(self, ws: str, fs: str) -> bool:
+        return self.execute("UPDATE discover_scopes SET enabled=0, requested_at=NULL "
+                            "WHERE workspace_id=? AND filespace=?", (ws, fs)) > 0
+
+    def discover_mark(self, ws: str, fs: str, **fields) -> None:
+        """Update run fields (started_at, finished_at, fv_seq, error, stats, requested_at)."""
+        if "stats" in fields and fields["stats"] is not None:
+            fields["stats"] = json.dumps(fields["stats"])
+        cols = ", ".join(f"{k}=?" for k in fields)
+        self.execute(f"UPDATE discover_scopes SET {cols} WHERE workspace_id=? AND filespace=?",
+                     (*fields.values(), ws, fs))
+
+    def discover_group_rows(self, ws: Optional[str] = None, fs: Optional[str] = None,
+                            statuses: Optional[Iterable[str]] = None) -> list[dict]:
+        where, args = ["1=1"], []
+        if ws is not None:
+            where.append("workspace_id=?")
+            args.append(ws)
+        if fs is not None:
+            where.append("filespace=?")
+            args.append(fs)
+        if statuses is not None:
+            st = list(statuses)
+            where.append(f"status IN ({','.join('?' * len(st))})")
+            args += st
+        return self.query(f"SELECT * FROM discover_groups WHERE {' AND '.join(where)} "
+                          "ORDER BY score DESC, id", args)
+
+    def discover_group_row(self, gid: str) -> Optional[dict]:
+        return self.one("SELECT * FROM discover_groups WHERE id=?", (gid,))
+
+    _GROUP_COLS = ("id", "workspace_id", "filespace", "status", "name", "named_by", "summary", "score", "size",
+                   "keys", "data", "merged_into", "created_at", "updated_at")
+
+    def discover_save(self, ws: str, fs: str, groups: list[dict], drop: Iterable[str] = ()) -> None:
+        """Write (insert or replace) groups and delete `drop`, in one transaction."""
+        with self.tx() as c:
+            drop = list(drop)
+            for i in range(0, len(drop), 500):
+                part = drop[i:i + 500]
+                c.execute(f"DELETE FROM discover_groups WHERE id IN ({','.join('?' * len(part))})", part)
+            c.executemany(
+                f"INSERT OR REPLACE INTO discover_groups ({', '.join(self._GROUP_COLS)}) "
+                f"VALUES ({', '.join('?' * len(self._GROUP_COLS))})",
+                [tuple(g.get(k) for k in self._GROUP_COLS) for g in groups])
+
+    def discover_update(self, gid: str, **fields) -> bool:
+        fields["updated_at"] = now_iso()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        return self.execute(f"UPDATE discover_groups SET {cols} WHERE id=?", (*fields.values(), gid)) > 0

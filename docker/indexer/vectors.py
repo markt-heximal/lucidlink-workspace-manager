@@ -217,6 +217,16 @@ class FileIndex:
         with self._lock:
             return int(self._valid[:len(self._keys)].sum())
 
+    def vectors(self, keys: list[tuple[str, str, str]]) -> tuple[list[int], np.ndarray]:
+        """(positions in `keys` that have a vector, their vectors as a float16 copy)."""
+        self.refresh()
+        with self._lock:
+            have = [(i, self._row[k]) for i, k in enumerate(keys)
+                    if k in self._row and self._valid[self._row[k]]]
+            if not have or self._mat is None:
+                return [], np.zeros((0, 0), dtype=np.float16)
+            return [i for i, _ in have], self._mat[np.array([r for _, r in have], dtype=np.int64)]
+
     def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
                block: int = 20000) -> list[tuple[tuple[str, str, str], float]]:
         """[((ws, fs, file_id), similarity)], best first."""
