@@ -31,6 +31,7 @@ from .config import Config
 from .folders import FolderError
 from .embedder import EmbedError
 from .llm import LLMError, LLMUnavailable
+from .related import K as RELATED_K, K_MAX as RELATED_K_MAX
 from .search import COLLECTION_K, COLLECTION_K_MAX, MAX_FILE_REFS
 from .service import IndexerService, NotFound
 
@@ -125,6 +126,15 @@ class CollectionBody(BaseModel):
     pinned: list[FileRef] = Field(default_factory=list, max_length=MAX_FILE_REFS)
     excluded: list[FileRef] = Field(default_factory=list, max_length=MAX_FILE_REFS)
     k: int = Field(default=COLLECTION_K, ge=1, le=COLLECTION_K_MAX)
+
+
+class RelatedBody(BaseModel):
+    workspaceId: Optional[str] = None
+    filespace: str = Field(min_length=1)
+    path: str = Field(pattern=r"^/")
+    k: int = Field(default=RELATED_K, ge=1, le=RELATED_K_MAX)
+    # Where related files may live (null = every enabled location).
+    scope: Optional[CollectionScope] = None
 
 
 def _refs(files: Optional[list[FileRef]]) -> Optional[list[dict]]:
@@ -232,6 +242,13 @@ def collection_files(body: CollectionBody, svc: IndexerService = Depends(_servic
     return svc.collection_files(body.query, body.mode, _filters(body.filters),
                                 body.scope.model_dump() if body.scope else None,
                                 _refs(body.pinned), _refs(body.excluded), body.k)
+
+
+@router.post("/related")
+def related(body: RelatedBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
+    """Versions, shared names, similar meaning and references of one file (docs: Related files); 404 if unknown."""
+    return svc.related(_ws(body.workspaceId, x_ws), body.filespace, body.path, body.k,
+                       body.scope.model_dump() if body.scope else None)
 
 
 @router.get("/find")

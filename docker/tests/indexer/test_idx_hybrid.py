@@ -237,6 +237,7 @@ def test_find_fold_columns_follow_renames_and_migrate(make_service, tmp_path):
     c = sqlite3.connect(db)
     c.execute("DROP TRIGGER files_fold_ai")
     c.execute("DROP TRIGGER files_fold_au")
+    c.execute("DROP INDEX files_name_fold")
     c.execute("ALTER TABLE files DROP COLUMN name_fold")
     c.execute("ALTER TABLE files DROP COLUMN path_fold")
     c.commit()

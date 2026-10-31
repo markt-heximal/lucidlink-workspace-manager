@@ -30,7 +30,8 @@ from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
 from .source import SdkSourceProvider, SettingsProvider, SourceProvider, VaultSettings
 from .store import FILE_ORDER, Store, fold_name, now_iso
-from .vectors import LocalIndex, RuvectorMirror, Scope, VectorService
+from . import related as related_mod
+from .vectors import FileIndex, LocalIndex, RuvectorMirror, Scope, VectorService
 from .worker import Scheduler, iso
 
 logger = logging.getLogger("indexer.service")
@@ -49,6 +50,8 @@ DAY = 86400.0
 # GET /index/profile age buckets: (key, max age in days), exclusive, oldest last.
 AGE_BUCKETS = (("7d", 7), ("30d", 30), ("90d", 90), ("older", None))
 LARGEST_FOLDERS = 10
+# Related files: seconds between passes of the file-vector builder.
+FILE_VECTOR_INTERVAL = 60.0
 
 
 def mtime_seconds(v: Optional[int]) -> Optional[float]:
@@ -167,7 +170,11 @@ class IndexerService:
             mirror = RuvectorMirror(config.ruvector_url, config.ruvector_api_key, self.store,
                                     self.embedder.model, lambda: self.embedder.dim,
                                     transport=ruvector_transport)
-        self.vectors = VectorService(self.store, LocalIndex(self.store, self.embedder.model), mirror)
+        self.vectors = VectorService(self.store, LocalIndex(self.store, self.embedder.model,
+                                                            config.local_index_max_points), mirror)
+        self.file_index = FileIndex(self.store, self.embedder.model)
+        # True once a pass of the file-vector builder found nothing left to do.
+        self.file_vectors_ready = False
         self.scheduler = Scheduler(self)
         # Block keys get a LocalSource; everything else the filespace provider
         # (looked up per lease, so `self.sources` can be swapped in tests).
@@ -179,6 +186,58 @@ class IndexerService:
     def start(self) -> None:
         self.scheduler.start()
         self._start_fts_backfill()
+        self._start_file_vectors()
+
+    def build_file_vectors(self, batch: int = 200, pause: float = 0.0,
+                           stop: Optional[threading.Event] = None) -> int:
+        """One pass of the file-vector builder (Related files): every indexed file
+        without a file vector gets the mean of its chunk vectors, from the
+        embeddings cache (nothing is read or embedded again). Returns files done."""
+        model = self.embedder.model
+        done = 0
+        for r in self.store.filespace_rows():
+            ws, fs = r["workspace_id"], r["filespace"]
+            # Files with no chunk vector yet (embedding pending) stay in the todo
+            # list; skip them for the rest of this pass.
+            failed: set[str] = set()
+            while not (stop is not None and stop.is_set()):
+                todo = [fid for fid in self.store.file_vector_todo(ws, fs, model, batch + len(failed))
+                        if fid not in failed][:batch]
+                if not todo:
+                    break
+                means = self.store.file_mean_vectors(ws, fs, todo, model)
+                failed |= {fid for fid in todo if fid not in means}
+                items = [(ws, fs, fid, n, v) for fid, (v, n) in means.items()]
+                self.store.put_file_vectors(model, items)
+                done += len(items)
+                if pause:
+                    (stop.wait(pause) if stop is not None else time.sleep(pause))
+        if not (stop is not None and stop.is_set()):
+            self.file_vectors_ready = done == 0 or self.file_vectors_ready
+        return done
+
+    def _start_file_vectors(self) -> None:
+        """Keep file vectors current in the background (low priority: short
+        batches with pauses; a pass every FILE_VECTOR_INTERVAL seconds)."""
+        self._fv_stop = threading.Event()
+
+        def run():
+            t0 = time.monotonic()
+            first = True
+            while not self._fv_stop.is_set():
+                try:
+                    n = self.build_file_vectors(pause=0.25, stop=self._fv_stop)
+                    if first and not self._fv_stop.is_set():
+                        logger.info("related files: %d file vectors built (%.0fs)", n, time.monotonic() - t0)
+                        first = False
+                    self.file_index.refresh()
+                    self.store.chunk_total(ttl=240.0)     # keep the count off the request path
+                except Exception:
+                    logger.exception("related files: file vector pass failed")
+                self._fv_stop.wait(FILE_VECTOR_INTERVAL)
+
+        self._fv_thread = threading.Thread(target=run, name="indexer-file-vectors", daemon=True)
+        self._fv_thread.start()
 
     def _start_fts_backfill(self) -> None:
         """Build the keyword index for chunks that predate it, in the background
@@ -205,6 +264,10 @@ class IndexerService:
         if stop is not None:
             stop.set()
             self._fts_thread.join(10)
+        stop = getattr(self, "_fv_stop", None)
+        if stop is not None:
+            stop.set()
+            self._fv_thread.join(10)
         self.scheduler.stop()
         self.sources.close()
         self.store.close()
@@ -341,6 +404,7 @@ class IndexerService:
             "filespaces": [self.filespace_status(ws, fs, ctl, totals) for ws, fs in self.scheduler.targets()],
             "embedder": self.embedder.status(),
             "vectorStore": self.vectors.status(),
+            "relatedFiles": {"fileVectors": self.file_index.count(), "ready": self.file_vectors_ready},
             "blockSources": list(self.scheduler.block_sources),
             "engine": self.engine_info(),
             "settings": {"ok": self.scheduler.settings_error is None, "error": self.scheduler.settings_error},
@@ -673,6 +737,19 @@ class IndexerService:
                          excluded: Optional[list[dict]] = None, k: int = search_mod.COLLECTION_K) -> dict:
         """A collection's current members (docs: Collections)."""
         return search_mod.collection_files(self, query, mode, filters, scope, pinned, excluded, k)
+
+    def related(self, workspace_id: Optional[str], filespace: str, path: str, k: int = related_mod.K,
+                scope: Optional[dict] = None) -> dict:
+        """Related files for one file (docs: Related files). NotFound when it is not in the ledger."""
+        with self.store.read_view():       # many reads; never queue behind indexing
+            ws = self.resolve_workspace(workspace_id)
+            scopes = self.scopes("*", None) if scope is None else self.scopes(scope.get("workspaceId"),
+                                                                              scope.get("filespace") or None)
+            rows = self.store.live_files_at_path(ws, filespace, path) if ws else []
+            if not rows:
+                raise NotFound("file not found in the index")
+            row = max(rows, key=lambda r: r["mtime"] or 0)
+            return related_mod.related(self, row, scopes | {(row["workspace_id"], row["filespace"])}, k)
 
     def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
         """Most recently changed files, newest first (see recent_page)."""

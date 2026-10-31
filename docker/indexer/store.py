@@ -18,9 +18,11 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Iterable, Iterator, Optional
+from urllib.parse import quote
 
 import numpy as np
 
@@ -149,6 +151,21 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+-- Related files: one meaning vector per indexed file (the normalised mean of its
+-- chunk vectors), built in the background from the embeddings cache. `seq` grows
+-- with every write, so the in-memory file index loads only what changed. A row
+-- whose file's chunks changed is dropped to vector NULL (a new seq) and rebuilt.
+CREATE TABLE IF NOT EXISTS file_vectors (
+    workspace_id TEXT NOT NULL,
+    filespace    TEXT NOT NULL,
+    file_id      TEXT NOT NULL,
+    model        TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    chunks       INTEGER NOT NULL DEFAULT 0,
+    vector       BLOB,               -- float32, L2-normalised; NULL = dropped
+    PRIMARY KEY (workspace_id, filespace, file_id, model)
+);
+CREATE INDEX IF NOT EXISTS file_vectors_seq ON file_vectors (model, seq);
 """
 
 # Keyword index over chunk text (docs: Search quality). External content, so the
@@ -256,7 +273,9 @@ class Store:
     def __init__(self, path: str):
         if path != ":memory:":
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        self.path = path
         self._lock = threading.RLock()
+        self._local = threading.local()    # read_view: a thread's private read connection
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -264,6 +283,7 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
+        self._fts_done = False
         self.fts_available = self._init_fts()
         self._generation = 0
 
@@ -294,6 +314,8 @@ class Store:
             self._conn.execute(f"UPDATE files SET name_fold={NAME_NORM_SQL}, path_fold={PATH_NORM_SQL}")
         for stmt in _split_sql(FOLD_TRIGGERS):
             self._conn.execute(stmt)
+        # Related files: "this file names report.pdf" looks names up exactly.
+        self._conn.execute("CREATE INDEX IF NOT EXISTS files_name_fold ON files (name_fold)")
 
     def _init_fts(self) -> bool:
         """Create the keyword index if this SQLite has FTS5; False disables keyword search."""
@@ -332,9 +354,12 @@ class Store:
         """Keyword search usable: FTS5 present and every chunk is in the index."""
         if not self.fts_available:
             return False
+        if self._fts_done:                 # once built it stays built (fts_rebuild resets this)
+            return True
         with self._lock:
             lo, hi = self.fts_hole()
-        return lo >= hi
+        self._fts_done = lo >= hi
+        return self._fts_done
 
     def fts_backfill_step(self, batch: int = FTS_BACKFILL_BATCH) -> bool:
         """Index the next `batch` pre-existing chunks; True once none are left.
@@ -382,6 +407,7 @@ class Store:
             return
         with self.tx() as c:
             hi = c.execute("SELECT COALESCE(MAX(point_id), 0) FROM chunks").fetchone()[0]
+            self._fts_done = False
             c.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('delete-all')")
             c.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (("fts_lo", "0"), ("fts_hi", str(hi))))
         self.bump()
@@ -411,18 +437,60 @@ class Store:
                 raise
             self._conn.execute("COMMIT")
 
+    @contextmanager
+    def reader(self) -> Iterator[sqlite3.Connection]:
+        """A read-only connection for long scans, so they never hold the shared
+        lock (WAL readers do not block the writer). An in-memory database has
+        no second connection: its scans run on the shared one, under the lock."""
+        if self.path == ":memory:":
+            with self._lock:
+                yield self._conn
+            return
+        conn = sqlite3.connect(f"file:{quote(os.path.abspath(self.path))}?mode=ro", uri=True,
+                               check_same_thread=False)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def read_view(self) -> Iterator[None]:
+        """Run this thread's query/one/scalar on a private read-only connection
+        until the block ends: long read-only work (Related files) then neither
+        waits behind indexing for the shared lock nor holds it up."""
+        if self.path == ":memory:" or getattr(self._local, "conn", None) is not None:
+            yield
+            return
+        with self.reader() as conn:
+            conn.row_factory = sqlite3.Row
+            self._local.conn = conn
+            try:
+                yield
+            finally:
+                self._local.conn = None
+
+    @contextmanager
+    def _cursor(self) -> Iterator[sqlite3.Connection]:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            yield conn
+        else:
+            with self._lock:
+                yield self._conn
+
     def query(self, sql: str, args: Iterable = ()) -> list[dict]:
-        with self._lock:
-            return [dict(r) for r in self._conn.execute(sql, tuple(args)).fetchall()]
+        with self._cursor() as c:
+            return [dict(r) for r in c.execute(sql, tuple(args)).fetchall()]
 
     def one(self, sql: str, args: Iterable = ()) -> Optional[dict]:
-        with self._lock:
-            r = self._conn.execute(sql, tuple(args)).fetchone()
+        with self._cursor() as c:
+            r = c.execute(sql, tuple(args)).fetchone()
             return dict(r) if r else None
 
     def scalar(self, sql: str, args: Iterable = ()):
-        with self._lock:
-            r = self._conn.execute(sql, tuple(args)).fetchone()
+        with self._cursor() as c:
+            r = c.execute(sql, tuple(args)).fetchone()
             return r[0] if r else None
 
     def execute(self, sql: str, args: Iterable = ()) -> int:
@@ -512,6 +580,8 @@ class Store:
                     continue
                 self.purge_source(target, fs)       # this copy wins; make room for it
             with self.tx() as c:
+                # File vectors are rebuilt under the new workspace (cheap: no re-embedding).
+                self._fv_drop(c, "workspace_id=? AND filespace=?", (ws, fs))
                 for table in ("files", "chunks", "surveys"):
                     c.execute(f"UPDATE {table} SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
                 c.execute("UPDATE filespaces SET workspace_id=? WHERE workspace_id=? AND filespace=?", (target, ws, fs))
@@ -539,6 +609,7 @@ class Store:
             chunks = c.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=?", (ws, fs)).rowcount
             c.execute("DELETE FROM surveys WHERE workspace_id=? AND filespace=?", (ws, fs))
             c.execute("DELETE FROM filespaces WHERE workspace_id=? AND filespace=?", (ws, fs))
+            self._fv_drop(c, "workspace_id=? AND filespace=?", (ws, fs))
         self.bump()
         return files, chunks
 
@@ -880,7 +951,8 @@ class Store:
         top = self.scalar("SELECT COALESCE(MAX(point_id), 0) FROM chunks") or 0
         if not top:
             return []
-        ids = sorted(set(random.Random(seed).randrange(1, top + 1) for _ in range(n)))
+        rng = random.Random(seed)
+        ids = sorted({rng.randrange(1, top + 1) for _ in range(n)})
         out: list[str] = []
         for i in range(0, len(ids), 500):
             part = ids[i:i + 500]
@@ -1028,13 +1100,18 @@ class Store:
             for old in existing.values():
                 c.execute("DELETE FROM chunks WHERE point_id=?", (old["point_id"],))
                 written += 1
+            if written:
+                self._fv_drop(c, "workspace_id=? AND filespace=? AND file_id=?", (ws, fs, file_id))
         if written:
             self.bump()
         return written
 
     def delete_file_chunks(self, ws: str, fs: str, file_id: str) -> int:
-        n = self.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=? AND file_id=?",
-                         (ws, fs, file_id))
+        with self.tx() as c:
+            n = c.execute("DELETE FROM chunks WHERE workspace_id=? AND filespace=? AND file_id=?",
+                          (ws, fs, file_id)).rowcount
+            if n:
+                self._fv_drop(c, "workspace_id=? AND filespace=? AND file_id=?", (ws, fs, file_id))
         if n:
             self.bump()
         return n
@@ -1137,6 +1214,7 @@ class Store:
                       (new_id, ws, fs, old_id))
             c.execute("UPDATE chunks SET file_id=? WHERE workspace_id=? AND filespace=? AND file_id=?",
                       (new_id, ws, fs, old_id))
+            self._fv_drop(c, "workspace_id=? AND filespace=? AND file_id=?", (ws, fs, old_id))
 
     def mirror_forget_file(self, ws: str, fs: str, file_id: str) -> None:
         """Make a file's live points look unmirrored so metadata is re-upserted."""
@@ -1152,3 +1230,238 @@ class Store:
 
     def live_point_ids(self, point_ids: list[int]) -> set[int]:
         return set(self.chunk_rows(point_ids).keys())
+
+    # ------------------------------------------------------------ vector scans
+    def chunk_total(self, ttl: float = 900.0) -> int:
+        """Chunk count, cached for `ttl` seconds (COUNT(*) takes 1–4 s on a million
+        chunks); a small count, cheap to take, is re-taken on any change. The
+        file-vector builder refreshes it every few minutes (ttl=240), so a
+        request rarely pays for the count."""
+        now = time.monotonic()
+        cached = getattr(self, "_chunk_total", None)
+        if (cached is None or now - cached[0] > ttl
+                or (cached[2] != self._generation and cached[1] < 100_000)):
+            with self.read_view():          # a long count must not hold the shared lock
+                n = self.chunk_count()
+            cached = (now, n, self._generation)
+            self._chunk_total = cached
+        return cached[1]
+
+    def iter_chunk_vectors(self, model: str, scopes: Optional[Iterable[tuple[str, str]]] = None,
+                           path_prefix: Optional[str] = None, point_ids: Optional[Iterable[int]] = None,
+                           batch: int = 20000) -> Iterator[tuple[np.ndarray, np.ndarray]]:
+        """(point ids, vectors) of live chunks in batches, on a read connection:
+        an exact vector search over any number of chunks in bounded memory.
+        `point_ids`: only those chunks (in batches of 500 ids)."""
+        base = ("SELECT c.point_id, e.vector FROM chunks c JOIN embeddings e ON e.model=? AND e.text_hash=c.text_hash "
+                "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace AND f.file_id=c.file_id "
+                "WHERE f.status != 'deleted'")
+        where, args = "", []
+        if scopes is not None:
+            scopes = sorted(set(scopes))
+            if not scopes:
+                return
+            where, args = self._scope_sql(scopes, path_prefix)
+            where = " AND " + where
+        elif path_prefix and path_prefix != "/":
+            p = path_prefix.rstrip("/")
+            where, args = " AND (f.path = ? OR f.path LIKE ? ESCAPE '\\')", [p, like_escape(p) + "/%"]
+        if point_ids is not None:
+            ids = sorted(set(int(p) for p in point_ids))
+            parts = [(f" AND c.point_id IN ({','.join('?' * len(ids[i:i + 500]))})", ids[i:i + 500])
+                     for i in range(0, len(ids), 500)]
+        else:
+            parts = [("", [])]
+        with self.reader() as conn:
+            for psql, pargs in parts:
+                cur = conn.execute(base + where + psql, (model, *args, *pargs))
+                while True:
+                    rows = cur.fetchmany(batch)
+                    if not rows:
+                        break
+                    dims = {len(r[1]) for r in rows}
+                    dim = max(dims, key=[len(r[1]) for r in rows].count) if len(dims) > 1 else dims.pop()
+                    rows = [r for r in rows if len(r[1]) == dim]
+                    yield (np.fromiter((r[0] for r in rows), dtype=np.int64, count=len(rows)),
+                           np.frombuffer(b"".join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), -1))
+
+    # ------------------------------------------------------------ file vectors
+    def _fv_drop(self, c: sqlite3.Connection, where: str, args: Iterable) -> None:
+        """Drop file vectors matching `where` (vector NULL under a new seq), so the
+        file index forgets them and the builder makes them again."""
+        args = tuple(args)
+        if c.execute(f"SELECT 1 FROM file_vectors WHERE vector IS NOT NULL AND {where} LIMIT 1", args).fetchone():
+            c.execute(f"UPDATE file_vectors SET vector=NULL, chunks=0, seq=? WHERE vector IS NOT NULL AND {where}",
+                      (self._fv_next_seq(c), *args))
+
+    @staticmethod
+    def _fv_next_seq(c: sqlite3.Connection) -> int:
+        c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('fv_seq', '0')")
+        c.execute("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key='fv_seq'")
+        return int(c.execute("SELECT value FROM meta WHERE key='fv_seq'").fetchone()[0])
+
+    def file_vector_todo(self, ws: str, fs: str, model: str, limit: int = 200) -> list[str]:
+        """file_ids of indexed files (with chunks) in a source that have no file vector."""
+        return [r["file_id"] for r in self.query(
+            "SELECT f.file_id FROM files f WHERE f.workspace_id=? AND f.filespace=? AND f.status='indexed' "
+            "AND f.chunk_count > 0 AND NOT EXISTS (SELECT 1 FROM file_vectors v WHERE v.workspace_id=f.workspace_id "
+            "AND v.filespace=f.filespace AND v.file_id=f.file_id AND v.model=? AND v.vector IS NOT NULL) LIMIT ?",
+            (ws, fs, model, int(limit)))]
+
+    def file_mean_vector(self, ws: str, fs: str, file_id: str, model: str) -> Optional[tuple[np.ndarray, int]]:
+        """(normalised mean of the file's chunk vectors, chunks used), None when it has none."""
+        rows = self.query("SELECT e.vector FROM chunks c JOIN embeddings e ON e.model=? AND e.text_hash=c.text_hash "
+                          "WHERE c.workspace_id=? AND c.filespace=? AND c.file_id=?", (model, ws, fs, file_id))
+        vecs = [blob_to_vec(r["vector"]) for r in rows]
+        if not vecs:
+            return None
+        dim = max(set(len(v) for v in vecs), key=[len(v) for v in vecs].count)
+        mean = np.mean([v for v in vecs if len(v) == dim], axis=0)
+        norm = float(np.linalg.norm(mean))
+        if norm == 0.0:
+            return None
+        return (mean / norm).astype(np.float32), len(vecs)
+
+    def file_mean_vectors(self, ws: str, fs: str, file_ids: list[str],
+                          model: str) -> dict[str, tuple[np.ndarray, int]]:
+        """file_mean_vector for many files of one source in one query, on a read
+        connection (the builder must not queue behind indexing for every file)."""
+        if not file_ids:
+            return {}
+        vecs: dict[str, list[np.ndarray]] = {}
+        with self.reader() as conn:
+            for i in range(0, len(file_ids), 300):
+                part = file_ids[i:i + 300]
+                for fid, blob in conn.execute(
+                        "SELECT c.file_id, e.vector FROM chunks c JOIN embeddings e ON e.model=? "
+                        "AND e.text_hash=c.text_hash WHERE c.workspace_id=? AND c.filespace=? "
+                        f"AND c.file_id IN ({','.join('?' * len(part))})", (model, ws, fs, *part)):
+                    vecs.setdefault(fid, []).append(blob_to_vec(blob))
+        out = {}
+        for fid, vs in vecs.items():
+            dim = max(set(len(v) for v in vs), key=[len(v) for v in vs].count)
+            mean = np.mean([v for v in vs if len(v) == dim], axis=0)
+            norm = float(np.linalg.norm(mean))
+            if norm:
+                out[fid] = ((mean / norm).astype(np.float32), len(vs))
+        return out
+
+    def put_file_vectors(self, model: str, items: list[tuple[str, str, str, int, np.ndarray]]) -> None:
+        """Write [(ws, fs, file_id, chunks, vector)] under one new seq."""
+        if not items:
+            return
+        with self.tx() as c:
+            seq = self._fv_next_seq(c)
+            c.executemany("INSERT OR REPLACE INTO file_vectors (workspace_id, filespace, file_id, model, seq, chunks, "
+                          "vector) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          [(ws, fs, fid, model, seq, n, vec_to_blob(v)) for ws, fs, fid, n, v in items])
+
+    def get_file_vector(self, ws: str, fs: str, file_id: str, model: str) -> Optional[np.ndarray]:
+        r = self.one("SELECT vector FROM file_vectors WHERE workspace_id=? AND filespace=? AND file_id=? AND model=? "
+                     "AND vector IS NOT NULL", (ws, fs, file_id, model))
+        return blob_to_vec(r["vector"]) if r else None
+
+    def iter_file_vectors(self, model: str, after_seq: int, batch: int = 5000) -> Iterator[list[tuple]]:
+        """File vector rows written after `after_seq`, oldest first, in batches of
+        (workspace_id, filespace, file_id, seq, vector|None)."""
+        with self.reader() as conn:
+            cur = conn.execute("SELECT workspace_id, filespace, file_id, seq, vector FROM file_vectors "
+                               "WHERE model=? AND seq > ? ORDER BY seq", (model, int(after_seq)))
+            while True:
+                rows = cur.fetchmany(batch)
+                if not rows:
+                    return
+                yield [tuple(r) for r in rows]
+
+    # ------------------------------------------------------------ related files
+    def live_rows(self, keys: Iterable[tuple[str, str, str]]) -> dict[tuple[str, str, str], dict]:
+        """Ledger rows of live files by (workspace_id, filespace, file_id)."""
+        keys = sorted(set(keys))
+        out: dict[tuple[str, str, str], dict] = {}
+        for i in range(0, len(keys), 300):
+            part = keys[i:i + 300]
+            for r in self.query(
+                    "SELECT workspace_id, filespace, file_id, path, size, mtime, status, chunk_count FROM files "
+                    "WHERE status != 'deleted' AND (workspace_id, filespace, file_id) IN (VALUES "
+                    + ",".join("(?, ?, ?)" for _ in part) + ")", [x for k in part for x in k]):
+                out[(r["workspace_id"], r["filespace"], r["file_id"])] = r
+        return out
+
+    _ROW_COLS = "workspace_id, filespace, file_id, path, size, mtime, status, chunk_count"
+
+    def files_name_containing(self, scopes: Iterable[tuple[str, str]], needle: str, limit: int) -> list[dict]:
+        """Live files in `scopes` whose folded name contains `needle` (version
+        candidates), at most `limit`. One scan of the name index (~0.1 s per
+        700k files; per-scope table scans took seconds), then those rows."""
+        ids = [r["rowid"] for r in self.query(
+            "SELECT rowid FROM files INDEXED BY files_name_fold WHERE instr(name_fold, ?) > 0", (needle,))]
+        scopes = set(scopes)
+        out: list[dict] = []
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            out += [r for r in self.query(f"SELECT {self._ROW_COLS} FROM files WHERE rowid IN "
+                                          f"({','.join('?' * len(part))}) AND status != 'deleted'", part)
+                    if (r["workspace_id"], r["filespace"]) in scopes]
+            if len(out) >= limit:
+                break
+        return out[:limit]
+
+    def files_named(self, folds: Iterable[str]) -> list[dict]:
+        """Live files whose folded name is one of `folds` (any location)."""
+        folds = sorted(set(f for f in folds if f))
+        out: list[dict] = []
+        for i in range(0, len(folds), 300):
+            part = folds[i:i + 300]
+            out += self.query(f"SELECT {self._ROW_COLS}, name_fold FROM files WHERE status != 'deleted' "
+                              f"AND name_fold IN ({','.join('?' * len(part))})", part)
+        return out
+
+    def shared_passages(self, ws: str, fs: str, file_id: str, max_spread: int = 20,
+                        limit: int = 500) -> tuple[int, dict[tuple[str, str, str], int]]:
+        """(this file's distinct passages, {other file: passages it shares}). A
+        passage found in more than `max_spread` chunks (a disclaimer, a letterhead)
+        says nothing about versions and is ignored."""
+        mine = [r["text_hash"] for r in self.query(
+            "SELECT DISTINCT text_hash FROM chunks WHERE workspace_id=? AND filespace=? AND file_id=?", (ws, fs, file_id))]
+        out: dict[tuple[str, str, str], int] = {}
+        for i in range(0, len(mine), 300):
+            part = mine[i:i + 300]
+            marks = ",".join("?" * len(part))
+            rare = [r["text_hash"] for r in self.query(
+                f"SELECT text_hash FROM chunks WHERE text_hash IN ({marks}) GROUP BY text_hash "
+                f"HAVING COUNT(*) <= ?", (*part, int(max_spread) + 1))]
+            if not rare:
+                continue
+            for r in self.query(
+                    "SELECT c.workspace_id, c.filespace, c.file_id, COUNT(DISTINCT c.text_hash) AS n FROM chunks c "
+                    f"WHERE c.text_hash IN ({','.join('?' * len(rare))}) AND NOT (c.workspace_id=? AND c.filespace=? "
+                    "AND c.file_id=?) GROUP BY c.workspace_id, c.filespace, c.file_id LIMIT ?",
+                    (*rare, ws, fs, file_id, int(limit))):
+                key = (r["workspace_id"], r["filespace"], r["file_id"])
+                out[key] = out.get(key, 0) + r["n"]
+        return len(mine), out
+
+    def file_texts(self, ws: str, fs: str, file_id: str, limit: int = 200) -> list[str]:
+        return [r["text"] for r in self.query(
+            "SELECT text FROM chunks WHERE workspace_id=? AND filespace=? AND file_id=? ORDER BY chunk_index LIMIT ?",
+            (ws, fs, file_id, int(limit)))]
+
+    def match_files(self, scopes: Iterable[tuple[str, str]], match: str,
+                    limit: int = 300) -> dict[tuple[str, str, str], int]:
+        """{live file: its first chunk point id matching the FTS5 query `match`}, over at most `limit` chunks."""
+        scopes = sorted(set(scopes))
+        if not scopes or not match or not self.fts_ready:
+            return {}
+        where, args = self._scope_sql(scopes, None)
+        sql = ("SELECT c.workspace_id, c.filespace, c.file_id, MIN(c.point_id) AS pid FROM "
+               "(SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT ?) m "
+               "JOIN chunks c ON c.point_id = m.rowid "
+               "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace AND f.file_id=c.file_id "
+               f"WHERE f.status != 'deleted' AND {where} GROUP BY c.workspace_id, c.filespace, c.file_id")
+        try:
+            with self._cursor() as c:
+                rows = c.execute(sql, (match, int(limit), *args)).fetchall()
+        except sqlite3.OperationalError as e:
+            logger.warning("related match rejected %r: %s", match, e)
+            return {}
+        return {(r[0], r[1], r[2]): int(r[3]) for r in rows}

@@ -47,6 +47,7 @@ service's global `_registry_lock` and UI requests never wait on a crawl.
 | `INDEX_MAX_FILE_BYTES` | indexer | Skip larger files. Default 25 MB. |
 | `LUCIDLINK_CACHE_DATA_GB`, `LUCIDLINK_CACHE_METADATA_GB` | both | SDK cache maximums per linked filespace, in GiB. Default 5 and 1 (see "SDK notes"). |
 | `INDEX_JOB_BUDGET_SEC` | indexer | Seconds one job may index before yielding its slot, so a huge filespace takes turns with the rest. Default 120. |
+| `LOCAL_INDEX_MAX_POINTS` | indexer | Local vector search keeps every chunk vector in memory up to this many chunks (~3 KB each at 768 dimensions); above it, it streams them from SQLite in batches. Default 250000. |
 
 ## Owner auth (Option A: existing Supabase sign-in)
 
@@ -126,12 +127,13 @@ active workspace.
 
 | Method | Path | Body / query | Result |
 |---|---|---|---|
-| GET | `/index/status` | — | `{"filespaces": [FilespaceStatus], "embedder": {"model", "dim", "ok", "error"}, "vectorStore": {"backend": "ruvector"\|"local", "ok", "points", "error"}}` |
+| GET | `/index/status` | — | `{"filespaces": [FilespaceStatus], "embedder": {"model", "dim", "ok", "error"}, "vectorStore": {"backend": "ruvector"\|"local", "ok", "points", "error"}, "relatedFiles": {"fileVectors", "ready"}}` |
 | POST | `/index/sync` | `{"workspaceId"?, "filespace"?}` | 202 `{"queued": [{"workspaceId","filespace"}]}` |
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
 | POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?, "mode"?: "all"\|"meaning"\|"keyword", "filters"?: {…}}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}], "files", "total", "counts", "refinements"}` — hybrid ranked (meaning + keywords + names); see "Search quality" and "All search" |
 | GET | `/index/recent` | `?workspaceId&filespace&limit=20&kind=&change=&since=&before=` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace; `kind` as `/index/bykind`, `change` a comma list of new\|modified\|renamed\|deleted, `since` ≤ `when` < `before` (ISO); unknown kind/change or a bad time → 400; see What's new) | `{"files": [RecentFile], "next": ISO\|null}`, newest `when` first; pass `next` as `before` for the next page (ties on `when` stay on one page) |
+| POST | `/index/related` | `{"workspaceId"?, "filespace", "path", "k"?: 10, "scope"?: {"workspaceId","filespace"?}\|null}` | versions, shared names, similar meaning and references of one file; see "Related files (Collections step 2)"; 404 when the file is not in the ledger |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
 | POST | `/index/survey` | `{"workspaceId"?, "filespace", "scope"?: "/"}` | regenerate now, same shape |
@@ -293,8 +295,17 @@ never read. Hints for a path inside a package apply to the package.
 - `files.name_fold` / `files.path_fold` — folded name and path for find
 - `embeddings(model, text_hash, dim, vector BLOB)` — the embedding cache
 - `surveys(workspace_id, filespace, scope, payload, generated_at, stale)`
+- `file_vectors(workspace_id, filespace, file_id, model, seq, chunks, vector)` —
+  one meaning vector per indexed file, for Related files (see there)
+- `files.name_fold` is indexed (`files_name_fold`) for Related files' exact name lookups
 
-Search always works from SQLite (numpy brute force; fine at personal scale).
+Search always works from SQLite (numpy brute force). Up to
+`LOCAL_INDEX_MAX_POINTS` chunks (default 250,000) the vectors are held in one
+in-memory matrix; above that (the Mini's 1.6 million chunks would be ~5 GB) the
+local search streams them from SQLite in batches of 20,000 on a read-only
+connection, so memory stays bounded and indexing is not blocked. A search
+limited to some files (a collection, `files: [...]`) always streams just those
+files' vectors and never loads the matrix.
 When `RUVECTOR_URL` is set, Ruvector is a mirror used to accelerate search:
 
 - Collection `ll_<model-slug>_<dim>`, cosine. `POST /collections`,
@@ -976,6 +987,98 @@ location, path, name, size, mtime, type, score, why, snippets`).
 
 The collection page and "Ask this collection" use this: Ask sends the member
 refs as `files`.
+
+### Related files (Collections step 2)
+
+Every open file gets a Related panel: `POST /index/related`.
+
+Request: `{"workspaceId"?, "filespace", "path", "k": 10, "scope": null}`
+(`k` 1–50 per group, else 422; `path` must start with `/`; `scope` null =
+every enabled location, else `{"workspaceId", "filespace"?}` like a
+collection's scope; the file's own location is always included). 404 when no
+live file is at that path.
+
+Response:
+
+```
+{"file": RelatedFile + "indexed": bool,
+ "versions":   [RelatedFile + "version": {"byName": bool, "shared": 0–1}],
+ "names":      {"terms": ["ThinkTank", "Acme", …],
+                "files": [RelatedFile + "names": ["ThinkTank", …]]},
+ "meaning":    [RelatedFile + "similarity": 0–1],
+ "references": {"mentions":    [RelatedFile],               (files this one names)
+                "mentionedBy": [RelatedFile + "snippet"]},  (files that name it)
+ "collection": {"name": "<file name without extension>", "pinned": [FileRef]},
+ "keywordReady"?: false, "meaningPartial"?: true}
+RelatedFile = {"workspaceId", "filespace", "kind", "location", "path", "name", "size",
+               "mtime", "type", "reason", "near": "folder" | "week" | null,
+               "copies": n}
+```
+
+Backup copies (the same name and size, anywhere in scope) are shown once:
+`copies` counts the others, and the reason ends "(also in 3 other places)".
+Each group reads 4 × `k` candidates so that `k` distinct files remain.
+
+`reason` is one plain sentence for the panel ("Same name: another version",
+"62% of the text in common", "Both mention ThinkTank and Acme", "About the
+same thing", "This file names Budget 2024.xlsx", "Names this file"), ending ",
+in the same folder" or ", edited the same week" when `near` is set.
+
+- **Versions** (newest first): the same name once version words, copy numbers
+  ("(2)"), dates and the extension are stripped and the rest folded
+  ("Proposal v2.docx" = "proposal_FINAL (signed).pdf"); or at least half of the
+  smaller file's passages in common (identical chunk text; a passage found in
+  more than 20 chunks is boilerplate and ignored). Generic names (untitled,
+  scan, notes, report, …) and names shorter than 4 characters are not matched
+  by name, nor is a short name (under 12 characters once folded) shared by
+  more than 50 files; a long, specific name matches however many backup copies
+  carry it. Any file type, any location in
+  scope; unindexed files match by name only.
+- **Mentions the same names**: up to 12 distinctive names of this file —
+  capitalised words and codes (letters with digits) found in at most
+  max(50, 0.1% of all chunks) chunks and in at least one other file. A
+  capitalised word counts only where it reads as a name at least once: after
+  a lowercase word, a comma, "The/A/Our…" or a title (Mr, Dr…), not at the
+  start of a line, sentence or table cell ("Smallest", "Meeting"). Words fused
+  by PDF extraction ("14Shareholder", "Performance1"), figures that start
+  with a digit ("2011F", "73x") and all-capitals words over 10 letters
+  (headings run together) are not names; codes start with a letter
+  ("WS2008", "T03"). Names are scored
+  by rarity (log of total ÷ chunks containing it) and frequency in the file.
+  Other files score the sum of the names they share; every version (not only
+  the `k` shown) is left out.
+- **About the same thing**: the closest files by file vector (cosine ≥ 0.5),
+  versions left out. A file vector is the normalised mean of the file's chunk
+  vectors, taken from the embeddings cache (nothing re-read or re-embedded).
+  A background builder fills `file_vectors` (short batches, a pass every
+  60 s, a 0.25 s pause between batches of 200 files); a file whose chunks change has its vector dropped (`vector` NULL
+  under a new `seq`) and rebuilt on the next pass. The in-memory file index
+  (float16, ~1.5 KB per file) loads once and then only rows with a newer
+  `seq`. `meaningPartial: true` until the first full pass has finished;
+  `/index/status` shows `"relatedFiles": {"fileVectors", "ready"}`.
+- **References**: `mentions` are file names written in this file's text
+  ("… Budget 2024.xlsx …": up to 6 words before a known extension, the longest
+  that is a real file's name; at most 3 files per name, same folder and
+  location first). `mentionedBy` are files whose text contains this file's
+  full name as a phrase (keyword index), with a snippet; names with a stem
+  under 4 characters are not looked up, and a passage naming 8 or more files
+  (a folder listing), a `.log` file (sync logs) or a sidecar of this file
+  ("report.pdf.json") is not a reference.
+- **Time and place** only tips the order: a file in the same folder, or edited
+  within a week, ranks a little higher (+5%) among names and meaning matches.
+- `collection`: "Make a collection from here" — this file, its versions,
+  references, name matches and top 5 meaning matches as pins (≤ 100), with
+  the file's name; the app saves it through `PUT /vault/collections` with
+  `query: ""` and lets the owner refine it.
+
+The whole lookup runs on a private read-only SQLite connection
+(`Store.read_view`), so it neither waits behind indexing for the shared
+connection nor holds indexing up. On the Mini (738k files, 1.6M chunks) a
+call takes 0.3–2.6 s, also while a location is being rescanned.
+
+Names and `mentionedBy` need the keyword index (`keywordReady: false` until
+it is built); meaning needs the file vectors. Images and other unindexed files
+still get versions by name and `mentionedBy`.
 
 ## Indexing controls
 

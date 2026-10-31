@@ -63,9 +63,15 @@ def _clamp(x: float) -> float:
 
 
 class LocalIndex:
-    def __init__(self, store: Store, model: str):
+    """Exact search. Holds every chunk vector in memory while there are at most
+    `max_points` of them; above that (a million chunks of 768 floats is 3 GB)
+    every search streams the vectors from SQLite in batches instead. A search
+    limited to some points (a collection) always streams just those."""
+
+    def __init__(self, store: Store, model: str, max_points: int = 250_000):
         self.store = store
         self.model = model
+        self.max_points = max_points
         self._lock = threading.Lock()
         self._gen = -1
         self._ids = np.zeros(0, dtype=np.int64)
@@ -92,7 +98,13 @@ class LocalIndex:
         self._paths = [r["path"] for r in rows]
         self._gen = gen
 
+    @property
+    def streaming(self) -> bool:
+        return self.store.chunk_total() > self.max_points
+
     def count(self) -> int:
+        if self.streaming:
+            return self.store.chunk_total()
         with self._lock:
             self._load()
             return len(self._ids)
@@ -100,6 +112,8 @@ class LocalIndex:
     def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
                path_prefix: Optional[str] = None, point_ids: Optional[set[int]] = None) -> list[tuple[int, float]]:
         """point_ids: only these points (a request limited to some files)."""
+        if point_ids is not None or self.streaming:
+            return self._scan(q, k, scopes, path_prefix, point_ids)
         with self._lock:
             self._load()
             if not len(self._ids) or self._matrix.shape[1] != len(q):
@@ -119,6 +133,109 @@ class LocalIndex:
             top = np.argpartition(-sims, kk - 1)[:kk]
             top = top[np.argsort(-sims[top], kind="stable")]
             return [(int(self._ids[idx[i]]), _clamp(sims[i])) for i in top]
+
+    def _scan(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]], path_prefix: Optional[str],
+              point_ids: Optional[set[int]]) -> list[tuple[int, float]]:
+        """The same search, streamed from SQLite: memory stays one batch."""
+        if point_ids is not None and not point_ids:
+            return []
+        q = np.asarray(q, dtype=np.float32)
+        best_ids = np.zeros(0, dtype=np.int64)
+        best = np.zeros(0, dtype=np.float32)
+        for ids, mat in self.store.iter_chunk_vectors(self.model, scopes, path_prefix, point_ids):
+            if mat.shape[1] != len(q):
+                continue
+            best_ids = np.concatenate([best_ids, ids])
+            best = np.concatenate([best, mat @ q])
+            if len(best) > k:
+                top = np.argpartition(-best, k - 1)[:k]
+                best_ids, best = best_ids[top], best[top]
+        order = np.lexsort((best_ids, -best))
+        return [(int(best_ids[i]), _clamp(best[i])) for i in order[:k]]
+
+
+class FileIndex:
+    """Meaning per file, for Related files: the file vectors (store.file_vectors)
+    in one float16 matrix (1.5 KB per file at 768 dimensions). Loaded once, then
+    only rows written since (`seq`), so indexing never forces a full reload."""
+
+    def __init__(self, store: Store, model: str):
+        self.store = store
+        self.model = model
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._row: dict[tuple[str, str, str], int] = {}
+        self._keys: list[tuple[str, str, str]] = []
+        self._scope_of: dict[Scope, int] = {}
+        self._scopes = np.zeros(0, dtype=np.int32)
+        self._valid = np.zeros(0, dtype=bool)
+        self._mat: Optional[np.ndarray] = None
+
+    def _grow(self, n: int, dim: int) -> None:
+        cap = 0 if self._mat is None else len(self._mat)
+        if n <= cap:
+            return
+        new = max(n, cap * 2, 1024)
+        mat = np.zeros((new, dim), dtype=np.float16)
+        if self._mat is not None:
+            mat[:cap] = self._mat
+        self._mat = mat
+        self._scopes = np.concatenate([self._scopes, np.zeros(new - cap, dtype=np.int32)])
+        self._valid = np.concatenate([self._valid, np.zeros(new - cap, dtype=bool)])
+
+    def refresh(self) -> None:
+        with self._lock:
+            for rows in self.store.iter_file_vectors(self.model, self._seq):
+                for ws, fs, fid, seq, blob in rows:
+                    self._seq = max(self._seq, seq)
+                    key = (ws, fs, fid)
+                    i = self._row.get(key)
+                    if blob is None:
+                        if i is not None:
+                            self._valid[i] = False
+                        continue
+                    v = blob_to_vec(blob)
+                    if self._mat is not None and self._mat.shape[1] != len(v):
+                        continue          # another dimension under the same model name
+                    if i is None:
+                        i = len(self._keys)
+                        self._keys.append(key)
+                        self._row[key] = i
+                        self._grow(i + 1, len(v))
+                    self._mat[i] = v
+                    self._scopes[i] = self._scope_of.setdefault((ws, fs), len(self._scope_of))
+                    self._valid[i] = True
+
+    def count(self) -> int:
+        self.refresh()
+        with self._lock:
+            return int(self._valid[:len(self._keys)].sum())
+
+    def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None,
+               block: int = 20000) -> list[tuple[tuple[str, str, str], float]]:
+        """[((ws, fs, file_id), similarity)], best first."""
+        self.refresh()
+        with self._lock:
+            n = len(self._keys)
+            if not n or self._mat is None or self._mat.shape[1] != len(q):
+                return []
+            mask = self._valid[:n].copy()
+            if scopes is not None:
+                codes = [self._scope_of[s] for s in scopes if s in self._scope_of]
+                mask &= np.isin(self._scopes[:n], np.array(codes, dtype=np.int32))
+            q = np.asarray(q, dtype=np.float32)
+            sims = np.full(n, -np.inf, dtype=np.float32)
+            for i in range(0, n, block):
+                part = mask[i:i + block]
+                if part.any():
+                    sims[i:i + block][part] = self._mat[i:min(i + block, n)][part].astype(np.float32) @ q
+            idx = np.nonzero(mask)[0]
+            if not len(idx):
+                return []
+            kk = min(k, len(idx))
+            top = idx[np.argpartition(-sims[idx], kk - 1)[:kk]]
+            top = top[np.argsort(-sims[top], kind="stable")]
+            return [(self._keys[i], _clamp(sims[i])) for i in top]
 
 
 def _under(path: str, prefix: str) -> bool:
@@ -379,7 +496,9 @@ class VectorService:
         if self._mirror_usable() and not (path_prefix and path_prefix != "/"):
             try:
                 hits = self.mirror.search(q, k, scopes)
-                if hits or not self.local.search(q, 1, scopes):
+                # (A cheap "is anything indexed here" stands in for a local search,
+                # which on a large index would stream every vector.)
+                if hits or not (self.store.has_chunks(scopes) if scopes is not None else self.store.chunk_total()):
                     self.last_backend = "ruvector"
                     return hits
                 # The mirror came back empty while local has matches: it has
