@@ -40,6 +40,45 @@ def test_version_base_keeps_distinct_names():
     assert version_base("Chapter 3.docx") != version_base("Chapter 4.docx")
 
 
+@pytest.mark.parametrize("name,dates", [
+    ("Draft Audit Committee Minutes_2019.07.22.pdf", {"20190722"}),
+    ("2018.04.19 Audit Committee Minutes.docx", {"20180419"}),
+    ("Draft Audit Committee Minutes 10.21.19.pdf", {"20191021"}),
+    ("Minutes_4.22.19.pdf", {"20190422"}),
+    ("Minutes-10-21-2019.pdf", {"20191021"}),
+    ("Budget 20240301.xlsx", {"20240301"}),
+    ("Plan v2.10.15.docx", set()),            # a version number, not a date
+    ("Q3'08 GEM vFinal.pptx", set()),
+    ("Budget 2024.xlsx", set()),               # a year alone is part of the name
+])
+def test_name_dates(name, dates):
+    from indexer.related import name_dates
+    assert name_dates(name) == dates
+
+
+def test_dated_names_are_different_documents():
+    from indexer.related import dates_differ, name_dates
+    a, b = name_dates("Minutes_2019.07.22.pdf"), name_dates("Minutes_2018.10.22.pdf")
+    assert version_base("Minutes_2019.07.22.pdf") == version_base("Minutes_2018.10.22.pdf")
+    assert dates_differ(a, b)
+    assert not dates_differ(a, name_dates("Minutes 7.22.19 signed.pdf"))   # the same date, written another way
+    assert not dates_differ(a, name_dates("Minutes v2.pdf"))               # no date: may be a version
+
+
+def test_minutes_of_different_meetings_are_not_versions(make_service):
+    svc = make_service()
+    a = src(svc, "fsA")
+    a.write("/AC/Draft Audit Committee Minutes_2019.07.22.md", para("july meeting"))
+    a.write("/AC/Draft Audit Committee Minutes_2018.10.22.md", para("october meeting"))
+    a.write("/AC/2018.04.19 Audit Committee Minutes.md", para("april meeting"))
+    a.write("/AC/Audit Committee Minutes 7.22.19 FINAL.md", para("july final"))
+    a.write("/AC/Audit Committee Minutes draft.md", para("undated"))
+    run(svc, "fsA")
+    body = svc.related("ws1", "fsA", "/AC/Draft Audit Committee Minutes_2019.07.22.md")
+    assert set(paths(body["versions"])) == {"/AC/Audit Committee Minutes 7.22.19 FINAL.md",
+                                            "/AC/Audit Committee Minutes draft.md"}
+
+
 # ---------------------------------------------------------------- versions
 def test_versions_by_name_and_by_content(make_service):
     svc = make_service()

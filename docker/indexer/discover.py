@@ -361,9 +361,12 @@ def _version_links(svc: "IndexerService", ws: str, fs: str, g: Graph, stop) -> N
             continue
         idx.sort(key=lambda i: -(rel._mtime_s(g.nodes[i].rep["mtime"]) or 0))
         idx = idx[:BASE_GROUP_MAX]
-        a, b = np.triu_indices(len(idx), 1)
-        arr = np.array(idx, dtype=np.int64)
-        g.add(arr[a], arr[b], S_VERSION, B_VERSION)
+        dates = [rel.name_dates(_name(g.nodes[i].rep["path"])) for i in idx]
+        pairs = [(idx[x], idx[y]) for x in range(len(idx)) for y in range(x + 1, len(idx))
+                 if not rel.dates_differ(dates[x], dates[y])]       # the minutes of two meetings aren't versions
+        if pairs:
+            g.add(np.array([p[0] for p in pairs], dtype=np.int64), np.array([p[1] for p in pairs], dtype=np.int64),
+                  S_VERSION, B_VERSION)
     _check(stop)
     node_of = {}
     for i, nd in enumerate(g.nodes):

@@ -49,7 +49,9 @@ slide slides draft final default template test temp tmp backup data output repor
 _VERSION_WORDS = (r"v|ver|version|rev|revision|draft|final|vfinal|vdraft|copy|signed|edited|edit|old|new|latest|"
                   r"updated|update|clean|redline|redlined|tracked|approved|wip|backup|bak|review|reviewed|comments")
 _COPY_NO = re.compile(r"[(\[]\s*\d+\s*[)\]]")
-_DATE = re.compile(r"(?<!\d)(?:19|20)\d{2}[-_. ]?[01]\d[-_. ]?[0-3]\d(?!\d)")
+_DATE = re.compile(r"(?<!\d)((?:19|20)\d{2})[-_. ]?([01]\d)[-_. ]?([0-3]\d)(?!\d)")
+# US style in names: "10.21.19", "4-22-2019", "7_24_17" (month first; separators required).
+_US_DATE = re.compile(r"(?<![\d.A-Za-z])([01]?\d)[-_.]([0-3]?\d)[-_.]((?:19|20)?\d{2})(?![\d])")
 _VERSION = re.compile(rf"(?<![^\W_])(?:{_VERSION_WORDS})\s*\d*(?:[.]\d+)*(?![^\W_])", re.I)
 _PUNCT = re.compile(r"[^\w\s]")
 _V_NUM = re.compile(r"(?<![^\W_])v\d+(?:[.]\d+)*(?![^\W_])", re.I)
@@ -104,6 +106,28 @@ WEEK = 7 * 86400.0
 NEAR_BONUS = 0.05
 
 
+def name_dates(name: str) -> frozenset[str]:
+    """Calendar dates written in a file name, as "YYYYMMDD": "Minutes_2019.07.22",
+    "Minutes 10.21.19", "Budget 20240301". Two names with dates and none in
+    common name different documents (the minutes of two meetings), however alike
+    the rest of the name."""
+    stem = name.rsplit(".", 1)[0] if "." in name.lstrip(".") else name
+    out: set[str] = set()
+    for y, m, d in _DATE.findall(stem):
+        if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+            out.add(f"{y}{m}{d}")
+    for m, d, y in _US_DATE.findall(_DATE.sub(" ", stem)):
+        if 1 <= int(m) <= 12 and 1 <= int(d) <= 31:
+            year = int(y) if len(y) == 4 else (2000 + int(y) if int(y) < 70 else 1900 + int(y))
+            out.add(f"{year:04d}{int(m):02d}{int(d):02d}")
+    return frozenset(out)
+
+
+def dates_differ(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Both names carry dates and share none: different documents, not versions."""
+    return bool(a) and bool(b) and not (a & b)
+
+
 def version_base(name: str) -> str:
     """A file name with version words, copy numbers, dates and the extension
     stripped, folded like find (case, spaces, -, _ and . ignored):
@@ -119,9 +143,9 @@ def _version_needle(name: str) -> str:
 
 def _strip_versions(name: str) -> str:
     stem = name.rsplit(".", 1)[0] if "." in name.lstrip(".") else name
-    s = _fold(stem).replace("_", " ").replace("-", " ")
+    s = _DATE.sub(" ", _fold(stem))       # dates first: "10-21-2019" keeps its dashes until here
+    s = _US_DATE.sub(" ", s).replace("_", " ").replace("-", " ")
     s = _COPY_NO.sub(" ", s)
-    s = _DATE.sub(" ", s)
     s = _V_NUM.sub(" ", s)
     prev = None
     while prev != s:                      # "final final", "signed copy"
@@ -269,7 +293,9 @@ def _versions(svc, me: dict, scopes: "set[Scope]") -> list[tuple[dict, bool, flo
         # longest unbroken run of the name, then compare bases exactly.
         needle = _version_needle(me["path"].rsplit("/", 1)[-1])
         cands = store.files_name_containing(scopes, needle, NAME_CANDIDATES) if len(needle) >= BASE_MIN else []
-        same = [r for r in cands if _key(r) != _key(me) and version_base(r["path"].rsplit("/", 1)[-1]) == base]
+        mine = name_dates(me["path"].rsplit("/", 1)[-1])
+        same = [r for r in cands if _key(r) != _key(me) and version_base(r["path"].rsplit("/", 1)[-1]) == base
+                and not dates_differ(mine, name_dates(r["path"].rsplit("/", 1)[-1]))]
         # Hundreds of "proposal"s are not versions of one; a long, specific name
         # ("t03shareholdervaluemetrics") is, however many backup copies there are.
         if len(same) <= NAME_CANDIDATES // 10 or len(base) >= SPECIFIC_BASE:

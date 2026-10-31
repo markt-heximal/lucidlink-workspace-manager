@@ -1035,7 +1035,12 @@ in the same folder" or ", edited the same week" when `near` is set.
 
 - **Versions** (newest first): the same name once version words, copy numbers
   ("(2)"), dates and the extension are stripped and the rest folded
-  ("Proposal v2.docx" = "proposal_FINAL (signed).pdf"); or at least half of the
+  ("Proposal v2.docx" = "proposal_FINAL (signed).pdf"), unless both names carry
+  dates and none in common: "Minutes_2019.07.22" and "Minutes_2018.10.22" are
+  two meetings, not versions, while "Minutes 7.22.19 FINAL" is the same meeting
+  and an undated "Minutes draft" may be either (`related.name_dates`: YYYY-MM-DD,
+  YYYYMMDD and US M.D.YY/YYYY with `.`, `-` or `_`; a number right after a
+  letter, as in "v2.10.15", is a version, not a date); or at least half of the
   smaller file's passages in common (identical chunk text; a passage found in
   more than 20 chunks is boilerplate and ignored). Generic names (untitled,
   scan, notes, report, …) and names shorter than 4 characters are not matched
@@ -1124,7 +1129,7 @@ stopped by a restart is asked for again.
      counts 0.7 (in ≤ 5 documents), 0.55 (≤ 15) or 0.4 (≤ 40).
    - **versions** (0.9): the same version-stripped base name
      (`related.version_base`; at most 50 per base unless the name is long and
-     specific), or half the smaller document's passages in common (passages in
+     specific; never two names whose dates differ), or half the smaller document's passages in common (passages in
      2–8 documents; more is boilerplate).
    - **references** (0.8): a document names another's file ("… Budget
      2024.xlsx …", the longest real name; folder listings and `.log` files

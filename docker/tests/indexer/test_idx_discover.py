@@ -87,6 +87,23 @@ def test_machine_codes_are_not_names():
     assert {"wagner", "w2008", "q408"} <= set(tf) and not {"dc78aacc", "e25bb512f2a8"} & set(tf)
 
 
+def test_dated_minutes_are_not_version_links(make_service):
+    svc = make_service()
+    a = src(svc, "fsA")
+    for d in ("2019.07.22", "2018.10.22", "2019.04.22"):
+        a.write(f"/AC/Audit Committee Minutes_{d}.md", para(f"meeting {d}"))
+    a.write("/AC/Audit Committee Minutes_2019.07.22 v2.md", para("meeting second draft"))
+    run(svc, "fsA")
+    with svc.store.read_view():
+        g = discover_mod.Graph(discover_mod.fold_nodes(svc.store.discover_files("ws1", "fsA")))
+        discover_mod._version_links(svc, "ws1", "fsA", g, None)
+    g.combine()
+    names = [n.rep["path"].rsplit("/", 1)[-1] for n in g.nodes]
+    linked = {tuple(sorted((names[k // g.n], names[k % g.n]))) for k, b in zip(g.keys.tolist(), g.bits.tolist())
+              if b & discover_mod.B_VERSION}
+    assert linked == {("Audit Committee Minutes_2019.07.22 v2.md", "Audit Committee Minutes_2019.07.22.md")}
+
+
 def test_louvain_separates_two_clusters():
     adj = {}
     def link(a, b, w=1.0):
