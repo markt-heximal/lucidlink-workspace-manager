@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import stat as stat_mod
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -20,6 +21,7 @@ import httpx
 
 from . import ask as ask_mod
 from . import folders as folders_mod
+from . import search as search_mod
 from . import survey as survey_mod
 from .block import KIND_LUCIDLINK, ONLINE_ONLY, TYPE_EXT, TYPES, LocalSource, PathRefused, RoutingSourceProvider, mounted, type_of
 from .block import NotMounted as NotMountedError
@@ -27,7 +29,7 @@ from .config import Config
 from .embedder import Embedder
 from .llm import LLM, LLMUnavailable
 from .source import SdkSourceProvider, SettingsProvider, SourceProvider, VaultSettings
-from .store import FILE_ORDER, Store, now_iso
+from .store import FILE_ORDER, Store, fold_name, now_iso
 from .vectors import LocalIndex, RuvectorMirror, Scope, VectorService
 from .worker import Scheduler, iso
 
@@ -40,12 +42,7 @@ RECENT_MAX = 200
 RECENT_CHANGES = ("new", "modified", "renamed", "deleted")
 BYKIND_MAX = 500
 # GET /index/bykind: the app's Kind filter onto the profile's type classes.
-KIND_CLASSES = {
-    "documents": ("document", "pdf", "spreadsheet"),
-    "presentations": ("presentation",),
-    "images": ("image", "design"),
-    "video": ("video", "audio"),
-}
+KIND_CLASSES = search_mod.KIND_CLASSES
 FILES_MAX = 200
 
 DAY = 86400.0
@@ -181,8 +178,33 @@ class IndexerService:
     # ------------------------------------------------------------ lifecycle
     def start(self) -> None:
         self.scheduler.start()
+        self._start_fts_backfill()
+
+    def _start_fts_backfill(self) -> None:
+        """Build the keyword index for chunks that predate it, in the background
+        (short batches; search stays meaning-only until it is done)."""
+        if self.store.fts_ready or not self.store.fts_available:
+            return
+        self._fts_stop = threading.Event()
+
+        def run():
+            t0 = time.monotonic()
+            lo, hi = self.store.fts_hole()
+            logger.info("keyword index: backfilling %d chunk ids in the background", hi - lo)
+            try:
+                if self.store.fts_backfill(pause=0.02, stop=self._fts_stop):
+                    logger.info("keyword index ready (%.1fs)", time.monotonic() - t0)
+            except Exception:
+                logger.exception("keyword index backfill failed; search stays meaning-only")
+
+        self._fts_thread = threading.Thread(target=run, name="indexer-fts-backfill", daemon=True)
+        self._fts_thread.start()
 
     def stop(self) -> None:
+        stop = getattr(self, "_fts_stop", None)
+        if stop is not None:
+            stop.set()
+            self._fts_thread.join(10)
         self.scheduler.stop()
         self.sources.close()
         self.store.close()
@@ -238,21 +260,30 @@ class IndexerService:
         return {key: self.location(key[0], key[1], k) for key, k in kinds.items()}
 
     def find(self, workspace_id: Optional[str], filespace: Optional[str], q: str, limit: int = 20) -> list[dict]:
-        """Files whose name or path matches every word of `q` (docs: Find by name)."""
-        words = [w for w in (q or "").lower().split() if w]
-        if len((q or "").strip()) < 2 or not words:
+        """Files whose name or path matches the query, ignoring case, spaces,
+        hyphens, underscores, dots (so CamelCase too) (docs: Find by name).
+
+        Rank: exact name (with or without extension) > name starts with > name
+        contains > name has every word > only the path matches; then newest.
+        """
+        if len((q or "").strip()) < 2:
+            return []
+        compact = fold_name(q)
+        words = [w for w in (fold_name(x) for x in q.split()) if w]
+        if not compact or not words:
             return []
         limit = max(1, min(int(limit), FIND_MAX))
         scopes = sorted(self.scopes(workspace_id, filespace))
         locs = self.locations()
-        first = words[0]
         hits: list[tuple[tuple, dict]] = []
-        for r in self.store.find_files(scopes, words, FIND_CANDIDATES):
+        for r in self.store.find_files(scopes, compact, words, FIND_CANDIDATES):
             name = r["path"].rsplit("/", 1)[-1]
-            low = name.lower()
-            rank = 0 if low.startswith(first) else 1 if all(w in low for w in words) else 2
+            stem = name.rsplit(".", 1)[0] if "." in name.lstrip(".") else name
+            tier = r["tier"] + 1
+            if r["nn"] == compact or fold_name(stem) == compact:
+                tier = 0
             ts = mtime_seconds(r["mtime"]) or 0.0
-            hits.append(((rank, -ts, r["path"]), {
+            hits.append(((tier, -ts, r["path"]), {
                 "workspaceId": r["workspace_id"], "filespace": r["filespace"],
                 "kind": locs.get((r["workspace_id"], r["filespace"]), {}).get("kind", KIND_LUCIDLINK),
                 "location": locs.get((r["workspace_id"], r["filespace"]),
@@ -627,29 +658,13 @@ class IndexerService:
 
     def search(self, workspace_id: Optional[str], filespace: Optional[str], query: str, k: int = 20,
                path_prefix: Optional[str] = None) -> list[dict]:
-        scopes = self.scopes(workspace_id, filespace)
-        if not scopes or not any(self.store.chunk_count(ws, fs) for ws, fs in scopes):
-            return []
-        q = self.embedder.embed_query(query)
-        hits = self.vectors.search(q, max(1, min(k, 200)), scopes, path_prefix)
-        rows = self.store.chunk_rows([pid for pid, _ in hits])
-        kinds = self.kinds()
-        locs = self.locations()
-        out = []
-        for pid, score in hits:
-            r = rows.get(pid)
-            if r is None:
-                continue
-            text = " ".join(r["text"].split())
-            out.append({
-                "workspaceId": r["workspace_id"], "filespace": r["filespace"],
-                "kind": kinds.get((r["workspace_id"], r["filespace"]), KIND_LUCIDLINK), "path": r["path"],
-                "location": locs.get((r["workspace_id"], r["filespace"])),
-                "chunkIndex": r["chunk_index"], "score": round(score, 4),
-                "snippet": text[:SNIPPET_CHARS] + ("…" if len(text) > SNIPPET_CHARS else ""),
-                "mtime": mtime_iso(r["mtime"]),
-            })
-        return out
+        """Chunk hits, hybrid-ranked (the `results` of search_all)."""
+        return self.search_all(workspace_id, filespace, query, k, path_prefix)["results"]
+
+    def search_all(self, workspace_id: Optional[str], filespace: Optional[str], query: str, k: int = 20,
+                   path_prefix: Optional[str] = None, mode: str = "all", filters: Optional[dict] = None) -> dict:
+        """All search: chunk results, file results, counts and refinements (docs: All search)."""
+        return search_mod.search(self, workspace_id, filespace, query, k, path_prefix, mode, filters)
 
     def recent(self, workspace_id: Optional[str], filespace: Optional[str], limit: int = 20) -> list[dict]:
         """Most recently changed files, newest first (see recent_page)."""

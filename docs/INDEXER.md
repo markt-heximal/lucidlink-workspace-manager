@@ -126,7 +126,7 @@ active workspace.
 | POST | `/index/sync` | `{"workspaceId"?, "filespace"?}` | 202 `{"queued": [{"workspaceId","filespace"}]}` |
 | PUT | `/index/filespaces` | `{"workspaceId","filespace","enabled": bool}` | `FilespaceStatus` |
 | POST | `/index/hint` | `{"workspaceId"?, "filespace", "op": "write"\|"delete"\|"move"\|"mkdir", "path", "src"?}` | 202 `{}` |
-| POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}]}` |
+| POST | `/index/search` | `{"workspaceId"?, "filespace"?, "query", "k"?: 20, "pathPrefix"?, "mode"?: "all"\|"meaning"\|"keyword", "filters"?: {…}}` | `{"results": [{"workspaceId","filespace","path","chunkIndex","score","snippet","mtime"}], "files", "total", "counts", "refinements"}` — hybrid ranked (meaning + keywords + names); see "Search quality" and "All search" |
 | GET | `/index/recent` | `?workspaceId&filespace&limit=20&kind=&change=&since=&before=` (limit capped at 200; `filespace` omitted = every enabled filespace of the workspace; `kind` as `/index/bykind`, `change` a comma list of new\|modified\|renamed\|deleted, `since` ≤ `when` < `before` (ISO); unknown kind/change or a bad time → 400; see What's new) | `{"files": [RecentFile], "next": ISO\|null}`, newest `when` first; pass `next` as `before` for the next page (ties on `when` stay on one page) |
 | POST | `/index/ask` | `{"workspaceId"?, "filespace"?, "question", "k"?: 12}` | `{"answer", "sources": [path], "citations": [{"workspaceId","filespace","kind","path","chunkIndex","score"}]}`; 503 when no LLM; `{"empty": true, …}` when nothing indexed |
 | GET | `/index/survey` | `?workspaceId&filespace&scope=/` | `{"topics": [Topic], "raw", "sources": [path], "generatedAt", "stale": bool}`; 404 when never generated |
@@ -282,6 +282,11 @@ never read. Hints for a path inside a package apply to the package.
 - `filespaces(workspace_id, filespace, enabled, last_scan_at, last_sync_at, last_error, …)`
 - `files(workspace_id, filespace, file_id, path, size, mtime, content_hash, status, reason, chunk_count, scan_id, indexed_at, change_kind, changed_at, prev_path)`
 - `chunks(point_id, workspace_id, filespace, file_id, chunk_index, text_hash, text)`
+- `chunks_fts` — FTS5 keyword index over `chunks.text` (external content, kept
+  by triggers; see "Search quality"), `chunks_fts_vocab` (its term statistics,
+  used to spot very common query words),
+  `meta` (backfill state)
+- `files.name_fold` / `files.path_fold` — folded name and path for find
 - `embeddings(model, text_hash, dim, vector BLOB)` — the embedding cache
 - `surveys(workspace_id, filespace, scope, payload, generated_at, stale)`
 
@@ -630,7 +635,9 @@ bearer token or key is masked.
 file **names and folder paths** in the ledger (no AI, instant), across the same
 scopes as search (`workspaceId: "*"` = every location). Case-insensitive; a
 name that starts with the query ranks above one that contains it, then newer
-first. Every word of a multi-word query must appear in the path. Files the
+first. Every word of a multi-word query must appear in the path. Matching
+ignores case, spaces, hyphens, underscores and dots, so "thinktank", "Think
+Tank", "think-tank" and "ThinkTank" all find each other (see "Search quality"). Files the
 indexer could not read (video, online-only, too large) are still found, since
 they are in the ledger. Result: `{"results": [{"workspaceId", "filespace",
 "kind", "location": Location, "path", "name", "size", "mtime", "status",
@@ -742,6 +749,150 @@ returning `minioProfiles`/`activeMinioProfileId`; `PUT` ignores them if an older
 app sends them; stored copies are purged once at startup / first read and on
 any write (see "Vault"). Favorites and workspaces are unaffected. LucidLink
 Connect S3 data stores (`connect_api.py`) are a separate feature and stay.
+
+### Search quality: keywords and names
+
+Search used to be pure vector similarity: the query was embedded and the
+nearest chunks returned. A rare name, brand or code ("ThinkTank") has no useful
+meaning to an embedding model, so documents that literally contained it could
+rank below vaguely similar text or not appear at all; Ask (same retrieval) then
+answered from the wrong excerpts. Find matched each word as a substring of
+`lower(path)`, so "thinktank" missed "Think Tank.docx" and vice versa.
+
+**Keyword index.** `chunks_fts` is an SQLite FTS5 table over chunk text
+(`content='chunks'`, `content_rowid='point_id'`, tokenizer `unicode61
+remove_diacritics 2`, so "café" = "cafe"). Triggers on `chunks` (insert, delete,
+update of `text`) keep it in sync; every chunk write in `store.py`
+(`replace_chunks`, `delete_file_chunks`, `purge_source`, `rekey_*`, which only
+changes keys) is plain SQL the triggers see. If the SQLite build lacks FTS5 the
+engine logs it and search stays meaning-only (`keywordReady: false`).
+
+**Existing databases.** On the first start of this version the table and
+triggers are created at once (new writes are indexed immediately) and the
+chunks already there are backfilled by a background thread in batches of 2,000
+(short transactions; `INSERT … SELECT` rather than one `'rebuild'`, which would
+hold the write lock and the shared connection for the whole build). Progress is
+the "hole" `(fts_lo, fts_hi]` in `meta`: point ids in it are not indexed yet,
+and the delete/update triggers skip them. Until the hole is empty search
+behaves exactly as before (meaning only, `score` = cosine). Measured: 6–7.5 s
+per 100k chunks (≈1 KB each; 75 s for 1M) on one core.
+
+**Query handling** (`search.QueryPlan`). The query is split into runs of
+letters/digits, so quotes, colons, hyphens, asterisks, `NEAR(`… are never FTS
+syntax and nothing a user types can raise. Each token is quoted; CamelCase and
+letter/digit boundaries add a phrase alternative ("ThinkTank" →
+`"thinktank"* OR "think tank"`), and a multi-word query adds its compound
+("think tank" → `("think" AND "tank"*) OR "thinktank"`). The last token is a
+prefix match when it has at least 3 characters. Ask questions use any content
+word (stopwords dropped) instead of all words, ranked by BM25.
+
+**Ranking.** `/index/search` and Ask run three lists in the same scopes and
+`pathPrefix`: meaning (top 200 chunks by vector), keyword (top 200 by FTS5
+`bm25()`), and name (first chunk of up to 50 indexed files whose folded name
+contains the folded query). They are fused with Reciprocal Rank Fusion
+(Σ 1/(60 + rank)), plus a boost of 0.05 for a chunk that contains the query as
+a phrase (case-insensitive, any space/hyphen/underscore/dot between its parts:
+ThinkTank, Think Tank, think-tank) and 0.04 when the file name matches. 0.05 is
+more than first place in all three lists, so a literal mention always outranks
+a non-mention. **`score`** is that fused value divided by the best possible for
+the signals that fired (0–1; 1 = first in every list with both boosts); before
+the keyword index is ready it is the cosine similarity as before. A term in more
+than 20,000 chunks is not BM25-ranked over every match (≈1 s per million
+chunks); its newest matching chunks are taken instead and meaning ranks them.
+
+**Snippets.** When the chunk mentions the query, the snippet starts about 80
+characters before the first mention (on a word boundary, with a leading "…"),
+so the user sees why it matched.
+
+**Find.** Both sides are folded: lowercase (ASCII, as SQLite's `lower()`),
+without spaces, hyphens, underscores, dots or tabs. The folded name and path are
+stored in `files.name_fold` / `files.path_fold`, filled once by a migration
+(~1.5 s per 300k files) and kept by triggers on every insert and path update.
+Folding inside the query (nested `replace()` plus extracting the last segment)
+made the scan ~7x slower (78 ms vs 10 ms on 30k files); a stored column keeps find at the cost of
+the old `LIKE` scan and needs no Python changes on the write paths. A query
+matches when every folded word is in the folded path; rank: exact name (with
+or without extension) > name starts with the folded query > name contains it >
+name contains every word > only the path matches; then newest.
+
+### All search
+
+`POST /index/search` combines meaning and every keyword mention and offers
+refinements that narrow toward the file the owner wants. Old requests keep
+working and `results` keeps its shape.
+
+Request additions (all optional):
+
+- `"mode"`: `"all"` (default; meaning + keywords + names) | `"meaning"` (vectors
+  only; `score` is the cosine similarity) | `"keyword"` (FTS + names only; no embedder call). `"keyword"` before
+  the keyword index is ready answers by meaning.
+- `"filters"`: `{"kind": "documents"|"presentations"|"images"|"video",
+  "pathPrefix" (same as the top-level one, which it overrides), "modifiedAfter":
+  ISO, "modifiedBefore": ISO (exclusive), "include": [term], "exclude": [term],
+  "inName": bool}`. include = the file has a chunk matching every term
+  (keyword); exclude = none; inName = the query matches the folded file name (as
+  find). Unknown mode/kind → 422.
+
+Response:
+
+- `results` — chunk hits as before, hybrid ranked (at most `k`, max 200).
+- `files` — matched files, best first, at most `k` (max 100):
+  `{"workspaceId","filespace","kind","location","path","name","size","mtime","type",
+  "score","why": {"meaning","keyword","name","mentions"},"snippets": [{"chunkIndex","text","keyword","highlights": [[start,end]]}]}`.
+  `type` is the file's class (document, pdf, presentation, …); `kind` (the
+  source kind, as on every result) is extra to the contract. A file is matched
+  by meaning when one of its chunks is within 0.15 of the best similarity (and
+  ≥ 0.2), by keyword when a chunk matched FTS or contains the phrase, by name
+  when its folded name contains the folded query. In `keyword` mode files
+  matched by keyword or name are listed; in `meaning` mode those matched by
+  meaning. `mentions` counts occurrences of the query (phrase or its words) in
+  the file's retrieved chunks — a lower bound. File `score`: RRF over each
+  list's per-file rank (the file's best chunk) plus the phrase/name boosts,
+  normalized like chunk scores. Up to 3 snippets, keyword ones first;
+  `highlights` are `[start, end)` character offsets into that snippet's `text`.
+- `total` — distinct matched files; `totalApprox: true` when a list hit its cap
+  (200 chunks, 50 names), so there may be more.
+- `counts` — `{"meaning","keyword","both","name"}` over the matched files.
+- `refinements` — up to 10, round-robin across kinds in the order match,
+  location, folder, type, term, date (each kind's best first), each `{"id","kind",
+  "label","count","apply"}`. `count` = matched files that remain; a refinement
+  is only offered when `0 < count < total`. `apply` is a patch to the request:
+  `{"mode"}`, `{"filters"}` (the **whole** filters object: current filters merged
+  with the new one, so replacing or merging both work), or `{"scope":
+  {"workspaceId","filespace"}}` (set those top-level fields). Kinds:
+  - `match` — "Only files that mention “q”" (`mode: keyword`), "About it, even
+    without the word" (`mode: meaning`), "Name contains “q”" (`inName`); the
+    first two only in `all` mode.
+  - `location` — one per source when matches span more than one.
+  - `folder` — folders where matches cluster (the deepest folder with a given
+    coverage; up to 6 candidates, round-robin keeps ~2–3) → `pathPrefix`.
+  - `type` — documents / presentations / images / video present → `kind`.
+  - `date` — "Changed in the last 30 days", the two most common years, "Before
+    <latest year>" → `modifiedAfter`/`modifiedBefore`.
+  - `term` — up to 5 distinctive words from the matched files' retrieved chunks
+    (keyword- and meaning-matched alike): words of ≥ 3 letters, not stopwords,
+    numbers or the query, scored by (share of matched files containing it) ×
+    idf against a cached 2,000-chunk random sample of the corpus. Label
+    `+ “budget”`, apply `filters.include` (+ the term).
+- `keywordReady: false` while the keyword index is being built or unavailable;
+  `meaningUnavailable: true` when the embedder failed in `all` mode and keyword
+  results answered alone (otherwise an embedder failure is still 503).
+
+Refinements and counts are computed from the retrieved candidates (≤ 200 chunks
+per list), so they are approximate on large result sets: a term or include
+filter applied later checks every chunk of the candidate files, which can find a
+few more than `count`.
+
+**Latency** (one 300k-file / 1M-chunk ledger, SQLite 3.45, one core;
+`mode=keyword`, all non-vector work): whole `/index/search`
+110–130 ms for common words, ~65 ms for a rare name; keyword channel alone
+0.1 ms for a rare name, 9 ms for "budget report"; find ~90 ms (scan of 300k
+rows; the old `lower(path) LIKE` scan cost the same); vector scoring adds ~40 ms
+of numpy (plus the existing per-request scope mask). The refinement word
+statistics come from a 2,000-chunk random sample cached for 10 minutes (the
+first request after that pays ~50 ms). One-time costs on upgrade: keyword
+backfill ~6–7.5 s per 100k chunks (75 s for 1M, in the background), folded-name
+migration ~1.5 s per 300k files (at startup).
 
 ## Indexing controls
 

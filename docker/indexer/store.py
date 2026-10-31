@@ -143,7 +143,75 @@ CREATE TABLE IF NOT EXISTS mirror_points (
     point_id   INTEGER NOT NULL,
     PRIMARY KEY (collection, point_id)
 );
+-- Small key/value state. fts_lo/fts_hi: chunk point ids in (lo, hi] are not yet
+-- in chunks_fts (the one-time backfill of a database that predates it).
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+# Keyword index over chunk text (docs: Search quality). External content, so the
+# text is stored once (in chunks); triggers keep it in sync with every chunk
+# insert/delete/text update. A row is in the index unless its point id is in the
+# backfill hole (fts_lo, fts_hi], which only exists while an old database is
+# being backfilled; ids are AUTOINCREMENT, so rows written after the table was
+# created are always above the hole.
+FTS_HOLE = ("NOT ({id} > COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='fts_lo'), 0) "
+            "AND {id} <= COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key='fts_hi'), 0))")
+FTS_SCHEMA = f"""
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text, content='chunks', content_rowid='point_id',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts_vocab USING fts5vocab(chunks_fts, row);
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.point_id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks WHEN {FTS_HOLE.format(id='old.point_id')} BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.point_id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF text ON chunks WHEN {FTS_HOLE.format(id='old.point_id')} BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES ('delete', old.point_id, old.text);
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.point_id, new.text);
+END;
+"""
+FTS_BACKFILL_BATCH = 2000
+
+# A file name or path folded for name matching: case, spaces, hyphens,
+# underscores and dots ignored, so "ThinkTank", "Think Tank" and "think_tank"
+# all become "thinktank". SQLite's lower() folds ASCII only; fold_name() matches.
+def _norm_sql(expr: str) -> str:
+    return (f"replace(replace(replace(replace(replace(lower({expr}), ' ', ''), '-', ''), '_', ''), '.', ''), "
+            f"char(9), '')")
+
+
+# The last path segment: strip everything up to the last '/'.
+NAME_SQL = "replace(path, rtrim(path, replace(path, '/', '')), '')"
+NAME_NORM_SQL = _norm_sql(NAME_SQL)
+PATH_NORM_SQL = _norm_sql("path")
+
+
+FOLD_TRIGGERS = f"""
+CREATE TRIGGER IF NOT EXISTS files_fold_ai AFTER INSERT ON files BEGIN
+    UPDATE files SET name_fold={NAME_NORM_SQL.replace('path', 'new.path')},
+                     path_fold={PATH_NORM_SQL.replace('path', 'new.path')} WHERE rowid=new.rowid;
+END;
+CREATE TRIGGER IF NOT EXISTS files_fold_au AFTER UPDATE OF path ON files BEGIN
+    UPDATE files SET name_fold={NAME_NORM_SQL.replace('path', 'new.path')},
+                     path_fold={PATH_NORM_SQL.replace('path', 'new.path')} WHERE rowid=new.rowid;
+END;
+"""
+
+
+def fold_name(text: str) -> str:
+    """Python twin of the SQL name folding (ASCII-only lowercase, like SQLite)."""
+    out = []
+    for ch in text:
+        if ch in " -_.\t":
+            continue
+        out.append(ch.lower() if ch.isascii() else ch)
+    return "".join(out)
 
 LIVE_STATUSES = ("pending", "indexed", "skipped", "failed")
 
@@ -155,6 +223,17 @@ FILE_ORDER = {
     "indexed": "indexed_at DESC, path",
 }
 BY_REASON_MAX = 20
+
+
+def _split_sql(script: str) -> list[str]:
+    """Split FTS_SCHEMA into statements (triggers contain ';' inside BEGIN…END)."""
+    out, buf = [], ""
+    for line in script.strip().splitlines():
+        buf += line + "\n"
+        if sqlite3.complete_statement(buf):
+            out.append(buf.strip())
+            buf = ""
+    return out
 
 
 def like_escape(text: str) -> str:
@@ -185,6 +264,7 @@ class Store:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.executescript(SCHEMA)
         self._migrate()
+        self.fts_available = self._init_fts()
         self._generation = 0
 
     def _migrate(self) -> None:
@@ -205,6 +285,106 @@ class Store:
         if "id_scheme" not in fs_cols:
             # NULL: ids were recorded by SDK 0.14 (or the filespace is new).
             self._conn.execute("ALTER TABLE filespaces ADD COLUMN id_scheme TEXT")
+        if "name_fold" not in cols:
+            # Folded name/path for find (fold_name). Stored, and kept by triggers on
+            # every path write, because folding on the fly costs ~3x the scan.
+            # One-time fill: ~1 s per 100k files.
+            self._conn.execute("ALTER TABLE files ADD COLUMN name_fold TEXT")
+            self._conn.execute("ALTER TABLE files ADD COLUMN path_fold TEXT")
+            self._conn.execute(f"UPDATE files SET name_fold={NAME_NORM_SQL}, path_fold={PATH_NORM_SQL}")
+        for stmt in _split_sql(FOLD_TRIGGERS):
+            self._conn.execute(stmt)
+
+    def _init_fts(self) -> bool:
+        """Create the keyword index if this SQLite has FTS5; False disables keyword search."""
+        try:
+            self._conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts5_probe USING fts5(x)")
+            self._conn.execute("DROP TABLE IF EXISTS temp.fts5_probe")
+        except sqlite3.OperationalError as e:
+            logger.warning("SQLite has no FTS5 (%s): keyword search disabled, vector search only", e)
+            return False
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                fresh = self._conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='chunks_fts'").fetchone() is None
+                if fresh:
+                    # Rows already in chunks (an older database) form the hole the
+                    # background backfill fills; an empty database has none.
+                    hi = self._conn.execute("SELECT COALESCE(MAX(point_id), 0) FROM chunks").fetchone()[0]
+                    self._conn.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                                           (("fts_lo", "0"), ("fts_hi", str(hi))))
+                for stmt in _split_sql(FTS_SCHEMA):
+                    self._conn.execute(stmt)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def fts_hole(self) -> tuple[int, int]:
+        r = {k: int(v) for k, v in self._conn.execute(
+            "SELECT key, value FROM meta WHERE key IN ('fts_lo', 'fts_hi')").fetchall()}
+        return r.get("fts_lo", 0), r.get("fts_hi", 0)
+
+    @property
+    def fts_ready(self) -> bool:
+        """Keyword search usable: FTS5 present and every chunk is in the index."""
+        if not self.fts_available:
+            return False
+        with self._lock:
+            lo, hi = self.fts_hole()
+        return lo >= hi
+
+    def fts_backfill_step(self, batch: int = FTS_BACKFILL_BATCH) -> bool:
+        """Index the next `batch` pre-existing chunks; True once none are left.
+
+        Short transactions, so the indexer and API keep working while an old,
+        large ledger is backfilled (one `'rebuild'` would hold the write lock,
+        and our shared connection, for minutes).
+        """
+        if not self.fts_available:
+            return True
+        with self.tx() as c:
+            lo, hi = self.fts_hole()
+            if lo >= hi:
+                return True
+            top = c.execute("SELECT MAX(point_id) FROM (SELECT point_id FROM chunks WHERE point_id > ? "
+                            "AND point_id <= ? ORDER BY point_id LIMIT ?)", (lo, hi, batch)).fetchone()[0]
+            new_lo = hi if top is None else top
+            c.execute("INSERT INTO chunks_fts(rowid, text) SELECT point_id, text FROM chunks "
+                      "WHERE point_id > ? AND point_id <= ?", (lo, new_lo))
+            if new_lo >= hi:
+                new_lo = hi = 0
+                c.execute("UPDATE meta SET value='0' WHERE key='fts_hi'")
+            c.execute("UPDATE meta SET value=? WHERE key='fts_lo'", (str(new_lo),))
+        if new_lo >= hi:
+            self.bump()
+            return True
+        return False
+
+    def fts_backfill(self, batch: int = FTS_BACKFILL_BATCH, pause: float = 0.0,
+                     stop: Optional[threading.Event] = None) -> bool:
+        """Run fts_backfill_step until done (or `stop` is set); True when done."""
+        while not (stop is not None and stop.is_set()):
+            if self.fts_backfill_step(batch):
+                return True
+            if pause:
+                (stop.wait(pause) if stop is not None else threading.Event().wait(pause))
+        return False
+
+    def fts_rebuild(self) -> None:
+        """Drop and re-create the keyword index from chunks (repair tool; tests).
+
+        Leaves a hole over every existing chunk, so the next backfill fills it.
+        """
+        if not self.fts_available:
+            return
+        with self.tx() as c:
+            hi = c.execute("SELECT COALESCE(MAX(point_id), 0) FROM chunks").fetchone()[0]
+            c.execute("INSERT INTO chunks_fts(chunks_fts) VALUES ('delete-all')")
+            c.executemany("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (("fts_lo", "0"), ("fts_hi", str(hi))))
+        self.bump()
 
     def close(self) -> None:
         with self._lock:
@@ -543,16 +723,145 @@ class Store:
                 out.append(r)
         return out
 
-    def find_files(self, scopes: Iterable[tuple[str, str]], words: list[str], limit: int) -> list[dict]:
-        """Live files whose path contains every word (case-insensitive), per scope."""
-        like = " AND ".join("lower(path) LIKE ? ESCAPE '\\'" for _ in words)
-        pats = ["%" + w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%" for w in words]
+    def find_files(self, scopes: Iterable[tuple[str, str]], compact: str, words: list[str],
+                   limit: int) -> list[dict]:
+        """Live files whose folded path contains `compact` (the whole folded query)
+        or every folded word, best name tier first, then newest, per scope.
+
+        Folding (fold_name) ignores case, spaces, hyphens, underscores and dots.
+        Substring match cannot use an index, so this scans the scope's ledger;
+        the folded name/path are stored columns (kept by triggers on every path
+        write) because folding inside the query made the scan ~3x slower.
+        tier: 0 name starts with compact, 1 name contains it, 2 name contains
+        every word, 3 only the path matches.
+        """
+        if not compact:
+            return []
+        words = [w for w in words if w] or [compact]
+        all_in = " AND ".join("instr(path_fold, ?) > 0" for _ in words)
+        name_all = " AND ".join("instr(name_fold, ?) > 0" for _ in words)
+        sql = (f"SELECT workspace_id, filespace, path, size, mtime, status, reason, name_fold AS nn, "
+               f"CASE WHEN substr(name_fold, 1, ?) = ? THEN 0 WHEN instr(name_fold, ?) > 0 THEN 1 "
+               f"WHEN {name_all} THEN 2 ELSE 3 END AS tier FROM files "
+               f"WHERE workspace_id=? AND filespace=? AND status != 'deleted' AND {all_in} "
+               f"ORDER BY tier, mtime DESC LIMIT ?")
         out: list[dict] = []
         for ws, fs in scopes:
-            out += self.query("SELECT workspace_id, filespace, path, size, mtime, status, reason FROM files "
-                              f"WHERE workspace_id=? AND filespace=? AND status != 'deleted' AND {like} "
-                              "ORDER BY mtime DESC LIMIT ?", (ws, fs, *pats, limit))
+            out += self.query(sql, (len(compact), compact, compact, *words, ws, fs, *words, limit))
         return out
+
+    # ------------------------------------------------------------ keyword search
+    @staticmethod
+    def _scope_sql(scopes: list[tuple[str, str]], path_prefix: Optional[str]) -> tuple[str, list]:
+        where = "(c.workspace_id, c.filespace) IN (VALUES " + ",".join("(?, ?)" for _ in scopes) + ")"
+        args: list = [x for sc in scopes for x in sc]
+        if path_prefix and path_prefix != "/":
+            p = path_prefix.rstrip("/")
+            where += " AND (f.path = ? OR f.path LIKE ? ESCAPE '\\')"
+            args += [p, like_escape(p) + "/%"]
+        return where, args
+
+    def keyword_search(self, scopes: Iterable[tuple[str, str]], match: str, limit: int,
+                       path_prefix: Optional[str] = None, ranked: bool = True) -> list[tuple[int, float]]:
+        """Chunks matching the FTS5 query `match`, best BM25 first: [(point_id, bm25)].
+
+        bm25() is negative (more negative = better). Empty when the index is not
+        ready or the query is rejected. ranked=False (a term in a large share of
+        the corpus, where ranking every match would cost ~1 s per million) takes
+        the newest matching chunks instead, which stops after `limit` rows.
+        """
+        scopes = sorted(scopes)
+        if not scopes or not match or not self.fts_ready:
+            return []
+        where, args = self._scope_sql(scopes, path_prefix)
+        sql = ("SELECT c.point_id, bm25(chunks_fts) AS r FROM chunks_fts "
+               "JOIN chunks c ON c.point_id = chunks_fts.rowid "
+               "JOIN files f ON f.workspace_id=c.workspace_id AND f.filespace=c.filespace AND f.file_id=c.file_id "
+               f"WHERE chunks_fts MATCH ? AND f.status != 'deleted' AND {where} "
+               + ("ORDER BY r LIMIT ?" if ranked else "ORDER BY chunks_fts.rowid DESC LIMIT ?"))
+        if not ranked:
+            sql = sql.replace("bm25(chunks_fts) AS r", "0.0 AS r")
+        try:
+            with self._lock:
+                rows = self._conn.execute(sql, (match, *args, max(1, int(limit)))).fetchall()
+        except sqlite3.OperationalError as e:      # never let a query string break search
+            logger.warning("keyword search rejected %r: %s", match, e)
+            return []
+        return [(int(r[0]), float(r[1])) for r in rows]
+
+    def files_mentioning(self, keys: Iterable[tuple[str, str, str]], match: str) -> set[tuple[str, str, str]]:
+        """The (workspace_id, filespace, file_id) of `keys` with a chunk matching `match`."""
+        keys = sorted(set(keys))
+        if not keys or not match or not self.fts_ready:
+            return set()
+        out: set[tuple[str, str, str]] = set()
+        for i in range(0, len(keys), 300):
+            part = keys[i:i + 300]
+            sql = ("SELECT DISTINCT c.workspace_id, c.filespace, c.file_id FROM chunks_fts "
+                   "JOIN chunks c ON c.point_id = chunks_fts.rowid WHERE chunks_fts MATCH ? AND "
+                   "(c.workspace_id, c.filespace, c.file_id) IN (VALUES " + ",".join("(?, ?, ?)" for _ in part) + ")")
+            try:
+                with self._lock:
+                    rows = self._conn.execute(sql, (match, *[x for k in part for x in k])).fetchall()
+            except sqlite3.OperationalError as e:
+                logger.warning("keyword filter rejected %r: %s", match, e)
+                return set()
+            out |= {(r[0], r[1], r[2]) for r in rows}
+        return out
+
+    def term_docs(self, terms: Iterable[str]) -> dict[str, int]:
+        """Corpus document frequency (chunks containing it) of indexed terms."""
+        terms = sorted(set(terms))
+        if not terms or not self.fts_available:
+            return {}
+        out = {t: 0 for t in terms}
+        for i in range(0, len(terms), 200):
+            part = terms[i:i + 200]
+            for r in self.query("SELECT term, doc FROM chunks_fts_vocab WHERE term IN (" + ",".join("?" * len(part))
+                                + ")", part):
+                out[r["term"]] = int(r["doc"])
+        return out
+
+    def prefix_docs(self, prefix: str, cap: int = 1000) -> int:
+        """Sum of chunk frequencies of up to `cap` indexed terms starting with `prefix` (a lower bound)."""
+        if not prefix or not self.fts_available:
+            return 0
+        r = self.scalar("SELECT COALESCE(SUM(doc), 0) FROM (SELECT doc FROM chunks_fts_vocab WHERE term >= ? "
+                        "AND term < ? LIMIT ?)", (prefix, prefix + "\U0010ffff", cap))
+        return int(r or 0)
+
+    def has_chunks(self, scopes: Iterable[tuple[str, str]]) -> bool:
+        return any(self.scalar("SELECT 1 FROM chunks WHERE workspace_id=? AND filespace=? LIMIT 1", sc)
+                   for sc in scopes)
+
+    def sample_texts(self, n: int, seed: int = 0) -> list[str]:
+        """About `n` chunk texts at random point ids (corpus statistics for refinements)."""
+        import random
+        top = self.scalar("SELECT COALESCE(MAX(point_id), 0) FROM chunks") or 0
+        if not top:
+            return []
+        ids = sorted(set(random.Random(seed).randrange(1, top + 1) for _ in range(n)))
+        out: list[str] = []
+        for i in range(0, len(ids), 500):
+            part = ids[i:i + 500]
+            out += [r["text"] for r in self.query(
+                f"SELECT text FROM chunks WHERE point_id IN ({','.join('?' * len(part))})", part)]
+        return out
+
+    def name_chunk_hits(self, scopes: Iterable[tuple[str, str]], compact: str, limit: int,
+                        path_prefix: Optional[str] = None) -> list[int]:
+        """First chunk of indexed files whose folded name contains `compact`, best
+        (name starts with it) and newest first: the "file is called that" channel."""
+        scopes = sorted(scopes)
+        if not scopes or len(compact) < 3:
+            return []
+        where, args = self._scope_sql(scopes, path_prefix)
+        where = where.replace("c.workspace_id", "f.workspace_id").replace("c.filespace", "f.filespace")
+        sql = ("SELECT c.point_id FROM files f JOIN chunks c ON c.workspace_id=f.workspace_id "
+               "AND c.filespace=f.filespace AND c.file_id=f.file_id AND c.chunk_index=0 "
+               f"WHERE f.status = 'indexed' AND instr(f.name_fold, ?) > 0 AND {where} "
+               "ORDER BY substr(f.name_fold, 1, ?) = ? DESC, f.mtime DESC LIMIT ?")
+        return [r["point_id"] for r in self.query(sql, (compact, *args, len(compact), compact, max(1, int(limit))))]
 
     def live_totals(self, ws: Optional[str] = None, fs: Optional[str] = None) -> dict[tuple[str, str], dict]:
         """{(ws, fs): {"files", "bytes"}} of live files: one GROUP BY over the
@@ -696,7 +1005,7 @@ class Store:
             marks = ",".join("?" * len(part))
             for r in self.query(
                     f"SELECT c.point_id, c.workspace_id, c.filespace, c.file_id, c.chunk_index, c.text, "
-                    f"f.path, f.mtime FROM chunks c JOIN files f ON f.workspace_id=c.workspace_id "
+                    f"f.path, f.mtime, f.size FROM chunks c JOIN files f ON f.workspace_id=c.workspace_id "
                     f"AND f.filespace=c.filespace AND f.file_id=c.file_id "
                     f"WHERE c.point_id IN ({marks}) AND f.status != 'deleted'", part):
                 out[r["point_id"]] = r

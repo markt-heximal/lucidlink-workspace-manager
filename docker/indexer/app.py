@@ -18,6 +18,7 @@ import os
 import signal
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Callable, Literal, Optional
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Query, Request
@@ -74,12 +75,24 @@ class HintBody(BaseModel):
     src: Optional[str] = None
 
 
+class SearchFilters(BaseModel):
+    kind: Optional[Literal["documents", "presentations", "images", "video"]] = None
+    pathPrefix: Optional[str] = None
+    modifiedAfter: Optional[datetime] = None
+    modifiedBefore: Optional[datetime] = None
+    include: list[str] = Field(default_factory=list, max_length=20)
+    exclude: list[str] = Field(default_factory=list, max_length=20)
+    inName: bool = False
+
+
 class SearchBody(BaseModel):
     workspaceId: Optional[str] = None
     filespace: Optional[str] = None
     query: str = Field(min_length=1)
     k: int = Field(default=20, ge=1, le=200)
     pathPrefix: Optional[str] = None
+    mode: Literal["all", "meaning", "keyword"] = "all"
+    filters: Optional[SearchFilters] = None
 
 
 class AskBody(BaseModel):
@@ -167,8 +180,14 @@ def hint(body: HintBody, svc: IndexerService = Depends(_service), x_ws: Optional
 
 @router.post("/search")
 def search(body: SearchBody, svc: IndexerService = Depends(_service), x_ws: Optional[str] = WorkspaceHeader):
-    return {"results": svc.search(_ws(body.workspaceId, x_ws), body.filespace, body.query, body.k,
-                                  body.pathPrefix)}
+    filters = None
+    if body.filters is not None:
+        filters = body.filters.model_dump(exclude_defaults=True)
+        for key in ("modifiedAfter", "modifiedBefore"):
+            if key in filters:   # echo back as ISO in refinement patches
+                filters[key] = filters[key].isoformat().replace("+00:00", "Z")
+    return svc.search_all(_ws(body.workspaceId, x_ws), body.filespace, body.query, body.k,
+                          body.pathPrefix, body.mode, filters)
 
 
 @router.get("/find")

@@ -1,6 +1,8 @@
 """Ask: answer a question from the indexed chunks (prompt from `discover-rag`).
 
-Retrieval is the same vector search as /index/search; the LLM sees at most `k`
+Retrieval is the same hybrid ranking as /index/search (meaning + keywords +
+file names, search.retrieve), so a question naming "ThinkTank" sees the
+documents that literally say it; the LLM sees at most `k`
 excerpts of 1200 chars each and is told to cite paths. The file service's
 /agent/query calls this first and falls back to its shallow live walk when the
 indexer is unreachable or answers `empty`.
@@ -8,6 +10,8 @@ indexer is unreachable or answers `empty`.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+
+from . import search as search_mod
 
 if TYPE_CHECKING:
     from .service import IndexerService
@@ -27,12 +31,11 @@ def answer(svc: "IndexerService", scopes: "set[Scope]", question: str, k: int = 
     """Raises LLMUnavailable (503) / LLMError (502) / EmbedError."""
     svc.llm_required()
     empty = {"answer": EMPTY_ANSWER, "sources": [], "citations": [], "empty": True}
-    if not any(svc.store.chunk_count(ws, fs) for ws, fs in scopes):
+    if not svc.store.has_chunks(scopes):
         return empty
-    q = svc.embedder.embed_query(question)
-    hits = svc.vectors.search(q, max(1, k), scopes)
-    rows = svc.store.chunk_rows([pid for pid, _ in hits])
-    used = [(rows[pid], score) for pid, score in hits if pid in rows]
+    ret = search_mod.retrieve(svc, scopes, question, "all", pool=max(search_mod.POOL // 2, k),
+                              question=True)
+    used = [(h.row, h.score) for h in ret.hits[:max(1, k)]]
     if not used:
         return empty
     context = "\n---\n".join(f"PATH: {r['path']}\nEXCERPT: {r['text'][:EXCERPT_CHARS]}" for r, _ in used)
