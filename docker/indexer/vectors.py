@@ -50,6 +50,12 @@ UPSERT_MAX_BYTES = 900_000
 # After a mirror failure, leave Ruvector alone for this long (search runs
 # locally meanwhile) instead of retrying on every request.
 MIRROR_COOLDOWN_SEC = 60.0
+# Mirror bookkeeping (live/dead counts, what is still unmirrored) is a scan of
+# every chunk: ~10 s each at 1.6 M chunks. Search never runs it (the worker
+# pushes after every indexing job); counts are cached, and above this many
+# points they are refreshed only by sync or after COUNTS_TTL_SEC.
+COUNTS_EXACT_MAX = 100_000
+COUNTS_TTL_SEC = 600.0
 
 
 
@@ -286,6 +292,8 @@ class RuvectorMirror:
         self.error: Optional[str] = None
         self.rebuilds = 0
         self.rehydrations = 0
+        # (collection, monotonic time, store generation, live, dead)
+        self._counts_cache: Optional[tuple[str, float, int, int, int]] = None
 
     @property
     def collection(self) -> Optional[str]:
@@ -354,6 +362,7 @@ class RuvectorMirror:
         logger.info("ruvector: (re)creating collection %s and rehydrating", name)
         self.rehydrations += 1
         self.store.mirror_clear(name)
+        self._counts_cache = None
         self._create(name)
         self._ready = name
         self._push_missing(name)
@@ -370,8 +379,14 @@ class RuvectorMirror:
     def _push_missing(self, name: str) -> int:
         pushed = 0
         while True:
-            rows = self.store.mirror_missing(name, self.model, UPSERT_BATCH)
+            # A full scan on a large index: on a private read connection, so
+            # searches and indexing never wait behind it for the shared lock.
+            with self.store.read_view():
+                rows = self.store.mirror_missing(name, self.model, UPSERT_BATCH)
             if not rows:
+                c = self._counts_cache
+                if pushed and c is not None and c[0] == name:
+                    self._counts_cache = (name, c[1], c[2], c[3] + pushed, c[4])
                 return pushed
             points = [{
                 # 6 decimals keeps cosine scores exact to ~1e-6 and halves the JSON.
@@ -423,17 +438,42 @@ class RuvectorMirror:
         """Bring the collection up to date with SQLite; rebuild if too many dead."""
         def op(name):
             self._verify(name)  # each sync cycle, so a silent restart is caught
-            live, dead = self.store.mirror_counts(name)
+            live, dead = self._counts(name, refresh=True)
             if dead and dead > DEAD_RATIO_REBUILD * max(live, 1):
                 self._rebuild(name)
                 return 0
             return self._push_missing(name)
         return self._run(op) or 0
 
-    def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None) -> list[tuple[int, float]]:
-        def op(name):
-            self._push_missing(name)
+    def _counts(self, name: str, refresh: bool = False, compute: bool = True,
+                max_age: Optional[float] = COUNTS_TTL_SEC) -> Optional[tuple[int, int]]:
+        """(live, dead) mirrored points. Cached: a small index is re-counted on
+        any change, a large one only on refresh (sync) or after max_age (None:
+        never). compute=False never scans: the cached value, or None."""
+        c = self._counts_cache
+        now = time.monotonic()
+        if not refresh and c is not None and c[0] == name:
+            stale = ((c[2] != self.store.generation and c[3] + c[4] < COUNTS_EXACT_MAX)
+                     or (max_age is not None and now - c[1] > max_age))
+            if not stale or not compute:
+                return c[3], c[4]
+        if not compute:
+            return None
+        gen = self.store.generation
+        with self.store.read_view():
             live, dead = self.store.mirror_counts(name)
+        self._counts_cache = (name, now, gen, live, dead)
+        return live, dead
+
+    def search(self, q: np.ndarray, k: int, scopes: Optional[set[Scope]] = None) -> list[tuple[int, float]]:
+        # Nothing here scans SQLite: the worker pushes new points after every
+        # indexing job (sync), so search only asks the server. Dead points are
+        # over-fetched by the last known dead count and dropped below.
+        small = self.store.chunk_total() < COUNTS_EXACT_MAX
+
+        def op(name):
+            counts = self._counts(name, compute=small)
+            dead = counts[1] if counts else 0
             body: dict = {"vector": np.asarray(q, dtype=np.float32).tolist(),
                           "k": int(min(2000, k * 2 + dead))}
             if scopes is not None and len(scopes) == 1:
@@ -448,7 +488,22 @@ class RuvectorMirror:
                     continue
             return hits
 
-        hits = self._run(op) or []
+        name = self.collection
+        if name is not None and self._ready == name:
+            # Verified collection: ask without the mirror lock, so a search
+            # never waits behind a sync that is pushing points.
+            try:
+                hits = op(name)
+                self.ok, self.error = True, None
+            except CollectionMissing:
+                self._ready = None
+                hits = self._run(op) or []   # heals (rehydrates) under the lock
+            except MirrorError as e:
+                self.ok, self.error = False, str(e)
+                self._ready = None
+                raise
+        else:
+            hits = self._run(op) or []
         # Drop dead points and anything outside the requested scope.
         rows = self.store.chunk_rows([pid for pid, _ in hits])
         out = []
@@ -464,7 +519,9 @@ class RuvectorMirror:
 
     def points(self) -> int:
         name = self.collection
-        return self.store.mirror_counts(name)[0] if name else 0
+        # Status: a large index shows the count from the last sync (which keeps
+        # it current) rather than re-scanning on every poll.
+        return self._counts(name, max_age=None)[0] if name else 0
 
 
 class VectorService:

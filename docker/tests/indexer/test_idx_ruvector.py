@@ -242,3 +242,68 @@ def test_upserts_respect_body_limit(make_service, ruv, monkeypatch):
     assert len(puts) > 1
     assert len(ruv.collections[name]["points"]) == svc.store.chunk_count()
     assert svc.status()["vectorStore"]["ok"] is True
+
+
+def _count_scans(svc, monkeypatch) -> list[str]:
+    """Record every mirror bookkeeping scan (each a full pass over chunks on a large index)."""
+    calls: list[str] = []
+    store = svc.store
+    for n in ("mirror_missing", "mirror_counts"):
+        orig = getattr(store, n)
+        monkeypatch.setattr(store, n, lambda *a, _o=orig, _n=n, **k: (calls.append(_n), _o(*a, **k))[1])
+    return calls
+
+
+def test_search_on_large_index_never_scans_mirror_bookkeeping(make_service, ruv, monkeypatch):
+    import indexer.vectors as vectors
+    monkeypatch.setattr(vectors, "COUNTS_EXACT_MAX", 0)   # treat the index as large
+    svc = make_service(ruvector=ruv.transport)
+    _index(svc, {"/a.md": para("alpha"), "/b.md": para("beta")})
+    calls = _count_scans(svc, monkeypatch)
+    for _ in range(3):
+        hits = svc.search("ws1", "fsA", "alpha detail")
+        assert hits[0]["path"] == "/a.md" and svc.vectors.last_backend == "ruvector"
+    assert calls == []
+    # Status shows the count kept by the last sync instead of re-scanning per poll.
+    assert svc.status()["vectorStore"]["points"] == svc.store.chunk_count()
+    assert calls == []
+    # Sync still does its full check (and refreshes the cached count).
+    svc.vectors.sync_mirror()
+    assert "mirror_counts" in calls and "mirror_missing" in calls
+
+
+def test_search_does_not_wait_for_a_running_sync(make_service, ruv):
+    import threading
+    svc = make_service(ruvector=ruv.transport)
+    _index(svc, {"/a.md": para("alpha"), "/b.md": para("beta")})
+    svc.search("ws1", "fsA", "alpha detail")             # collection verified
+    lock = svc.vectors.mirror._lock
+    held, release = threading.Event(), threading.Event()
+
+    def sync_in_progress():
+        with lock:
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=sync_in_progress)
+    t.start()
+    held.wait(5)
+    try:
+        out: list = []
+        s = threading.Thread(target=lambda: out.append(svc.search("ws1", "fsA", "beta detail")))
+        s.start()
+        s.join(2)
+        assert not s.is_alive(), "search blocked behind the mirror lock"
+        assert out[0][0]["path"] == "/b.md" and svc.vectors.last_backend == "ruvector"
+    finally:
+        release.set()
+        t.join()
+
+
+def test_small_index_counts_follow_changes(make_service, ruv):
+    svc = make_service(ruvector=ruv.transport)
+    s = _index(svc, {"/a.md": para("alpha"), "/b.md": para("beta")})
+    assert svc.status()["vectorStore"]["points"] == svc.store.chunk_count()
+    s.write("/c.md", para("gamma"))
+    run(svc)
+    assert svc.status()["vectorStore"]["points"] == svc.store.chunk_count()
